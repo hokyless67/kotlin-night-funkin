@@ -1,0 +1,195 @@
+package nightfunkin.ui
+
+import korlibs.image.color.Colors
+import korlibs.korge.scene.Scene
+import korlibs.korge.view.Container
+import korlibs.korge.view.SContainer
+import korlibs.korge.view.Text
+import korlibs.korge.view.addUpdater
+import korlibs.korge.view.solidRect
+import korlibs.korge.view.text
+import kotlinx.coroutines.launch
+import nightfunkin.core.Constants
+import nightfunkin.core.KnfInput
+import nightfunkin.data.SongEntry
+import nightfunkin.data.SongRegistry
+import nightfunkin.play.PlayRequest
+import nightfunkin.play.PlayScene
+import kotlin.math.max
+import kotlin.math.min
+
+/**
+ * Song select: a scrollable list of every song found under
+ * `preload/data/songs`, plus difficulty picking. This is KNF's Freeplay.
+ */
+class SongSelectScene : Scene() {
+
+    private val entries: List<SongEntry> by lazy { SongRegistry.songs }
+    private var selected = 0
+    private var difficultyIndex = Constants.DEFAULT_DIFFICULTY_LIST.indexOf(Constants.DEFAULT_DIFFICULTY)
+    private var variationIndex = 0
+    private var time = 0.0
+    private var statusText = ""
+    private var statusTimer = 0.0
+
+    private lateinit var listLayer: Container
+    private lateinit var infoText: Text
+    private lateinit var diffText: Text
+    private lateinit var varText: Text
+    private lateinit var statusLine: Text
+
+    override suspend fun SContainer.sceneInit() {
+        solidRect(
+            Constants.GAME_WIDTH * 2.0, Constants.GAME_HEIGHT * 2.0, Colors["#14141f"],
+        )
+
+        val header = text("FREEPLAY", textSize = 46.0, color = Colors.WHITE)
+        header.x = 56.0
+        header.y = 34.0
+        addChild(header)
+
+        val count = text("${entries.size} songs detected", textSize = 18.0, color = Colors["#6a6a7a"])
+        count.x = 56.0
+        count.y = 88.0
+        addChild(count)
+
+        listLayer = Container()
+        addChild(listLayer)
+
+        infoText = text("", textSize = 22.0, color = Colors["#9a9aae"])
+        infoText.x = 56.0
+        infoText.y = 560.0
+        addChild(infoText)
+
+        diffText = text("", textSize = 28.0, color = Colors.WHITE)
+        diffText.x = 56.0
+        diffText.y = 610.0
+        addChild(diffText)
+
+        varText = text("", textSize = 20.0, color = Colors["#7a7a90"])
+        varText.x = 56.0
+        varText.y = 652.0
+        addChild(varText)
+
+        statusLine = text("", textSize = 20.0, color = Colors["#66FF66"])
+        statusLine.x = Constants.GAME_WIDTH - 420.0
+        statusLine.y = 40.0
+        addChild(statusLine)
+
+        val help = text(
+            "↑↓ / W S  select song    ← → / A D  difficulty    Q E  variation    ENTER play    ESC back",
+            textSize = 16.0,
+            color = Colors["#4f4f60"],
+        )
+        help.x = 56.0
+        help.y = 690.0
+        addChild(help)
+
+        if (entries.isEmpty()) {
+            setStatus("No songs found — is the FNF 'assets' folder reachable?")
+        }
+        rebuildList()
+        refreshInfo()
+    }
+
+    private fun currentDifficulties(): List<String> =
+        entries.getOrNull(selected)?.difficulties ?: Constants.DEFAULT_DIFFICULTY_LIST
+
+    private fun currentVariations(): List<String> =
+        listOf(Constants.DEFAULT_VARIATION) + (entries.getOrNull(selected)?.metadata?.playData?.songVariations ?: emptyList())
+
+    private fun rebuildList() {
+        listLayer.removeChildren()
+        val start = maxOf(0, selected - 8)
+        val end = minOf(entries.size, start + 16)
+        for (i in start until end) {
+            val song = entries[i]
+            val isSel = i == selected
+            val t = listLayer.text(
+                if (isSel) "▶  ${song.name}" else "   ${song.name}",
+                textSize = if (isSel) 28.0 else 24.0,
+                color = if (isSel) Colors.WHITE else Colors["#7d7d90"],
+            )
+            t.x = 56.0
+            t.y = 130.0 + (i - start) * 27.0
+        }
+    }
+
+    private fun refreshInfo() {
+        val song = entries.getOrNull(selected)
+        if (song == null) {
+            infoText.text = ""
+            diffText.text = ""
+            varText.text = ""
+            return
+        }
+        val diffs = currentDifficulties()
+        difficultyIndex = difficultyIndex.coerceIn(0, (diffs.size - 1).coerceAtLeast(0))
+        infoText.text = "artist: ${song.artist}    charter: ${song.charter ?: "?"}    stage: ${song.metadata.playData.stage}"
+        diffText.text = diffs.joinToString("   ") { if (it == diffs[difficultyIndex]) "[$it]" else it }
+        val vars = currentVariations()
+        variationIndex = variationIndex.coerceIn(0, (vars.size - 1).coerceAtLeast(0))
+        varText.text = "variation: " + vars.joinToString("   ") {
+            if (it == vars[variationIndex]) "[$it]" else it
+        }
+    }
+
+    private fun setStatus(msg: String) {
+        statusText = msg
+        statusTimer = 3.0
+        statusLine.text = msg
+    }
+
+    override suspend fun SContainer.sceneMain() {
+        val knfInput = KnfInput(keys)
+        addUpdater { dt ->
+            val d = dt.secondsDouble()
+            time += d
+            knfInput.update()
+
+            if (statusTimer > 0.0) {
+                statusTimer -= d
+                if (statusTimer <= 0.0) statusLine.text = ""
+            }
+
+            if (entries.isNotEmpty()) {
+                // W / Up = previous song, S / Down = next song
+                if (knfInput.justPressed(2)) {
+                    selected = (selected - 1 + entries.size) % entries.size
+                    rebuildList(); refreshInfo()
+                }
+                if (knfInput.justPressed(1)) {
+                    selected = (selected + 1) % entries.size
+                    rebuildList(); refreshInfo()
+                }
+                // A / Left and D / Right cycle difficulty
+                val diffs = currentDifficulties()
+                if (knfInput.justPressed(0)) {
+                    difficultyIndex = (difficultyIndex - 1 + diffs.size) % diffs.size
+                    refreshInfo()
+                }
+                if (knfInput.justPressed(3)) {
+                    difficultyIndex = (difficultyIndex + 1) % diffs.size
+                    refreshInfo()
+                }
+            }
+
+            if (knfInput.accept) launch { startSelected() }
+            if (knfInput.back) launch { sceneContainer.changeTo<TitleScene>() }
+        }
+    }
+
+    private suspend fun startSelected() {
+        val song = entries.getOrNull(selected) ?: return
+        val diffs = currentDifficulties()
+        val vars = currentVariations()
+        if (song.difficulty(diffs[difficultyIndex], vars[variationIndex]) == null) {
+            setStatus("${song.name} has no chart for ${diffs[difficultyIndex]}")
+            return
+        }
+        PlayRequest.songId = song.id
+        PlayRequest.difficulty = diffs[difficultyIndex]
+        PlayRequest.variation = vars[variationIndex]
+        sceneContainer.changeTo<PlayScene>()
+    }
+}
