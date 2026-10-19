@@ -22,6 +22,19 @@ class GameplayCamera(
     var focusY: Double = viewportHeight / 2.0
         private set
 
+    /**
+     * Where the camera is heading.
+     *
+     * FNF never moves the camera directly: `resetCamera` does
+     * `FlxG.camera.follow(cameraFollowPoint, LOCKON, Constants.DEFAULT_CAMERA_FOLLOW_RATE)`,
+     * so the camera *follows* a point with a lerp and every focus change is a
+     * glide rather than a cut.
+     */
+    var targetX: Double = viewportWidth / 2.0
+        private set
+    var targetY: Double = viewportHeight / 2.0
+        private set
+
     var followRate: Double = Constants.DEFAULT_CAMERA_FOLLOW_RATE.toDouble()
     var followEnabled: Boolean = true
 
@@ -44,6 +57,14 @@ class GameplayCamera(
     // ---- API ------------------------------------------------------------
 
     fun setFocus(x: Double, y: Double) {
+        targetX = x
+        targetY = y
+    }
+
+    /** Jumps straight to the target, like FNF's `camera.focusOn(...)`. */
+    fun setFocusImmediate(x: Double, y: Double) {
+        targetX = x
+        targetY = y
         focusX = x
         focusY = y
     }
@@ -80,6 +101,17 @@ class GameplayCamera(
     // ---- per-frame ------------------------------------------------------
 
     fun update(dtSeconds: Double) {
+        // The camera eases towards the follow point, exactly like Flixel's
+        // `followLerp`: `focus += (target - focus) * rate`, per frame.
+        if (snapNextFrame) {
+            focusX = targetX
+            focusY = targetY
+            snapNextFrame = false
+        } else if (followEnabled) {
+            focusX += (targetX - focusX) * followRate
+            focusY += (targetY - focusY) * followRate
+        }
+
         // Exponential decay, exactly like FNF's `pow(0.95, elapsed * 60)`.
         val decay = Constants.BOP_DECAY_PER_FRAME.toDouble().pow(dtSeconds * 60.0)
         bopMultiplier = 1.0 + (bopMultiplier - 1.0) * decay
@@ -92,8 +124,6 @@ class GameplayCamera(
         cam.scaleY = effectiveZoom
         cam.x = viewportWidth / 2.0 - focusX * effectiveZoom
         cam.y = viewportHeight / 2.0 - focusY * effectiveZoom
-
-        snapNextFrame = false
     }
 
     /** Screen-space -> content-space, used for HUD placement inside the camera. */

@@ -47,6 +47,26 @@ object KnfFiles {
 
     fun exists(path: String): Boolean = file(path).isFile
 
+    /** Like [exists], but for a folder - Animate atlases live in one. */
+    fun isDirectory(path: String): Boolean = file(path).isDirectory
+
+    /**
+     * Finds the folder holding an Animate atlas, given the stage's library and
+     * the prop's asset path.
+     *
+     * A stage's `directory` names the week's library (`week2`, `week7`, ...), and
+     * the prop's path is relative to that library's `images` folder.
+     */
+    fun findAnimateDir(library: String, assetPath: String): String? {
+        val raw = assetPath.substringAfter(':')
+        for (lib in listOf(library, "shared", "preload") + imageLibraries) {
+            if (lib.isEmpty()) continue
+            val dir = "$lib/images/$raw"
+            if (isDirectory(dir) && exists("$dir/Animation.json")) return dir
+        }
+        return null
+    }
+
     // ---- FNF's asset libraries ------------------------------------------
 
     /**
@@ -188,7 +208,17 @@ object KnfFiles {
         return bmp
     }
 
-    /** True for indexed (palette) or sub-8-bit PNGs. */
+    /**
+     * True for PNGs KorGE's own decoder cannot handle.
+     *
+     * `korlibs.image.format.PNG` only implements 8-bit RGBA (colour type 6);
+     * every other colour type falls into a `TODO("Bytes: N")` and throws
+     * `NotImplementedError`. FNF ships plenty of the others - the judgement
+     * popups and the health bar are greyscale+alpha (type 4), the note sheets
+     * are indexed (type 3).
+     *
+     * Those go through ImageIO instead, which is in the JDK.
+     */
     private fun needsImageIo(d: ByteArray): Boolean {
         if (d.size < 30) return false
         val pngSignature = d[0] == 0x89.toByte() &&
@@ -197,7 +227,7 @@ object KnfFiles {
         // IHDR payload: bit depth at byte 24, colour type at byte 25.
         val bitDepth = d[24].toInt() and 0xFF
         val colorType = d[25].toInt() and 0xFF
-        return colorType == 3 || bitDepth < 8
+        return colorType != 6 || bitDepth != 8
     }
 
     /**

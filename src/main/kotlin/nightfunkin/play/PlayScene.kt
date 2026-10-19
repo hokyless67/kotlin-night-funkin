@@ -242,7 +242,9 @@ class PlayScene : Scene() {
         // FNF opens the camera on the opponent's focus point, at the stage zoom.
         val (focusX, focusY) = opponent.cameraFocusPoint(opponentSlot.cameraOffsets)
         defaultCameraFocus = focusX to focusY
-        camera.setFocus(focusX, focusY)
+        // FNF's resetCamera with snap=true jumps to the focus point on the first frame.
+
+        camera.setFocusImmediate(focusX, focusY)
         camera.setZoomImmediate(stageFile.cameraZoom)
 
         buildStageProps()
@@ -278,10 +280,9 @@ class PlayScene : Scene() {
         playerStrumline.setNoteData(chart.notes.filter { it.isPlayerNote })
         opponentStrumline.setNoteData(chart.notes.filter { !it.isPlayerNote })
 
-        hud = Hud(hudContainer, downscroll)
+        hud = Hud(hudContainer, noteStyle, downscroll)
         hud.resetHealth()
-        hud.setSongLabels(song.name, song.artist, chart.difficulty.uppercase())
-        hud.setWatermark("${song.name} [${song.artist}]", chart.difficulty + " / " + chart.variation)
+        hud.setHealthIcons(player, opponent)
         playerStrumline.pressKey(0)
 
         // ---- audio -------------------------------------------------------
@@ -320,6 +321,11 @@ class PlayScene : Scene() {
         conductor.onStepHit = {
             val step = conductor.currentStep
             camera.onStep(step)
+            // FNF's `HealthIcon.onStepHit` bops on every beat
+            // (`bopEvery = Constants.STEPS_PER_BEAT`), not on the hits.
+            if (step % Constants.STEPS_PER_BEAT == 0) {
+                hud.bopIcons(conductor.stepLengthMs.toDouble())
+            }
             // `danceEvery` counts beats and defaults to one, so everyone re-poses
             // on every quarter note.
             if (step % 4 == 0) onBeat()
@@ -442,7 +448,6 @@ class PlayScene : Scene() {
         opponentStrumline.setNoteData(chart.notes.filter { !it.isPlayerNote })
         hud.resetHealth()
         hud.setScore(0)
-        hud.setCombo(0)
         conductor.update(prePosition, false)
     }
 
@@ -468,9 +473,10 @@ class PlayScene : Scene() {
         }
 
         camera.update(dt)
+        hud.popUps.beatLengthMs = conductor.beatLengthMs.toDouble()
         hud.update(dt)
-        playerStrumline.update(conductor, startTimestampMs.toFloat())
-        opponentStrumline.update(conductor, startTimestampMs.toFloat())
+        playerStrumline.update(conductor, startTimestampMs.toFloat(), dt)
+        opponentStrumline.update(conductor, startTimestampMs.toFloat(), dt)
 
         opponent.update(dt)
         girlfriend.update(dt)
@@ -517,10 +523,6 @@ class PlayScene : Scene() {
         if (!changed) return
         val ms = conductor.globalOffset
         Save.globalOffsetMs = ms
-        hud.setWatermark(
-            "${song.name} [${song.artist}]",
-            "${chart.difficulty} / ${chart.variation}   offset ${"%+.0f".format(ms)} ms",
-        )
     }
 
     /**
@@ -552,12 +554,12 @@ class PlayScene : Scene() {
         if (step != countdownStep && step <= 3) {
             countdownStep = step
             val label = when (step) {
-                0 -> "3"
-                1 -> "2"
-                2 -> "1"
-                else -> "GO!"
+                0 -> "three"
+                1 -> "two"
+                2 -> "one"
+                else -> "go"
             }
-            hud.showCountdown(label)
+            hud.showCountdown(label, conductor.beatLengthMs.toDouble())
             when (step) {
                 0 -> sfx.play(countdownSounds[0], 0.6)
                 1 -> sfx.play(countdownSounds[1], 0.6)
@@ -576,7 +578,7 @@ class PlayScene : Scene() {
         music.play(startTimestampMs)
 vocals.play(startTimestampMs - conductor.instrumentalOffset)
         opponentVocals.play(startTimestampMs - conductor.instrumentalOffset)
-        hud.showCountdown("GO!")
+        hud.showCountdown("go", conductor.beatLengthMs.toDouble())
     }
 
     private fun checkSongEnd() {
@@ -620,7 +622,6 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         opponentVocals.stop()
         val accuracy = if (totalNotes > 0) hits.toFloat() / totalNotes else 0f
         val rank = Scoring.rankFor(accuracy)
-        hud.setRank("${rank.uppercase()}  ${(accuracy * 100).roundToInt()}%")
         if (avsyncDebug && avcount > 0) {
             val avg = avsum / avcount
             println("KNF: AVSYNC notes=$avcount avg=${"%.2f".format(avg)}ms audio-vs-chart")
@@ -715,10 +716,9 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         combo++
         hits++
         hud.setScore(score)
-        hud.setCombo(combo)
         hud.showJudgement(judgement)
+        hud.showCombo(combo)
         hud.addHealth(Scoring.healthDelta(judgement))
-        hud.bopIcons()
 
         // FNF's BF behaviour: strike the matching `singDIR` pose on every hit.
         if (note.isPlayerNote) player.sing(note.directionIndex, conductor.stepLengthMs.toDouble())
@@ -731,7 +731,6 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
     private fun ghostTap() {
         combo = 0
         misses++
-        hud.setCombo(0)
         hud.addHealth(Constants.HEALTH_GHOST_MISS_PENALTY)
     }
 
@@ -777,9 +776,13 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
                 note.handledMiss = true
                 combo = 0
                 misses++
-                hud.setCombo(0)
                 hud.addHealth(Constants.HEALTH_MISS_PENALTY)
                 hud.showJudgement(Judgement.MISS)
+                // FNF hides the tail of a dropped hold note:
+                // `holdNote.missedNote = true; holdNote.visible = false;`
+                note.killTrail()
+                // FNF breaks the combo counter: `if (combo >= 10) comboPopUps.displayCombo(0);`
+                hud.showComboBreak()
                 sfx.play(missSound, 0.35)
             }
         }
@@ -788,7 +791,6 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
                 note.handledMiss = true
                 // The opponent flubbing it is good for us.
                 hud.addHealth(-Constants.HEALTH_MISS_PENALTY)
-                hud.bopIcons()
             }
         }
     }
@@ -799,6 +801,9 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
             if (!note.isHoldNote) continue
             val lane = note.directionIndex
             if (note.isHolding) {
+                // FNF's `Strumline.holdConfirm`: the receptor keeps the confirm
+                // pose for as long as the note is held.
+                playerStrumline.holdConfirm(lane)
                 if (!gameInput.isDown(lane)) {
                     note.releaseClip()
                     continue
@@ -822,7 +827,6 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
             music.pause()
             vocals.pause()
         opponentVocals.pause()
-            hud.setRank("YOU DIED")
             println("KNF: died at ${(conductor.songPosition / 1000.0).roundToInt()}s")
         }
     }

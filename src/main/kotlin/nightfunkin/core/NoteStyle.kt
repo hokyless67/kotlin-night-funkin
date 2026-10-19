@@ -22,6 +22,13 @@ private data class NoteStyleAssets(
     @SerialName("offsets") val offsets: List<Double> = listOf(0.0, 0.0),
     @SerialName("enabled") val enabled: Boolean = true,
     /**
+     * FNF's per-asset pixel flag; `NoteStyle.buildJudgementSprite` uses it to
+     * turn antialiasing off and to pick a stepped fade for the popup.
+     */
+    @SerialName("isPixel") val isPixel: Boolean = false,
+    /** Frame rate for the skin's animations, `anim.frameRate ?? 24`. */
+    @SerialName("frameRate") val frameRate: Int = 24,
+    /**
      * Note-skin files mix objects and scalars inside `data` (e.g. `"enabled": true`
      * sitting next to prefix maps), so it is read as raw JSON.
      */
@@ -153,6 +160,33 @@ class NoteStyle(val id: String) {
     }
 
     /**
+     * Every frame of a strumline animation.
+     *
+     * FNF registers the receptors as animations, not single sprites:
+     *
+     * ```haxe
+     * _data.assets.noteStrumline?.data?.leftPress?.toNamed('press'),
+     * _data.assets.noteStrumline?.data?.leftConfirm?.toNamed('confirm'),
+     * _data.assets.noteStrumline?.data?.leftConfirmHold?.toNamed('confirm-hold'),
+     * ```
+     *
+     * and `pressLeft0` / `confirmLeft0` are four-frame sequences, so swapping a
+     * single PNG loses the whole squish.
+     */
+    fun strumFrames(direction: Int, kind: String): List<AtlasSlice> {
+        val style = active
+        val asset = style.data.assets["noteStrumline"] ?: return emptyList()
+        val atlas = style.atlasFor(asset.assetPath) ?: return emptyList()
+        val key = "${style.arrowKeys[direction]}$kind"
+        val prefix = asset.assetBy(key) ?: key
+        return atlas.framesByPrefix(prefix).map { atlas.slice(it) }
+    }
+
+    /** Frame rate of the strumline animations, `anim.frameRate ?? 24`. */
+    val strumFrameRate: Double
+        get() = (active.data.assets["noteStrumline"]?.frameRate ?: 24).toDouble()
+
+    /**
      * Note splash animations, one list of frames per variant.
      *
      * FNF registers `note impact 1|2 <colour>0` as animations and plays them at
@@ -195,6 +229,35 @@ class NoteStyle(val id: String) {
     }
 
     /**
+     * The hold-note sheet.
+     *
+     * `funkin` uses the raw 8-column strip `NOTE_hold_assets.png` (416x87), but
+     * the `pixel` skin ships its own little sheet, `week6:weeb/pixelUI/arrowEndsNew`
+     * (72x6), which is stretched by a scale of 6 instead.
+     *
+     * Either way the sheet is eight columns: for direction `d` the body is
+     * column `d*2` and the end cap column `d*2+1`.
+     */
+    fun holdNoteSheet(): Bitmap? {
+        val asset = active.data.assets["holdNote"] ?: return null
+        return bitmapFor(asset.assetPath)
+    }
+
+    /** Width of the whole hold-note sheet, or null when it is missing. */
+    fun holdNoteSheetWidth(): Int? = holdNoteSheet()?.width
+
+    /** Height of the whole hold-note sheet, or null when it is missing. */
+    fun holdNoteSheetHeight(): Int? = holdNoteSheet()?.height
+
+    /** `NoteStyle.fetchHoldNoteScale` - the hold note has its own scale. */
+    val holdNoteScale: Float
+        get() = active.data.assets["holdNote"]?.scale ?: 1f
+
+    /** `NoteStyle.isHoldNotePixel`. */
+    val isHoldNotePixel: Boolean
+        get() = active.data.assets["holdNote"]?.isPixel ?: false
+
+    /**
      * `NOTE_hold_assets.png` is a raw 8-column strip (no XML): for direction `d`
      * the body is column `d*2` and the end cap column `d*2+1`.
      */
@@ -206,21 +269,105 @@ class NoteStyle(val id: String) {
      * it — stretching it to the head's width is what makes holds look like slabs.
      */
     fun sustainWidth(): Int? {
-        val asset = data.assets["holdNote"] ?: return null
-        val bmp = bitmapFor(asset.assetPath) ?: return null
+        val bmp = holdNoteSheet() ?: return null
         return (bmp.width / 8).takeIf { it > 0 }
     }
 
     fun sustainSlices(direction: Int): Pair<AtlasSlice, AtlasSlice>? {
         sustainCache[direction]?.let { return it }
-        val asset = data.assets["holdNote"] ?: return null
-        val bmp = bitmapFor(asset.assetPath) ?: return null
+        val bmp = holdNoteSheet() ?: return null
         val segW = bmp.width / 8
         if (segW <= 0 || bmp.height <= 0) return null
         val d = direction.coerceIn(0, 3)
         val body = bmp.sliceWithSize(d * 2 * segW, 0, segW, bmp.height)
         val cap = bmp.sliceWithSize((d * 2 + 1) * segW, 0, segW, bmp.height)
         return (body to cap).also { sustainCache[d] = it }
+    }
+
+    // ======================================================================
+    // judgements and combo digits
+    // ======================================================================
+
+    /**
+     * One judgement popup: the texture, its scale, its pixel flag and the
+     * per-style offsets.
+     *
+     * Mirrors `NoteStyle.buildJudgementSprite`:
+     *
+     * ```haxe
+     * case "sick":
+     *   var assetPath = buildJudgementSpritePath(rating);
+     *   result.loadTexture(assetPath);
+     *   result.scale.x = _data.assets.judgementSick?.scale ?? 1.0;
+     * ```
+     */
+    data class JudgementAsset(
+        val slice: AtlasSlice,
+        val scale: Float,
+        val isPixel: Boolean,
+        val offsets: List<Double>,
+    )
+
+    private fun judgementAsset(name: String): JudgementAsset? {
+        val style = active
+        val asset = style.data.assets[name] ?: return null
+        val bmp = style.bitmapFor(asset.assetPath) ?: return null
+        return JudgementAsset(
+            slice = bmp.sliceWithSize(0, 0, bmp.width, bmp.height),
+            scale = asset.scale,
+            isPixel = asset.isPixel,
+            offsets = asset.offsets,
+        )
+    }
+
+    /** The popup for a judgement name: `sick`, `good`, `bad` or `shit`. */
+    fun judgement(name: String): JudgementAsset? = when (name) {
+        "sick" -> judgementAsset("judgementSick")
+        "good" -> judgementAsset("judgementGood")
+        "bad" -> judgementAsset("judgementBad")
+        "shit" -> judgementAsset("judgementShit")
+        else -> null
+    }
+
+    /** One digit of the combo counter, `0` to `9`. */
+    fun comboNumber(digit: Int): JudgementAsset? =
+        if (digit in 0..9) judgementAsset("comboNumber$digit") else null
+
+    /** True when the whole skin is pixel art, which also covers the notes. */
+    val isPixel: Boolean
+        get() = active.data.assets["note"]?.isPixel
+            ?: active.data.assets.values.any { it.isPixel }
+
+    /**
+     * The countdown graphic for a step.
+     *
+     * `NoteStyle.buildCountdownSprite`:
+     *
+     * ```haxe
+     * case TWO: result.loadTexture(assetPath); result.scale.x = _data.assets.countdownTwo?.scale ?? 1.0;
+     * ```
+     *
+     * The steps are `three`, `two`, `one` and `go`; `funkin` ships no graphic
+     * for `three`, so only the sound plays there.
+     */
+    fun countdown(step: String): JudgementAsset? {
+        val name = when (step) {
+            "three" -> "countdownThree"
+            "two" -> "countdownTwo"
+            "one" -> "countdownOne"
+            "go" -> "countdownGo"
+            else -> return null
+        }
+        val style = active
+        val asset = style.data.assets[name] ?: return null
+        if (asset.assetPath.isEmpty()) return null
+        val bmp = style.bitmapFor(asset.assetPath) ?: return null
+        return JudgementAsset(
+            slice = bmp.sliceWithSize(0, 0, bmp.width, bmp.height),
+            scale = asset.scale,
+            isPixel = asset.isPixel,
+            offsets = asset.offsets,
+        )
     }
 
     // ======================================================================
@@ -237,51 +384,24 @@ class NoteStyle(val id: String) {
                 else -> null
             }
 
-    /**
-     * FNF asset paths are bare (`NOTE_hold_assets`) or library-prefixed
-     * (`week6:weeb/pixelUI/arrows-pixels`); the prefix names a top-level folder.
-     */
-    private fun assetCandidates(assetPath: String): List<String> {
-        val library = assetPath.substringBefore(':', "")
-        val raw = assetPath.substringAfter(':')
-        return buildList {
-            if (library.isNotEmpty() && library != raw) add("$library/$raw")
-            add("shared/images/$raw")
-            add("preload/images/$raw")
-            add(raw)
-        }
-    }
-
     private fun atlasFor(assetPath: String): TextureAtlas? {
         atlases[assetPath]?.let { return it }
-        for (candidate in assetCandidates(assetPath)) {
-            val xml = "$candidate.xml"
-            if (KnfFiles.exists(xml)) {
-                val atlas = runCatching { TextureAtlas.load(xml) }
-                    .onFailure { println("KNF: bad atlas $xml: ${it.message}") }
-                    .getOrNull()
-                if (atlas != null) {
-                    atlases[assetPath] = atlas
-                    return atlas
-                }
-            }
-        }
-        return null
+        val xml = KnfFiles.resolve(assetPath, ".xml") ?: return null
+        val atlas = runCatching { TextureAtlas.load(xml) }
+            .onFailure { println("KNF: bad atlas $xml: ${it.message}") }
+            .getOrNull()
+        if (atlas != null) atlases[assetPath] = atlas
+        return atlas
     }
 
     private fun bitmapFor(assetPath: String): Bitmap? {
         bitmaps[assetPath]?.let { return it }
-        for (candidate in assetCandidates(assetPath)) {
-            val png = "$candidate.png"
-            if (KnfFiles.exists(png)) {
-                val bmp = runCatching { KnfFiles.bitmap(png) }.getOrNull()
-                if (bmp != null) {
-                    bitmaps[assetPath] = bmp
-                    return bmp
-                }
-            }
-        }
-        return null
+        val png = KnfFiles.resolve(assetPath, ".png") ?: return null
+        val bmp = runCatching { KnfFiles.bitmap(png) }
+            .onFailure { println("KNF: bitmap '$png' failed: $it") }
+            .getOrNull()
+        if (bmp != null) bitmaps[assetPath] = bmp
+        return bmp
     }
 
     // ---- procedural stand-ins, only used when a skin asset is missing ----

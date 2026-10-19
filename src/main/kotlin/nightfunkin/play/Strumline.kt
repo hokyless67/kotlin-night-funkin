@@ -6,8 +6,10 @@ import korlibs.korge.view.Image
 import korlibs.korge.view.addUpdater
 import korlibs.korge.view.image
 import nightfunkin.audio.dtSeconds
+import nightfunkin.core.AtlasSlice
 import nightfunkin.core.Constants
 import nightfunkin.core.NoteStyle
+import nightfunkin.core.setPixelArt
 import nightfunkin.data.SongNoteData
 import nightfunkin.timing.Conductor
 
@@ -112,10 +114,10 @@ class Strumline(
     // per-frame
     // ======================================================================
 
-    fun update(conductor: Conductor, songStart: Float = 0f) {
+    fun update(conductor: Conductor, songStart: Float = 0f, dt: Double = 1.0 / 60.0) {
         spawnIncoming(conductor, songStart)
         updateNotes(conductor)
-        receptors.forEach { it?.update() }
+        receptors.forEach { it?.update(dt) }
     }
 
     private fun spawnIncoming(conductor: Conductor, songStart: Float) {
@@ -228,6 +230,14 @@ class Strumline(
         receptors[direction]?.confirm()
     }
 
+    /**
+     * FNF's `Strumline.holdConfirm`: the receptor keeps the confirm pose for as
+     * long as the hold note is being held.
+     */
+    fun holdConfirm(direction: Int) {
+        receptors[direction]?.holdConfirm()
+    }
+
     fun playStatic(direction: Int) {
         receptors[direction]?.release()
     }
@@ -300,7 +310,23 @@ class Strumline(
     }
 }
 
-/** A single arrow receptor with static / press / confirm states. */
+/**
+ * A single arrow receptor with static / press / confirm states.
+ *
+ * FNF's receptors are *animations*, not single sprites -
+ * `pressLeft0` and `confirmLeft0` are four-frame sequences - so this plays the
+ * frames through instead of swapping one PNG.
+ *
+ * ```haxe
+ * public function playPress():Void {
+ *     this.active = (forceActive || isAnimationDynamic('press'));
+ *     this.playAnimation('press', true);
+ * }
+ * ```
+ *
+ * The animations are not looped (`anim.looped ?? false`), so they play once and
+ * freeze on their last frame.
+ */
 private class Receptor(
     private val host: Container,
     private val direction: Int,
@@ -308,45 +334,94 @@ private class Receptor(
 ) {
     val container: Container = Container().also { host.addChild(it) }
 
+    /**
+     * FNF's `StrumlineNote.fixOffsets`: while the "confirm" animation plays, the
+     * graphic is nudged to compensate for the glow the animation draws around
+     * the arrow.
+     */
+    private val confirmOffset = 13.0
+
     private var state = "Static"
+    private var frames: List<AtlasSlice> = emptyList()
+    private var frameIndex = 0
     private var timer = 0.0
+    private var finished = true
+
+    private val image: Image = Container().let { _ ->
+        // The image lives in its own child container so the confirm offset can
+        // move the graphic without moving the receptor's lane position.
+        Image(korlibs.image.bitmap.Bitmap32(1, 1, intArrayOf(0), false)).also { img ->
+            container.addChild(img)
+        }
+    }
 
     init {
         redraw()
     }
 
-    private fun redraw() {
-        val slice = noteStyle.strumSlice(direction, state) ?: return
-        container.removeChildren()
-        container.image(slice).also { img ->
-            // FNF centres the receptor graphic on the lane origin
-            // (`centerOffsets()` + `centerOrigin()`), so notes and receptors have
-            // to share an anchor or they drift by half a sprite.
-            img.anchor = Anchor2D.CENTER
-            img.scaleX = noteStyle.scale.toDouble()
-            img.scaleY = noteStyle.scale.toDouble()
-            img.x = 0.0
-            img.y = 0.0
-            img.alpha = 0.95
+    private fun setState(next: String) {
+        if (state == next && finished) return
+        state = next
+        frames = noteStyle.strumFrames(direction, next)
+        if (frames.isEmpty()) {
+            // No animation for this state - fall back to the single sprite.
+            val single = noteStyle.strumSlice(direction, next)
+            frames = listOf(single)
         }
+        frameIndex = 0
+        timer = 0.0
+        finished = frames.size <= 1
+        redraw()
+    }
+
+    private fun redraw() {
+        val slice = frames.getOrNull(frameIndex) ?: return
+        image.bitmap = slice
+        image.anchor = Anchor2D.CENTER
+        image.scaleX = noteStyle.scale.toDouble()
+        image.scaleY = noteStyle.scale.toDouble()
+        image.x = if (state == "Confirm") -confirmOffset else 0.0
+        image.y = if (state == "Confirm") -confirmOffset else 0.0
+        image.alpha = 0.95
+        image.setPixelArt(noteStyle.isPixel)
     }
 
     fun press() {
-        state = "Press"; timer = 0.12; redraw()
+        setState("Press")
     }
 
     fun confirm() {
-        state = "Confirm"; timer = 0.18; redraw()
+        setState("Confirm")
+    }
+
+    /**
+     * FNF's `StrumlineNote.holdConfirm`: once the confirm animation has played
+     * out, the held receptor keeps the confirm pose.
+     */
+    fun holdConfirm() {
+        if (state == "Confirm" && finished) setState("ConfirmHold")
+        else if (state != "Confirm") setState("Confirm")
     }
 
     fun release() {
-        state = "Static"; timer = 0.0; redraw()
+        setState("Static")
     }
 
-    fun update() {
-        if (timer <= 0.0) return
-        timer -= 1.0 / 60.0
-        if (timer <= 0.0) release()
+    fun update(dt: Double) {
+        if (frames.size <= 1 || finished) return
+        val step = 1.0 / noteStyle.strumFrameRate
+        timer += dt
+        while (timer >= step) {
+            timer -= step
+            frameIndex++
+            if (frameIndex >= frames.size) {
+                frameIndex = frames.size - 1
+                finished = true
+                timer = 0.0
+                break
+            }
+        }
+        redraw()
     }
 
     fun destroy() = container.removeFromParent()

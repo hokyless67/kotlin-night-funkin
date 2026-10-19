@@ -8,17 +8,18 @@ import nightfunkin.core.AtlasSlice
 import nightfunkin.core.Constants
 import nightfunkin.core.NoteDirection
 import nightfunkin.core.NoteStyle
+import nightfunkin.core.setPixelArt
 import nightfunkin.timing.Conductor
 import kotlin.math.abs
 
 /**
  * The sustain "tail" of a hold note.
  *
- * FNF draws this with a custom mesh over `NOTE_hold_assets.png`; KNF stretches
- * the body slice and pins the end cap, which reads identically at gameplay
+ * FNF draws this with a custom mesh over the hold-note sheet; KNF stretches
+ * the body column and pins the end cap, which reads identically at gameplay
  * speed and costs nothing.
  *
- * Geometry follows `play/notes/SustainTrail.hx` plus the y-offset rules in
+ * Geometry follows `play/notes/SustainTrail.hx` plus the y rules in
  * `Strumline.updateNotes`.
  */
 class SustainTrail(
@@ -45,9 +46,34 @@ class SustainTrail(
     private var body: Image? = null
     private var cap: Image? = null
 
-    /** `SustainTrail.setupHoldNoteGraphic`: `graphic.width / 8 * holdNoteScale`. */
+    /**
+     * FNF's `SustainTrail.setupHoldNoteGraphic`:
+     *
+     * ```haxe
+     * graphicWidth = graphic.width / 8 * zoom;
+     * var bottomHeight:Float = graphic.height * zoom * endOffset;
+     * ```
+     *
+     * `zoom` is the note style's own hold-note scale (0.7 for `funkin`, 6 for
+     * `pixel`), which is *not* the note scale - that is why the pixel hold note
+     * is a 72x6 sheet stretched to a fat bar.
+     */
     private val widthPx: Double =
-        (noteStyle.sustainWidth() ?: Constants.STRUMLINE_SIZE) * noteStyle.scale.toDouble()
+        ((noteStyle.holdNoteSheetWidth() ?: Constants.STRUMLINE_SIZE) / 8.0) *
+            noteStyle.holdNoteScale.toDouble()
+
+    /** `endOffset` / `bottomClip` from `setupHoldNoteGraphic`. */
+    private val endOffset: Double = if (noteStyle.isHoldNotePixel) 1.0 else 0.5
+    private val bottomClip: Double = if (noteStyle.isHoldNotePixel) 1.0 else 0.9
+
+    /** The end cap's height, `graphic.height * zoom * (bottomClip - endOffset)`. */
+    private val capHeightPx: Double =
+        (noteStyle.holdNoteSheetHeight() ?: 0) * noteStyle.holdNoteScale.toDouble() *
+            (bottomClip - endOffset)
+
+    /** `graphic.height * zoom * endOffset` - the part of the sheet the cap eats. */
+    private val bottomHeightPx: Double =
+        (noteStyle.holdNoteSheetHeight() ?: 0) * noteStyle.holdNoteScale.toDouble() * endOffset
 
     init {
         // FNF: `holdNoteSprite.x = this.x + getXPos(dir) + STRUMLINE_SIZE / 2 - width / 2`,
@@ -58,29 +84,44 @@ class SustainTrail(
         val pair = noteStyle.sustainSlices(directionIndex)
         if (pair != null) {
             val (bodySlice, capSlice) = pair
-            // Both sprites pivot on their centre, matching FNF's
-            // `origin.set(width * 0.5, height * 0.5)`.
-            body = image(bodySlice).also { it.anchor = Anchor2D.CENTER }
-            cap = image(capSlice).also { it.anchor = Anchor2D.TOP }
+            // FNF's vertices start at the top of the sheet and grow downwards, so
+            // the body hangs from its first row rather than being centred on it.
+            body = image(bodySlice).also { it.anchor = Anchor2D.TOP_LEFT }
+            cap = image(capSlice).also { it.anchor = Anchor2D.TOP_LEFT }
             cap?.visible = false
+            body?.setPixelArt(noteStyle.isHoldNotePixel)
+            cap?.setPixelArt(noteStyle.isHoldNotePixel)
         }
         parent.addChild(this)
     }
 
     /** `SustainTrail.sustainHeight`: linear in milliseconds, times the scroll speed. */
-    private fun sustainHeightPx(): Double =
-        sustainLength * Constants.PIXELS_PER_MS.toDouble() * scrollSpeed.toDouble()
+    private fun sustainHeightPx(lengthMs: Float): Double =
+        lengthMs * Constants.PIXELS_PER_MS.toDouble() * scrollSpeed.toDouble()
 
     private fun noteOffsetY(conductor: Conductor): Double =
         Constants.PIXELS_PER_MS * (conductor.timeWithDelta - strumTime) * scrollSpeed *
             (if (downscroll) 1.0 else -1.0)
 
     /**
-     * Ported from the three branches of `Strumline.updateHoldNotes`.
+     * Ported from the three branches of `Strumline.updateNotes`.
      *
-     * The trail is centre-anchored and sits `STRUMLINE_SIZE / 2` below the note
-     * head; once the head is being held it pins to that spot and shrinks, and a
-     * note released early keeps the offset it had drifted to.
+     * FNF's trail is a mesh whose first row sits at the sprite's position and
+     * grows *downwards* (upscroll) or *upwards* (downscroll, `flipY`):
+     *
+     * ```haxe
+     * // upscroll, not held
+     * holdNote.y = this.y - INITIAL_OFFSET + getNoteY(...) + STRUMLINE_SIZE / 2 + yOffset;
+     * // upscroll, held
+     * holdNote.y = this.y - INITIAL_OFFSET + STRUMLINE_SIZE / 2;
+     * // downscroll, not held
+     * holdNote.y = this.y - INITIAL_OFFSET + getNoteY(...) - holdNote.height + STRUMLINE_SIZE / 2 + yOffset;
+     * // downscroll, held
+     * holdNote.y = this.y - INITIAL_OFFSET - holdNote.height + STRUMLINE_SIZE / 2;
+     * ```
+     *
+     * The tail therefore starts at the head's lower edge - centring it instead
+     * is what pushed it a long way up the lane.
      */
     fun updateGeometry(conductor: Conductor) {
         val b = body ?: return
@@ -99,30 +140,41 @@ class SustainTrail(
 
         val headY = strumlineY - Constants.INITIAL_OFFSET + noteOffsetY(conductor)
         val half = Constants.STRUMLINE_SIZE / 2.0
-        val centreY = if (clipping) strumlineY - Constants.INITIAL_OFFSET + half else headY + half + yOffset
-
-        val h = sustainHeightPx()
-        if (h <= 1.0) {
+        val graphicHeight = sustainHeightPx(sustainLength)
+        val bodyHeight = graphicHeight - bottomHeightPx
+        if (bodyHeight <= 1.0) {
             b.visible = false
             c.visible = false
             return
         }
         b.visible = true
-        c.visible = true
+        c.visible = capHeightPx > 1.0
 
-        y = centreY
-        b.x = 0.0
-        b.y = 0.0
+        // Where the tail's leading edge sits.
+        val trailY = when {
+            clipping && downscroll -> strumlineY - Constants.INITIAL_OFFSET - graphicHeight + half
+            clipping -> strumlineY - Constants.INITIAL_OFFSET + half
+            downscroll -> headY - graphicHeight + half + yOffset
+            else -> headY + half + yOffset
+        }
+        // The container only carries the lane's X; the Y is absolute, so the
+        // container must not offset it a second time.
+        y = 0.0
+
+        // The body hangs from the leading edge, in the direction the note came from.
+        val bodyTop = if (downscroll) trailY - bodyHeight else trailY
+        b.x = -widthPx / 2.0
+        b.y = bodyTop
         b.scaleX = widthPx / b.bitmap.width.toDouble().coerceAtLeast(1.0)
-        b.scaleY = h / b.bitmap.height.toDouble().coerceAtLeast(1.0)
+        b.scaleY = bodyHeight / b.bitmap.height.toDouble().coerceAtLeast(1.0)
 
         // The rounded cap closes the end the tail is heading towards; downscroll
         // mirrors the trail, so the cap swaps to the top (`flipY` in FNF).
         val capScale = widthPx / c.bitmap.width.toDouble().coerceAtLeast(1.0)
         c.scaleX = capScale
-        c.scaleY = capScale
-        c.x = 0.0
-        c.y = if (downscroll) -h / 2.0 else h / 2.0
+        c.scaleY = capHeightPx / c.bitmap.height.toDouble().coerceAtLeast(1.0)
+        c.x = -widthPx / 2.0
+        c.y = if (downscroll) bodyTop - capHeightPx else bodyTop + bodyHeight
     }
 
     fun kill() = removeFromParent()
@@ -181,6 +233,7 @@ class NoteSprite(
                 it.anchor = Anchor2D.CENTER
                 it.scaleX = noteStyle.scale.toDouble()
                 it.scaleY = noteStyle.scale.toDouble()
+                it.setPixelArt(noteStyle.isPixel)
             }
         }
     }
@@ -247,6 +300,12 @@ class NoteSprite(
             it.strumlineY = strumlineY
             it.updateGeometry(conductor)
         }
+    }
+
+    /** FNF hides the tail of a hold note that was dropped: holdNote.visible = false. */
+    fun killTrail() {
+        holdTrail?.kill()
+        holdTrail = null
     }
 
     fun startClip() {

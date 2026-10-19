@@ -8,9 +8,16 @@ import korlibs.korge.view.Image
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import nightfunkin.core.AnimateAtlas
 import nightfunkin.core.AtlasSlice
+import nightfunkin.core.Bounds
+import nightfunkin.core.Mat
+import nightfunkin.core.Pose
+import nightfunkin.core.PosePart
+import nightfunkin.core.SpriteDef
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.TextureAtlas
+import nightfunkin.core.setPixelArt
 import korlibs.math.geom.degrees
 import kotlin.math.atan2
 import kotlin.math.hypot
@@ -30,6 +37,23 @@ data class CharacterAnimationDef(
     val flipY: Boolean = false,
 )
 
+/**
+ * FNF's `CharacterData.HealthIconData` - which face to show on the health bar.
+ *
+ * `CharacterData` fills in `id: null` when the field is missing and then
+ * `if (input.healthIcon.id == null) input.healthIcon.id = id;`, so a character
+ * without an explicit entry uses its own icon.
+ */
+@Serializable
+data class HealthIconData(
+    val id: String? = null,
+    val isPixel: Boolean? = null,
+    val scale: Double? = null,
+    val offsets: List<Double>? = null,
+    val flipX: Boolean? = null,
+    val shouldBop: Boolean? = null,
+)
+
 @Serializable
 data class CharacterData(
     val version: String = "1.0.0",
@@ -38,6 +62,14 @@ data class CharacterData(
     val assetPath: String = "",
     val flipX: Boolean = false,
     val scale: Double? = null,
+    /**
+     * FNF turns antialiasing off for the whole character when this is set -
+     * `SparrowCharacter.loadSpritesheet` does
+     * `if (_data.isPixel) { isPixel = true; antialiasing = false; }`.
+     */
+    val isPixel: Boolean = false,
+    /** Which face to show on the health bar; defaults to the character's own. */
+    @SerialName("healthIcon") val healthIcon: HealthIconData? = null,
     /** How long a sing pose is held, in 16th-note steps (FNF's `singTime`). */
     val singTime: Double = 8.0,
     val offsets: List<Double> = listOf(0.0, 0.0),
@@ -49,215 +81,6 @@ data class CharacterData(
 // ===========================================================================
 // spritemap1.json — Adobe Animate "Better TA Extension" atlas
 // ===========================================================================
-
-@Serializable
-private data class RawSprite(@SerialName("SPRITE") val sprite: RawSpriteData? = null)
-
-@Serializable
-private data class RawSpriteData(
-    val name: String = "0",
-    val x: Int = 0,
-    val y: Int = 0,
-    val w: Int = 0,
-    val h: Int = 0,
-    val rotated: Boolean = false,
-)
-
-@Serializable
-private data class RawAtlas(@SerialName("SPRITES") val sprites: List<RawSprite> = emptyList())
-
-/** The spritemap file wraps everything in an `ATLAS` object. */
-@Serializable
-private data class SpritemapRoot(@SerialName("ATLAS") val atlas: RawAtlas = RawAtlas())
-
-private data class SpriteDef(
-    val name: String,
-    val slice: AtlasSlice,
-    /** Logical (un-rotated) size, which is what the animation matrices apply to. */
-    val width: Int,
-    val height: Int,
-    /** Rotated sheets store the sprite turned 90°, so undo that when drawing. */
-    val turned: Boolean,
-    /**
-     * Where the sprite sits inside the sheet. Always 0 for Animate, where the
-     * symbol matrices place everything; for a legacy sheet it is the frame's own
-     * position (`x - frameX`, `y - frameY`), because a plain `FlxSprite` loaded
-     * from the whole PNG draws each sub-texture in place.
-     */
-    val dx: Int = 0,
-    val dy: Int = 0,
-)
-
-// ===========================================================================
-// Animation.json — the symbol tree
-// ===========================================================================
-
-/**
- * A 2D affine transform `[a b c d tx ty]`, matching Adobe Animate's `MX` arrays
- * and Flixel's `FlxMatrix`.
- */
-private data class Mat(
-    val a: Double = 1.0,
-    val b: Double = 0.0,
-    val c: Double = 0.0,
-    val d: Double = 1.0,
-    val tx: Double = 0.0,
-    val ty: Double = 0.0,
-) {
-    /** `parent ∘ child`, i.e. Flixel's `child.concat(parent)`. */
-    fun under(parent: Mat) = Mat(
-        a = parent.a * this.a + parent.c * this.b,
-        b = parent.b * this.a + parent.d * this.b,
-        c = parent.a * this.c + parent.c * this.d,
-        d = parent.b * this.c + parent.d * this.d,
-        tx = parent.a * this.tx + parent.c * this.ty + parent.tx,
-        ty = parent.b * this.tx + parent.d * this.ty + parent.ty,
-    )
-
-    /** Applies this transform to a point. */
-    fun xform(x: Double, y: Double) = a * x + c * y + tx to b * x + d * y + ty
-}
-
-private fun matOf(mx: List<Double>?): Mat {
-    if (mx == null || mx.size < 6) return Mat()
-    return Mat(
-        a = mx[0], b = mx[1], c = mx[2], d = mx[3], tx = mx[4], ty = mx[5],
-    )
-}
-
-/**
- * A leaf of the symbol tree: one sprite out of the atlas.
- *
- * FNF calls this an "atlas sprite instance" (`ASI`). Every sprite in a character
- * sheet is one of these; the limbs only look whole because their parent symbols
- * place them.
- */
-@Serializable
-private data class AnimAtlasInstance(
-    /** Name of the sprite in `spritemap1.json`. */
-    @SerialName("N") val name: String = "",
-    @SerialName("MX") val matrix: List<Double>? = null,
-)
-
-/**
- * An instance of another symbol (`SI`), placed with its own matrix and advanced
- * from `FF` — the frame its own timeline starts on.
- */
-@Serializable
-private data class AnimSymbolInstance(
-    @SerialName("SN") val symbolName: String = "",
-    @SerialName("FF") val firstFrame: Int = 0,
-    @SerialName("TRP") val translate: AnimVec = AnimVec(),
-    /** `LP` (loop), `PO` (play once) or `SF` (single frame). */
-    @SerialName("LP") val loop: String = "LP",
-    @SerialName("MX") val matrix: List<Double>? = null,
-)
-
-@Serializable
-private data class AnimVec(val x: Double = 0.0, val y: Double = 0.0)
-
-@Serializable
-private data class AnimEvent(
-    @SerialName("SI") val instance: AnimSymbolInstance? = null,
-    @SerialName("ASI") val atlas: AnimAtlasInstance? = null,
-)
-
-@Serializable
-private data class AnimFrame(
-    /** Frame label, only present on the layer that names the poses. */
-    @SerialName("N") val name: String? = null,
-    /** Index of the first timeline frame this keyframe covers. */
-    @SerialName("I") val start: Int = 0,
-    /** How many frames it covers. */
-    @SerialName("DU") val duration: Int = 1,
-    @SerialName("E") val events: List<AnimEvent> = emptyList(),
-)
-
-@Serializable
-private data class AnimLayer(
-    @SerialName("LN") val name: String = "",
-    /** `Clp` marks a mask layer, which is never drawn itself. */
-    @SerialName("LT") val layerType: String? = null,
-    @SerialName("FR") val frames: List<AnimFrame> = emptyList(),
-) {
-    /**
-     * `frameIndices[i]` is the keyframe shown at timeline frame `i`, built by
-     * repeating each keyframe's index for its `DU` frames. Flixel precomputes
-     * exactly this table.
-     */
-    val frameIndices: IntArray by lazy {
-        buildList {
-            frames.forEachIndexed { index, f -> repeat(f.duration.coerceAtLeast(1)) { add(index) } }
-        }.toIntArray()
-    }
-
-    val frameCount: Int get() = frameIndices.size
-
-    val isMask: Boolean get() = layerType == "Clp" || layerType == "Clipper"
-
-    /** The keyframe active at [index], or null if the layer has ended. */
-    fun keyframeAt(index: Int): AnimFrame? {
-        if (index < 0 || index >= frameIndices.size) return null
-        return frames.getOrNull(frameIndices[index])
-    }
-}
-
-@Serializable
-private data class AnimTimeline(@SerialName("L") val layers: List<AnimLayer> = emptyList()) {
-    val frameCount: Int get() = layers.maxOfOrNull { it.frameCount } ?: 0
-}
-
-@Serializable
-private data class AnimSymbol(@SerialName("TL") val timeline: AnimTimeline = AnimTimeline())
-
-/** `SD.S` — the symbol dictionary, keyed by the symbol name `SI.SN` refers to. */
-@Serializable
-private data class AnimSymbolDefs(@SerialName("S") val symbols: List<AnimSymbolDef> = emptyList())
-
-@Serializable
-private data class AnimSymbolDef(
-    @SerialName("SN") val name: String = "",
-    @SerialName("TL") val timeline: AnimTimeline = AnimTimeline(),
-)
-
-@Serializable
-private data class AnimMetadata(
-    @SerialName("FRT") val frameRate: Double = 24.0,
-    @SerialName("W") val width: Int = 0,
-    @SerialName("H") val height: Int = 0,
-)
-
-@Serializable
-private data class AnimRoot(
-    @SerialName("AN") val animation: AnimSymbol = AnimSymbol(),
-    @SerialName("SD") val symbolDefs: AnimSymbolDefs = AnimSymbolDefs(),
-    @SerialName("MD") val metadata: AnimMetadata = AnimMetadata(),
-)
-
-// ===========================================================================
-
-/** One atlas sprite to draw for a given timeline frame, already placed. */
-private data class PosePart(
-    val sprite: String,
-    val matrix: Mat,
-)
-
-private class Pose(val parts: List<PosePart>)
-
-private class Bounds {
-    var minX = Double.MAX_VALUE
-    var minY = Double.MAX_VALUE
-    var maxX = -Double.MAX_VALUE
-    var maxY = -Double.MAX_VALUE
-    val empty: Boolean get() = minX > maxX
-    val width: Double get() = if (empty) 0.0 else maxX - minX
-    val height: Double get() = if (empty) 0.0 else maxY - minY
-
-    fun add(x: Double, y: Double) {
-        minX = minOf(minX, x); maxX = maxOf(maxX, x)
-        minY = minOf(minY, y); maxY = maxOf(maxY, y)
-    }
-}
 
 /**
  * A playable FNF character: an Adobe Animate texture atlas plus its timeline.
@@ -319,11 +142,8 @@ class Character(val id: String) : Container() {
         "$root/$rawPath".removePrefix("/")
     }
 
-    private val anim: AnimRoot? = animateDir?.let { dir ->
-        runCatching {
-            knfJson.decodeFromString<AnimRoot>(KnfFiles.textOrNull("$dir/Animation.json") ?: "{}")
-        }.getOrNull()
-    }
+    /** The Animate atlas, for `renderType: animateatlas` / `multianimateatlas`. */
+    private val animateAtlas: AnimateAtlas? = animateDir?.let { AnimateAtlas(it) }
 
     /**
      * Legacy atlas for every character that predates the Animate pipeline.
@@ -340,17 +160,11 @@ class Character(val id: String) : Container() {
     }
 
     private val sprites: Map<String, SpriteDef> =
-        if (animateDir != null) loadSprites(animateDir) else loadLegacySprites(legacyAtlas)
-
-    private val symbolByName: Map<String, AnimTimeline> =
-        anim?.symbolDefs?.symbols.orEmpty().associate { it.name to it.timeline }
+        animateAtlas?.sprites ?: loadLegacySprites(legacyAtlas)
 
     /** All poses, indexed by timeline frame of the main symbol (or atlas frame). */
     private val poses: List<Pose> =
-        if (legacyAtlas != null) legacyPoses()
-        else runCatching { loadPoses() }.getOrElse {
-            println("KNF: character '$id' timeline failed: $it"); emptyList()
-        }
+        if (legacyAtlas != null) legacyPoses() else animateAtlas?.poses ?: emptyList()
 
     private val anims: Map<String, List<Int>> = runCatching { loadAnimations() }.getOrElse { emptyMap() }
 
@@ -384,7 +198,7 @@ class Character(val id: String) : Container() {
                 )
             }
         }
-    } ?: computeBounds()
+    } ?: animateAtlas?.bounds ?: Bounds()
 
     /** Undo the authoring origin, so local (0,0) is the character's top-left. */
     val originX: Double get() = bounds.minX
@@ -393,6 +207,21 @@ class Character(val id: String) : Container() {
     val localHeight: Double get() = bounds.height
 
     val displayName: String get() = data.name.ifEmpty { id }
+
+    /** FNF's `_data.isPixel`; pixel sheets render with nearest-neighbour sampling. */
+    val isPixel: Boolean get() = data.isPixel
+
+    /**
+     * Which face to put on the health bar.
+     *
+     * `BaseCharacter.getHealthIconId` falls back to the character's own id, and
+     * `BaseCharacter.initHealthIcon` flips the *player's* icon once because
+     * "BF is looking the other way".
+     */
+    val healthIconId: String get() = data.healthIcon?.id ?: id
+    val healthIconIsPixel: Boolean get() = data.healthIcon?.isPixel ?: data.isPixel
+    val healthIconFlipX: Boolean get() = data.healthIcon?.flipX ?: false
+    val healthIconShouldBop: Boolean get() = data.healthIcon?.shouldBop ?: true
 
     /** `BaseCharacter.getDataFlipX()` - the raw flag from `characters/<id>.json`. */
     val dataFlipX: Boolean get() = data.flipX
@@ -420,7 +249,7 @@ class Character(val id: String) : Container() {
     private var frameTime = 0.0
     private var frameIndex = 0
 
-    private val frameRate: Double = anim?.metadata?.frameRate ?: 24.0
+    private val frameRate: Double = animateAtlas?.frameRate ?: 24.0
 
     private var singTimer = 0.0
     private var dancing = true
@@ -467,41 +296,6 @@ class Character(val id: String) : Container() {
     // loading
     // ======================================================================
 
-    private fun loadSprites(dir: String): Map<String, SpriteDef> {
-        val json = KnfFiles.textOrNull("$dir/spritemap1.json") ?: return emptyMap()
-        val bitmap: Bitmap = KnfFiles.bitmapOrNull("$dir/spritemap1.png") ?: return emptyMap()
-
-        val raw = runCatching { knfJson.decodeFromString<SpritemapRoot>(json) }
-            .getOrElse {
-                println("KNF: character '$id' spritemap parse failed: $it")
-                return emptyMap()
-            }.atlas
-
-        val out = LinkedHashMap<String, SpriteDef>()
-        for (entry in raw.sprites) {
-            val s = entry.sprite ?: continue
-            if (s.w <= 0 || s.h <= 0) continue
-            // Better TA stores rotated sprites turned 90° clockwise in the sheet.
-            if (s.rotated) {
-                out[s.name] = SpriteDef(
-                    name = s.name,
-                    slice = bitmap.sliceWithSize(s.x, s.y, s.h, s.w),
-                    width = s.h,
-                    height = s.w,
-                    turned = true,
-                )
-            } else {
-                out[s.name] = SpriteDef(
-                    name = s.name,
-                    slice = bitmap.sliceWithSize(s.x, s.y, s.w, s.h),
-                    width = s.w,
-                    height = s.h,
-                    turned = false,
-                )
-            }
-        }
-        return out
-    }
 
     /**
      * Legacy sheet: one [SpriteDef] per atlas frame. A rotated frame has already
@@ -546,120 +340,27 @@ class Character(val id: String) : Container() {
      * events in order, symbol instances recursing into their own timeline at
      * `FF + (frameIndex - keyframeStart)`.
      */
-    private fun loadPoses(): List<Pose> {
-        val timeline = anim?.animation?.timeline ?: return emptyList()
-        val total = timeline.frameCount
-        if (total <= 0) return emptyList()
-
-        val out = ArrayList<Pose>(total)
-        for (index in 0 until total) {
-            val parts = ArrayList<PosePart>()
-            collect(timeline, index, Mat(), parts, 0)
-            out += Pose(parts)
-        }
-        return out
-    }
-
-    private fun collect(
-        timeline: AnimTimeline,
-        frameIndex: Int,
-        parent: Mat,
-        out: MutableList<PosePart>,
-        depth: Int,
-    ) {
-        if (depth > MAX_SYMBOL_DEPTH) return
-        // Flixel skips a timeline entirely once its frame counter runs past the end.
-        if (frameIndex < 0 || frameIndex >= timeline.frameCount) return
-
-        // `Timeline.draw` walks layers from the last index down to the first.
-        for (li in timeline.layers.indices.reversed()) {
-            val layer = timeline.layers[li]
-            if (layer.isMask) continue
-            val keyframe = layer.keyframeAt(frameIndex) ?: continue
-
-            for (event in keyframe.events) {
-                val asi = event.atlas
-                if (asi != null) {
-                    val def = sprites[asi.name] ?: continue
-                    out += PosePart(asi.name, matOf(asi.matrix).under(parent))
-                    continue
-                }
-                val si = event.instance ?: continue
-                val child = symbolByName[si.symbolName] ?: continue
-                val childFrame = resolveSymbolFrame(si, frameIndex, keyframe.start, child)
-                collect(child, childFrame, matOf(si.matrix).under(parent), out, depth + 1)
-            }
-        }
-    }
 
     /**
-     * `SymbolInstance.getFrameIndex`: the instance's own timeline starts at `FF`
-     * and advances with the parent's frame counter, clamped or wrapped by `LP`.
-     */
-    private fun resolveSymbolFrame(
-        si: AnimSymbolInstance,
-        frameIndex: Int,
-        keyframeStart: Int,
-        child: AnimTimeline,
-    ): Int {
-        val first = si.firstFrame
-        val last = child.frameCount - 1
-        if (last < 0) return 0
-        val raw = first + (frameIndex - keyframeStart)
-        return when (si.loop) {
-            "PO", "playonce" -> raw.coerceAtMost(last)
-            "SF", "singleframe" -> first
-            else -> ((raw % (last + 1)) + (last + 1)) % (last + 1)
-        }
-    }
-
-    /**
-     * Union of every sprite in every pose — FNF's `Timeline._bounds`.
+     * Legacy sheet animations, resolved the way Flixel does it on a plain
+     * `FlxSprite` loaded from the whole PNG.
      *
-     * All four corners are transformed, because a limb that is rotated or scaled
-     * covers more than a plain `centre +/- half size` box; using the box instead
-     * would clip characters whose sing poses swing further than their idle ones.
+     * With no prefix list to index into, `frameIndices` are absolute positions in
+     * the sheet's frame collection, so `spooky`'s `danceRight` `[8..15]` picks the
+     * second half of its sixteen `spooky dance idle0` frames. Without them the
+     * prefix match runs over every frame name in sheet order, which is the same
+     * order the exporter wrote them in.
      */
-    private fun computeBounds(): Bounds {
-        val b = Bounds()
-        for (pose in poses) {
-            for (part in pose.parts) {
-                val def = sprites[part.sprite] ?: continue
-                val w = def.width.toDouble()
-                val h = def.height.toDouble()
-                for (corner in CORNERS) {
-                    val (x, y) = part.matrix.xform(corner[0] * w, corner[1] * h)
-                    b.add(x, y)
-                }
-            }
-        }
-        return b
-    }
-
     /**
      * Every main-timeline frame carrying [prefix], expanded over each keyframe's
      * duration.
      *
      * Mirrors flixel-animate's `findFrameLabelIndices`: layers are walked in
      * order and the scan stops at the *first layer that has a match*, so a label
-     * that only exists on layer 1 is still found. Only the trailing whitespace
-     * of a label is stripped (`frame.name.rtrim()`).
+     * that only exists on layer 1 is still found.
      */
-    private fun labelFrames(prefix: String): List<Int> {
-        val timeline = anim?.animation?.timeline ?: return emptyList()
-        for (layer in timeline.layers) {
-            val out = ArrayList<Int>()
-            for (frame in layer.frames) {
-                if (frame.name?.trimEnd() != prefix) continue
-                for (i in 0 until frame.duration) {
-                    val index = frame.start + i
-                    if (index in poses.indices) out += index
-                }
-            }
-            if (out.isNotEmpty()) return out
-        }
-        return emptyList()
-    }
+    private fun labelFrames(prefix: String): List<Int> =
+        animateAtlas?.labelFrames(prefix) ?: emptyList()
 
     /**
      * Animation name -> the main-timeline frames it plays.
@@ -684,12 +385,11 @@ class Character(val id: String) : Container() {
      * index would show `singUP`'s first frame for a single frame of dad's idle.
      */
     private fun loadAnimations(): Map<String, List<Int>> {
-        val legacy = legacyAtlas != null
-        if (!legacy && anim?.animation?.timeline == null) return emptyMap()
+        if (animateAtlas == null && legacyAtlas == null) return emptyMap()
         val out = LinkedHashMap<String, List<Int>>()
 
         for (def in data.animations) {
-            val frames = if (legacy) {
+            val frames = if (legacyAtlas != null) {
                 legacyAnimationFrames(def)
             } else if (!def.frameIndices.isNullOrEmpty()) {
                 val found = labelFrames(def.prefix)
@@ -704,16 +404,6 @@ class Character(val id: String) : Container() {
         return out
     }
 
-    /**
-     * Legacy sheet animations, resolved the way Flixel does it on a plain
-     * `FlxSprite` loaded from the whole PNG.
-     *
-     * With no prefix list to index into, `frameIndices` are absolute positions in
-     * the sheet's frame collection, so `spooky`'s `danceRight` `[8..15]` picks the
-     * second half of its sixteen `spooky dance idle0` frames. Without them the
-     * prefix match runs over every frame name in sheet order, which is the same
-     * order the exporter wrote them in.
-     */
     private fun legacyAnimationFrames(def: CharacterAnimationDef): List<Int> {
         val order = sprites.keys.toList()
         if (def.frameIndices.isNullOrEmpty()) {
@@ -837,6 +527,7 @@ class Character(val id: String) : Container() {
             }
             img.visible = true
             img.bitmap = def.slice
+            img.setPixelArt(isPixel)
 
             // Anchor at the sprite's centre so scale and rotation compose the
             // same way the Animate matrix does.

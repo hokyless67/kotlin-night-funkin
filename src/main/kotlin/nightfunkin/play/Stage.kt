@@ -6,8 +6,13 @@ import korlibs.korge.view.Image
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import nightfunkin.core.AnimateAtlas
 import nightfunkin.core.KnfFiles
+import nightfunkin.core.setPixelArt
+import korlibs.math.geom.Anchor2D
 import korlibs.math.geom.degrees
+import kotlin.math.atan2
+import kotlin.math.hypot
 
 // ===========================================================================
 // preload/data/stages/<id>.json
@@ -28,6 +33,20 @@ data class StagePropData(
     val isPixel: Boolean = false,
     val flipX: Boolean = false,
     val flipY: Boolean = false,
+    /** `animateatlas`, `sparrow` or `packer`; only `animateatlas` is supported. */
+    val animType: String = "",
+    /** The animations the prop can play, as frame-label prefixes. */
+    val animations: List<StagePropAnimation>? = null,
+    /** Which of [animations] starts playing. */
+    val startingAnimation: String? = null,
+)
+
+/** One of a prop's animations: a name and the frame-label prefix it plays. */
+@Serializable
+data class StagePropAnimation(
+    val name: String = "",
+    val prefix: String = "",
+    val looped: Boolean = false,
 )
 
 @Serializable
@@ -70,6 +89,15 @@ class StageDataFile(val id: String) {
     val cameraZoom: Double get() = data.cameraZoom ?: 1.0
     val characters: StageCharacters get() = data.characters
 
+    /**
+     * The asset library the stage lives in, e.g. `week2`.
+     *
+     * FNF's `Paths.getLibraryPathForce(file, library)` builds
+     * `'$library:assets/$library/$file'`, so a stage's `directory` names the
+     * top-level folder its props are resolved against.
+     */
+    val directory: String get() = data.directory
+
     fun characterFor(slot: String): StageCharacterData? =
         when (slot) {
             "bf" -> characters.bf
@@ -90,7 +118,7 @@ class StageDataFile(val id: String) {
 class Stage(id: String) : Container() {
 
     private val file = StageDataFile(id)
-    private val loaded = ArrayList<Image>()
+    private val loaded = ArrayList<Container>()
 
     /** Parallax factors of each loaded prop, parallel to [loaded]. */
     val scrollFactors = ArrayList<Pair<Double, Double>>()
@@ -106,19 +134,95 @@ class Stage(id: String) : Container() {
         if (loaded.isEmpty()) println("KNF: stage '$id' has no usable props")
     }
 
-    private fun buildProp(prop: StagePropData): Image? {
+    private fun buildProp(prop: StagePropData): Container? {
         if (prop.assetPath.isEmpty()) return null
         if (prop.assetPath.startsWith("#")) return buildSolidColor(prop)
+        if (prop.animType == "animateatlas") return buildAnimateProp(prop)
 
         val bmp: Bitmap = resolveAsset(prop.assetPath) ?: return null
-        return Image(bmp).also { apply(it, prop, bmp.width.toDouble(), bmp.height.toDouble()) }
+        val img = Image(bmp)
+        apply(img, prop, bmp.width.toDouble(), bmp.height.toDouble())
+        // FNF: `propSprite.antialiasing = !dataProp.isPixel;`
+        img.setPixelArt(prop.isPixel)
+        return Container().also { it.addChild(img) }
+    }
+
+    /**
+     * A prop drawn from an Adobe Animate atlas.
+     *
+     * FNF's `Stage.addProp`:
+     *
+     * ```haxe
+     * case 'animateatlas':
+     *     propSprite.loadTextureAtlas(dataProp.assetPath, _data.directory, cast dataProp.atlasSettings);
+     * ```
+     *
+     * The "animation" of such a prop is a frame *label* in the atlas' main
+     * timeline - `halloweenBG` plays the `static` label, `sniper` the `Idle` one -
+     * so the prop is the union of the sprites of that label's first frame.
+     */
+    private fun buildAnimateProp(prop: StagePropData): Container? {
+        val dir = KnfFiles.findAnimateDir(file.directory, prop.assetPath)
+        if (dir == null) {
+            println("KNF: stage prop asset missing: ${prop.assetPath} (${prop.animType})")
+            return null
+        }
+        val atlas = AnimateAtlas(dir)
+        if (atlas.sprites.isEmpty()) {
+            println("KNF: stage prop '${file.id}' has no sprites in $dir")
+            return null
+        }
+
+        val prefix = prop.animations
+            ?.firstOrNull { it.name == (prop.startingAnimation ?: "idle") }
+            ?.prefix
+            ?: prop.animations?.firstOrNull()?.prefix
+            ?: return null
+
+        val frames = atlas.labelFrames(prefix)
+        if (frames.isEmpty()) {
+            println("KNF: stage prop '${file.id}' has no frame labelled '$prefix' in $dir")
+            return null
+        }
+
+        val pose = atlas.poses.getOrNull(frames.first()) ?: return null
+        val box = atlas.boundsOf(frames.first())
+
+        val container = Container()
+        for (part in pose.parts) {
+            val def = atlas.sprites[part.sprite] ?: continue
+            val img = Image(def.slice)
+            img.anchor = Anchor2D.CENTER
+            val m = part.matrix
+            val (cx, cy) = m.xform(def.width / 2.0, def.height / 2.0)
+            img.x = cx - box.minX
+            img.y = cy - box.minY
+            // The same decomposition `Character.renderPose` uses: a negative
+            // determinant means the symbol is mirrored, not rotated.
+            img.scaleX = hypot(m.a, m.b) * (if (m.a * m.d - m.c * m.b < 0.0) -1.0 else 1.0)
+            img.scaleY = hypot(m.c, m.d)
+            img.rotation = ((if (def.turned) -90.0 else 0.0) +
+                Math.toDegrees(atan2(m.b, m.a))).degrees
+            img.setPixelArt(prop.isPixel)
+            container.addChild(img)
+        }
+
+        val sx = prop.scale.getOrElse(0) { 1.0 }
+        val sy = prop.scale.getOrElse(1) { 1.0 }
+        container.scaleX = sx
+        container.scaleY = sy
+        container.x = prop.position.getOrElse(0) { 0.0 }
+        container.y = prop.position.getOrElse(1) { 0.0 }
+        container.alpha = prop.alpha
+        container.rotation = prop.angle.degrees
+        return container
     }
 
     /**
      * Solid-colour props: FNF makes a 1x1 sprite and scales it to `scale`, which
      * is how the speaker/lamp blocks in later weeks are drawn.
      */
-    private fun buildSolidColor(prop: StagePropData): Image? {
+    private fun buildSolidColor(prop: StagePropData): Container? {
         val w = prop.scale.getOrElse(0) { 1.0 }
         val h = prop.scale.getOrElse(1) { 1.0 }
         if (w <= 0 || h <= 0) return null
@@ -126,7 +230,9 @@ class Stage(id: String) : Container() {
         val bmp = korlibs.image.bitmap.Bitmap32(
             1, 1, intArrayOf(argb), false,
         )
-        return Image(bmp).also { apply(it, prop, w, h, extraScaleX = w, extraScaleY = h) }
+        val img = Image(bmp)
+        apply(img, prop, w, h, extraScaleX = w, extraScaleY = h)
+        return Container().also { it.addChild(img) }
     }
 
     private fun apply(
