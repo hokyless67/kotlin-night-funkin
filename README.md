@@ -55,8 +55,11 @@ Game design, data format etc. are the work of the Friday Night Funkin' crew (Pha
 ninjamuffin99, Kawai Sprite and many more). This project is an independent
 reimplementation for study and experimentation.
 
-[Official Friday Night Funkin' GitHub](https://github.com/FunkinCrew/funkin)
-[Official Friday Night Funkin' Assets](https://github.com/FunkinCrew/Funkin.assets/tree/724eba9de9e76761d9cefd52169926bc51c760a5)
-[Official KorGE GitHub](https://github.com/korlibs/korge)
+---
 
-[My Discord](https://потом.добавлю.ссылку)
+## Links
+
+* **[Official Friday Night Funkin' GitHub](https://github.com/FunkinCrew/funkin)**
+* **[Official Friday Night Funkin' Assets](https://github.com/FunkinCrew/Funkin.assets/tree/724eba9de9e76761d9cefd52169926bc51c760a5)**
+* **[Official KorGE GitHub](https://github.com/korlibs/korge)**
+* **[My Discord](https://потом.добавлю.ссылку)**
