@@ -1,0 +1,39 @@
+# ---- Gradle / Kotlin build output -------------------------------------------
+build/
+.gradle/
+.kotlin/
+out/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# ---- IDE / editor -----------------------------------------------------------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+*~
+
+# ---- OS junk ----------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Logs / crash dumps -----------------------------------------------------
+*.log
+hs_err_pid*
+replay_pid*
+
+# ---- Extracted dependency sources / stray jars ------------------------------
+# KorGE/Korlibs sources that were unpacked for API reference only; the build
+# compiles src/main/kotlin and never reads these.
+/commonMain/
+/jvmMain/
+/META-INF/
+
+# ---- Upstream Friday Night Funkin' sources & assets -------------------------
+# Reference material and runtime assets. The Kotlin port does not need these to
+# build; keep them locally only.
+/Funkin-0.8.6-Source/

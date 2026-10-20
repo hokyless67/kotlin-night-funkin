@@ -67,6 +67,15 @@ class TextureAtlas private constructor(
     fun frame(name: String): AtlasFrame? = frames[name]
 
     /**
+     * The first frame in atlas file order.
+     *
+     * Flixel's `set_frames` points a sprite at index 0, and `updateHitbox()`
+     * then derives `width`/`height` from *that* frame - so this is the frame
+     * that fixes a receptor's hitbox for the rest of its life.
+     */
+    fun firstFrame(): AtlasFrame? = frames.values.firstOrNull()
+
+    /**
      * Lazily slices the frame out of the base bitmap.
      *
      * A rotated frame is physically turned back the moment it is cut out, so

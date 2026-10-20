@@ -66,20 +66,14 @@ class SustainTrail(
     private val endOffset: Double = if (noteStyle.isHoldNotePixel) 1.0 else 0.5
     private val bottomClip: Double = if (noteStyle.isHoldNotePixel) 1.0 else 0.9
 
-    /** The end cap's height, `graphic.height * zoom * (bottomClip - endOffset)`. */
-    private val capHeightPx: Double =
-        (noteStyle.holdNoteSheetHeight() ?: 0) * noteStyle.holdNoteScale.toDouble() *
-            (bottomClip - endOffset)
-
     /** `graphic.height * zoom * endOffset` - the part of the sheet the cap eats. */
     private val bottomHeightPx: Double =
         (noteStyle.holdNoteSheetHeight() ?: 0) * noteStyle.holdNoteScale.toDouble() * endOffset
 
     init {
-        // FNF: `holdNoteSprite.x = this.x + getXPos(dir) + STRUMLINE_SIZE / 2 - width / 2`,
-        // and the trail is centre-anchored, so its centre is the lane centre.
-        // Without this every tail piles up in lane 0.
-        x = laneX.toDouble()
+        // FNF: `holdNoteSprite.x = this.x + getXPos(dir) + STRUMLINE_SIZE / 2 - holdNote.width / 2;`
+        // The tail's artwork is centred on the lane, exactly like the note head.
+        x = laneX.toDouble() + Constants.STRUMLINE_SIZE / 2.0
 
         val pair = noteStyle.sustainSlices(directionIndex)
         if (pair != null) {
@@ -87,8 +81,15 @@ class SustainTrail(
             // FNF's vertices start at the top of the sheet and grow downwards, so
             // the body hangs from its first row rather than being centred on it.
             body = image(bodySlice).also { it.anchor = Anchor2D.TOP_LEFT }
-            cap = image(capSlice).also { it.anchor = Anchor2D.TOP_LEFT }
-            cap?.visible = false
+            // FNF samples the cap's UVs from 0 to `bottomClip` (0.9 for the
+            // normal skins, 1.0 for pixel), i.e. the column is drawn at its own
+            // uniform zoom, not squashed into `endOffset`. Crop the column to
+            // that fraction so KorGE reproduces the same height.
+            val capRows = (capSlice.height * bottomClip).toInt().coerceAtLeast(1)
+            val capVisible =
+                if (capRows < capSlice.height) capSlice.sliceWithSize(0, 0, capSlice.width, capRows)
+                else capSlice
+            cap = image(capVisible).also { it.anchor = Anchor2D.TOP_LEFT }
             body?.setPixelArt(noteStyle.isHoldNotePixel)
             cap?.setPixelArt(noteStyle.isHoldNotePixel)
         }
@@ -120,13 +121,21 @@ class SustainTrail(
      * holdNote.y = this.y - INITIAL_OFFSET - holdNote.height + STRUMLINE_SIZE / 2;
      * ```
      *
-     * The tail therefore starts at the head's lower edge - centring it instead
-     * is what pushed it a long way up the lane.
+     * The `- holdNote.height` term cancels the mesh's own height, so the edge
+     * that meets the arrow is `y + graphicHeight` - the head's *centre* in both
+     * scroll directions. That is the point computed below as [attachY]; getting
+     * it wrong is what leaves the tail hanging below the arrow instead of being
+     * clipped in its middle.
      */
     fun updateGeometry(conductor: Conductor) {
         val b = body ?: return
         val c = cap ?: return
 
+        // FNF shortens the tail while the note is held
+        // (`holdNote.sustainLength = (strumTime + fullSustainLength) - songPosition`),
+        // which makes it shrink at exactly the scroll rate - the far end of the
+        // tail therefore stays put in the world while the top is pinned to the
+        // receptor.
         if (clipping) {
             sustainLength = (strumTime + fullSustainLength) - conductor.songPosition
         }
@@ -138,7 +147,6 @@ class SustainTrail(
         }
         visible = true
 
-        val headY = strumlineY - Constants.INITIAL_OFFSET + noteOffsetY(conductor)
         val half = Constants.STRUMLINE_SIZE / 2.0
         val graphicHeight = sustainHeightPx(sustainLength)
         val bodyHeight = graphicHeight - bottomHeightPx
@@ -148,33 +156,40 @@ class SustainTrail(
             return
         }
         b.visible = true
-        c.visible = capHeightPx > 1.0
+        c.visible = true
 
-        // Where the tail's leading edge sits.
-        val trailY = when {
-            clipping && downscroll -> strumlineY - Constants.INITIAL_OFFSET - graphicHeight + half
-            clipping -> strumlineY - Constants.INITIAL_OFFSET + half
-            downscroll -> headY - graphicHeight + half + yOffset
-            else -> headY + half + yOffset
+        // The point the tail hangs from is always the head's centre: the
+        // receptor centre once it is held, and the (moving) head centre while it
+        // is being approached. FNF computes a different `holdNote.y` for each
+        // scroll direction (`y`, and `y - height`), but the mesh's leading edge
+        // is `y` upscroll and `y + graphicHeight` downscroll, so the on-screen
+        // attachment is identical either way.
+        val attachY = if (clipping) {
+            strumlineY - Constants.INITIAL_OFFSET + half
+        } else {
+            strumlineY - Constants.INITIAL_OFFSET + noteOffsetY(conductor) + half + yOffset
         }
         // The container only carries the lane's X; the Y is absolute, so the
         // container must not offset it a second time.
         y = 0.0
 
-        // The body hangs from the leading edge, in the direction the note came from.
-        val bodyTop = if (downscroll) trailY - bodyHeight else trailY
+        // The body hangs from the attachment, in the direction the note came
+        // from; the cap then closes the far end (`flipY` mirrors both in FNF).
+        val bodyTop = if (downscroll) attachY - bodyHeight else attachY
         b.x = -widthPx / 2.0
         b.y = bodyTop
         b.scaleX = widthPx / b.bitmap.width.toDouble().coerceAtLeast(1.0)
         b.scaleY = bodyHeight / b.bitmap.height.toDouble().coerceAtLeast(1.0)
 
-        // The rounded cap closes the end the tail is heading towards; downscroll
-        // mirrors the trail, so the cap swaps to the top (`flipY` in FNF).
-        val capScale = widthPx / c.bitmap.width.toDouble().coerceAtLeast(1.0)
-        c.scaleX = capScale
-        c.scaleY = capHeightPx / c.bitmap.height.toDouble().coerceAtLeast(1.0)
+        // FNF draws the cap at its own uniform `zoom` over the top `bottomClip`
+        // of the column, so its height is `graphic.height * zoom * bottomClip`
+        // and the rounded end reaches
+        // `graphic.height * zoom * (bottomClip - endOffset)` past the body.
+        val capScreenHeight = c.bitmap.height.toDouble() * noteStyle.holdNoteScale.toDouble()
+        c.scaleX = noteStyle.holdNoteScale.toDouble()
+        c.scaleY = noteStyle.holdNoteScale.toDouble()
         c.x = -widthPx / 2.0
-        c.y = if (downscroll) bodyTop - capHeightPx else bodyTop + bodyHeight
+        c.y = if (downscroll) bodyTop - capScreenHeight else bodyTop + bodyHeight
     }
 
     fun kill() = removeFromParent()
@@ -226,11 +241,14 @@ class NoteSprite(
 
     init {
         host.addChild(this)
+        // FNF: `this.notes.zIndex = 30;` - the note head draws over the tail.
+        zIndex = 30.0
         slice?.let { s ->
             head = image(s).also {
-                // Flixel draws sprites centred on their origin; matching that here
-                // is what keeps the arrow head sitting on the receptor.
-                it.anchor = Anchor2D.CENTER
+                // Flixel draws a sprite's graphic from its *top left* corner
+                // (`centerOffsets` + `centerOrigin` cancel out), so the note head
+                // is anchored the same way as the receptor it has to land on.
+                it.anchor = Anchor2D.TOP_LEFT
                 it.scaleX = noteStyle.scale.toDouble()
                 it.scaleY = noteStyle.scale.toDouble()
                 it.setPixelArt(noteStyle.isPixel)
@@ -242,12 +260,11 @@ class NoteSprite(
     val isHolding: Boolean get() = holdTrail?.clipping == true
 
     fun setDirection(dir: Int, slice: AtlasSlice?) {
-        // A pooled note can come back as a different direction, and the tail is
-        // baked for one direction only, so it has to be rebuilt.
-        if (dir != directionIndex) {
-            holdTrail?.kill()
-            holdTrail = null
-        }
+        // The tail belongs to the note that owned it, so it always goes with the
+        // note into the pool - otherwise a tap note can inherit the tail of the
+        // hold note that used the same sprite.
+        holdTrail?.kill()
+        holdTrail = null
         directionIndex = dir
         val img = head
         if (img != null && slice != null) {
@@ -268,7 +285,9 @@ class NoteSprite(
         val dir = directionIndex
         var trail = holdTrail
         if (trail == null) {
-            trail = SustainTrail(host, dir, noteStyle, laneX)
+            // FNF: `this.holdNotes.zIndex = 20;` - the tail draws over the
+            // receptor but under the note head.
+            trail = SustainTrail(host, dir, noteStyle, laneX).also { it.zIndex = 20.0 }
             holdTrail = trail
         }
         trail.strumTime = strumTime
@@ -312,6 +331,21 @@ class NoteSprite(
         holdTrail?.clipping = true
     }
 
+    /**
+     * FNF's `Strumline.hitNote` -> `killNote`: the note head is hidden (and
+     * killed) as soon as it is struck, while the hold trail lives on. This is
+     * what lets a held trail show all the way up to the receptor's centre
+     * instead of being covered by its own arrow.
+     */
+    fun hideHead() {
+        head?.visible = false
+    }
+
+    /** Re-shows the head when the pooled sprite is handed back out. */
+    fun showHead() {
+        head?.visible = true
+    }
+
     fun releaseClip(conductor: Conductor? = null) {
         holdTrail?.let { trail ->
             if (trail.clipping && conductor != null) {
@@ -320,6 +354,8 @@ class NoteSprite(
                 val consumed = (trail.strumTime + trail.fullSustainLength) - conductor.songPosition
                 trail.yOffset =
                     (trail.fullSustainLength - consumed.coerceAtLeast(0f)) * Constants.PIXELS_PER_MS
+                // The tail is cut back to what was actually played.
+                trail.sustainLength = consumed.coerceAtLeast(0f)
             }
             trail.clipping = false
         }

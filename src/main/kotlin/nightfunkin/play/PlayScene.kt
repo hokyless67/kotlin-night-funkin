@@ -72,6 +72,9 @@ class PlayScene : Scene() {
     private lateinit var playerStrumline: Strumline
     private lateinit var opponentStrumline: Strumline
     private lateinit var hud: Hud
+
+    /** When the bot should let go of each lane, in song milliseconds. */
+    private val autoReleaseAt = HashMap<Int, Float>()
     private lateinit var camera: GameplayCamera
 
     // ---- gameplay state -------------------------------------------------
@@ -283,7 +286,6 @@ class PlayScene : Scene() {
         hud = Hud(hudContainer, noteStyle, downscroll)
         hud.resetHealth()
         hud.setHealthIcons(player, opponent)
-        playerStrumline.pressKey(0)
 
         // ---- audio -------------------------------------------------------
         val instPath = song.instrumentalPath()
@@ -642,15 +644,29 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
     }
 
     private fun onPress(lane: Int) {
+        // FNF's strumline plays the press animation from its update loop, as
+        // soon as the key is held:
+        //
+        // ```haxe
+        // if (isKeyHeld(dir) && getByDirection(dir).getCurrentAnimation() == 'static') {
+        //     playPress(dir);
+        // }
+        // ```
+        //
+        // so the arrow sinks the moment you press it, hit or miss.
+        playerStrumline.pressKey(lane)
+
         val candidates = playerStrumline.notesMayHit(lane)
         if (candidates.isEmpty()) {
-            playerStrumline.pressKey(lane)
-            ghostTap()
+            // FNF's `Strumline.mayGhostTap`: a tap into empty air only counts
+            // when no note is in range and none was hit just before.
+            if (playerStrumline.mayGhostTap()) ghostTap()
             return
         }
         val note = candidates.first()
         goodNoteHit(note)
-        playerStrumline.playConfirm(lane)
+        // FNF's `Strumline.hitNote`: the confirm animation and the splash.
+        playerStrumline.hitNote(lane)
     }
 
     private fun onRelease(lane: Int) {
@@ -711,6 +727,8 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         note.hasBeenHit = true
         note.judgement = judgement
         note.timingErrorMs = timingError
+        // FNF's `hitNote` -> `killNote`: the arrow disappears on impact.
+        note.hideHead()
 
         score += Scoring.scoreNote(absError)
         combo++
@@ -723,9 +741,12 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         // FNF's BF behaviour: strike the matching `singDIR` pose on every hit.
         if (note.isPlayerNote) player.sing(note.directionIndex, conductor.stepLengthMs.toDouble())
 
-        if (note.isHoldNote) note.startClip()
-
-
+        if (note.isHoldNote) {
+            note.startClip()
+            // FNF's `PlayState.processNoteHit`:
+            // `if (note.isHoldNote && note.holdNoteSprite != null) playerStrumline.playNoteHoldCover(note.holdNoteSprite);`
+            playerStrumline.playNoteHoldCover(note.directionIndex)
+        }
     }
 
     private fun ghostTap() {
@@ -742,17 +763,33 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         checkDeath()
     }
 
-    /** FNF's botplay: strikes every note exactly on its strum time. */
+    /**
+     * FNF's botplay: strikes every note exactly on its strum time.
+     *
+     * The bot holds the key down for the note's length and then lets go, so the
+     * receptor goes back to its static pose instead of sticking on the pressed
+     * one.
+     */
     private fun autoPlayPlayerNotes() {
         val now = conductor.songPosition
         for (note in playerStrumline.notes) {
             if (note.hasBeenHit || note.hasMissed) continue
             if (now >= note.strumTime - 1f) {
                 goodNoteHit(note)
-                playerStrumline.playConfirm(note.directionIndex)
                 playerStrumline.pressKey(note.directionIndex)
+                playerStrumline.hitNote(note.directionIndex)
+                // Let go once the note (or its sustain) is over.
+                val hold = if (note.isHoldNote) note.fullSustainLength else 60f
+                autoReleaseAt[note.directionIndex] = note.strumTime + hold
             } else if (now >= note.strumTime - 60f) {
                 playerStrumline.pressKey(note.directionIndex)
+            }
+        }
+        for (lane in autoReleaseAt.keys.toList()) {
+            val at = autoReleaseAt[lane] ?: continue
+            if (now >= at) {
+                autoReleaseAt.remove(lane)
+                playerStrumline.releaseKey(lane)
             }
         }
     }
@@ -762,7 +799,8 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
             if (note.mayHit && !note.hasBeenHit && !note.hasMissed) {
                 note.hasBeenHit = true
                 note.timingErrorMs = conductor.songPosition - note.strumTime
-                opponentStrumline.playConfirm(note.directionIndex)
+                note.hideHead()
+                opponentStrumline.hitNote(note.directionIndex)
                 // FNF's DAD behaviour: the CPU poses on every note it lands.
                 opponent.sing(note.directionIndex, conductor.stepLengthMs.toDouble())
                 if (note.isHoldNote) note.startClip()
@@ -804,13 +842,15 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
                 // FNF's `Strumline.holdConfirm`: the receptor keeps the confirm
                 // pose for as long as the note is held.
                 playerStrumline.holdConfirm(lane)
-                if (!gameInput.isDown(lane)) {
+                if (!playerStrumline.isKeyHeld(lane)) {
                     note.releaseClip()
+                    playerStrumline.endNoteHoldCover(lane)
                     continue
                 }
                 val remaining = note.fullSustainLength - (now - note.strumTime)
                 if (remaining <= 0f) {
                     note.releaseClip()
+                    playerStrumline.endNoteHoldCover(lane)
                     continue
                 }
                 // FNF grants a small health drip while the tail is held.

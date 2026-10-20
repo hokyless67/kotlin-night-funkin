@@ -44,6 +44,23 @@ class Strumline(
     private val splashLayers = arrayOfNulls<Container>(Constants.KEY_COUNT)
 
     /**
+     * Which lanes are currently held down.
+     *
+     * The receptor needs to know: FNF's `StrumlineNote.onAnimationFinished` only
+     * falls back to the pressed pose while the key is still down.
+     */
+    private val heldKeys = BooleanArray(Constants.KEY_COUNT)
+
+    /** The hold note covers, one per lane. */
+    private val holdCovers = arrayOfNulls<HoldCover>(Constants.KEY_COUNT)
+
+    /**
+     * FNF's `Constants.GHOST_TAP_DELAY` (3/8 s): a tap into empty air is
+     * forgiven for a moment after a real hit.
+     */
+    private var ghostTapTimer = 0.0
+
+    /**
      * Lane-local y of the receptor line. Notes are children of the same
      * container, so this stays local — adding the lane's screen y on top of it
      * would count the offset twice.
@@ -69,8 +86,12 @@ class Strumline(
                 // FNF spreads them by a few pixels (`INITIAL_OFFSET` on the
                 // receptor, `STRUMLINE_SIZE / 2` on the tail), which leaves the
                 // hold tail visibly off to the right of its arrow.
-                it.container.x = xPos(i)
+                // FNF: child.x = getXPos(dir) + INITIAL_OFFSET; child.y = 0; - the receptors
+                // are children of the strumline, so the lane offset is added here.
+                it.container.x = xPos(i) + Constants.INITIAL_OFFSET.toDouble()
                 it.container.y = 0.0
+                // FNF: `this.strumlineNotes.zIndex = 10;`
+                it.container.zIndex = 10.0
             }
         }
     }
@@ -117,7 +138,29 @@ class Strumline(
     fun update(conductor: Conductor, songStart: Float = 0f, dt: Double = 1.0 / 60.0) {
         spawnIncoming(conductor, songStart)
         updateNotes(conductor)
-        receptors.forEach { it?.update(dt) }
+        if (ghostTapTimer > 0.0) {
+            ghostTapTimer -= dt * 1000.0
+            if (ghostTapTimer <= 0.0) ghostTapTimer = 0.0
+        }
+        // FNF's `Strumline.updateNotes`:
+        //
+        // ```haxe
+        // for (dir in DIRECTIONS) {
+        //     if (isKeyHeld(dir) && getByDirection(dir).getCurrentAnimation() == 'static') {
+        //         playPress(dir);
+        //     }
+        // }
+        // ```
+        //
+        // The press pose is driven by the *held* state, and only entered from
+        // the static one - which is also what makes the receptor come back to
+        // the static pose once the confirm animation is over.
+        for (dir in 0 until Constants.KEY_COUNT) {
+            val receptor = receptors[dir] ?: continue
+            if (heldKeys[dir] && receptor.isStatic) receptor.press()
+            receptor.update(dt, heldKeys[dir])
+            holdCovers[dir]?.update(dt)
+        }
     }
 
     private fun spawnIncoming(conductor: Conductor, songStart: Float) {
@@ -155,9 +198,12 @@ class Strumline(
         note.lowPriority = false
         note.judgement = null
         note.visible = true
+        note.showHead()
 
-        // Head, centred on the lane and nudged 2px left, matching FNF.
-        note.x = xPos(dir) - Constants.NUDGE
+        // FNF: `noteSprite.x = this.x + getXPos(dir) - (width - STRUMLINE_SIZE) / 2 - NUDGE;`
+        // The note's artwork is centred on that position, so the head and the
+        // receptor line up when the note reaches the strumline.
+        note.x = xPos(dir) - (note.displayWidth() - Constants.STRUMLINE_SIZE) / 2.0 - Constants.NUDGE.toDouble()
 
         if (nd.length > 0f) note.ensureTrail()
         notes += note
@@ -191,9 +237,20 @@ class Strumline(
             } else {
                 note.y < -256
             }
+
+            // A hold note's tail lives on after its head has scrolled off, so
+            // the note has to stay around until the hold is over. FNF keeps them
+            // apart - the head is in the `notes` group and the tail in
+            // `holdNotes` - while KNF hangs the tail off the head.
+            if (note.isHoldNote && note.isHolding) {
+                val remaining = (note.strumTime + note.fullSustainLength) - now
+                if (remaining <= 0f) note.releaseClip(conductor)
+            }
+
             // FNF recycles anything resolved (hit or missed) once it scrolls off.
             // Hit notes matter here too, otherwise they pile up for the whole song.
-            if (offscreen && (note.hasMissed || note.hasBeenHit || note.handledMiss)) {
+            val holdActive = note.isHoldNote && note.isHolding
+            if (!holdActive && offscreen && (note.hasMissed || note.hasBeenHit || note.handledMiss)) {
                 recycle(i)
                 continue
             }
@@ -217,13 +274,70 @@ class Strumline(
         it.directionIndex == direction && it.mayHit && !it.hasBeenHit && !it.hasMissed
     }
 
+    /**
+     * FNF's `Strumline.playPress` path: the key went down.
+     *
+     * The press *pose* is not what this plays - the splash is FNF's
+     * `PlayState.processNoteHit`:
+     *
+     * ```haxe
+     * playerStrumline.hitNote(note, !event.isComboBreak);
+     * if (event.doesNotesplash) playerStrumline.playNoteSplash(note.noteData.getDirection());
+     * ```
+     *
+     * so the impact graphic belongs to a hit, not to a key press.
+     */
     fun pressKey(direction: Int) {
+        heldKeys[direction] = true
         receptors[direction]?.press()
-        playSplash(direction)
     }
 
     fun releaseKey(direction: Int) {
+        heldKeys[direction] = false
         receptors[direction]?.release()
+    }
+
+    /** FNF's `Strumline.isKeyHeld`, including notes struck by the bot. */
+    fun isKeyHeld(direction: Int): Boolean = heldKeys[direction]
+
+    /**
+     * FNF's `Strumline.hitNote`: the confirm animation plus the note splash.
+     */
+    fun hitNote(direction: Int) {
+        receptors[direction]?.confirm()
+        playSplash(direction)
+        // FNF forgives ghost taps for a moment after a hit.
+        ghostTapTimer = Constants.GHOST_TAP_DELAY
+    }
+
+    /**
+     * FNF's `Strumline.playNoteHoldCover`: the glow that covers the receptor
+     * while a hold note is held.
+     */
+    fun playNoteHoldCover(direction: Int) {
+        val asset = noteStyle.holdCover(direction) ?: return
+        // FNF: `this.noteHoldCovers.zIndex = 40;`
+        val cover = HoldCover(container, direction, asset, noteStyle).also { it.zIndex = 40.0 }
+        cover.laneX = xPos(direction)
+        cover.strumlineY = strumlineY.toDouble()
+        holdCovers[direction]?.kill()
+        holdCovers[direction] = cover
+    }
+
+    /** FNF's `holdNote.cover.playEnd()`, when the hold is released. */
+    fun endNoteHoldCover(direction: Int) {
+        holdCovers[direction]?.playEnd()
+    }
+
+    /**
+     * FNF's `Strumline.mayGhostTap`: a tap into empty air is only a ghost tap
+     * when no note is in range and none was hit recently.
+     */
+    fun mayGhostTap(): Boolean {
+        if (notes.any { it.mayHit }) return false
+        if (notes.any { it.isHoldNote && (it.hasBeenHit || it.hasMissed) }) return false
+        if (ghostTapTimer > 0.0) return false
+        return true
     }
 
     fun playConfirm(direction: Int) {
@@ -257,6 +371,7 @@ class Strumline(
         val layer = splashLayers[direction] ?: Container().also {
             it.y = 0.0
             container.addChild(it)
+            it.zIndex = 50.0
             splashLayers[direction] = it
         }
         while (layer.numChildren >= Constants.NOTE_SPLASH_CAP) layer.removeChildAt(0)
@@ -266,11 +381,24 @@ class Strumline(
         val ox = noteStyle.splashOffsets.getOrElse(0) { 0.0 }
         val oy = noteStyle.splashOffsets.getOrElse(1) { 0.0 }
 
-        val img = layer.image(first)
+        val img = layer.image(first.slice)
         img.anchor = Anchor2D.TOP_LEFT
-        // FNF's `NoteSplash.play` uses `offset.set(width * 0.3, height * 0.3)`.
-        img.x = xPos(direction) + Constants.INITIAL_OFFSET + ox
-        img.y = -Constants.INITIAL_OFFSET + oy
+        // FNF's `NoteSplash.play`:
+        //
+        // ```haxe
+        // splash.x = this.x + getXPos(direction) + INITIAL_OFFSET + offsets[0] * scale.x;
+        // splash.y = this.y - INITIAL_OFFSET + offsets[1] * scale.y;
+        // // Center the animation on the note splash.
+        // offset.set(width * 0.3, height * 0.3);
+        // ```
+        //
+        // The splash sprite never gets `centerOrigin`, so its origin stays zero
+        // and the artwork ends up 30% of its size up and to the left of the lane
+        // - which is what centres the impact graphic on the note.
+        val w = first.slice.width.toDouble()
+        val h = first.slice.height.toDouble()
+        img.x = xPos(direction) + Constants.INITIAL_OFFSET + ox - w * 0.3 - first.offsetX
+        img.y = -Constants.INITIAL_OFFSET + oy - h * 0.3 - first.offsetY
         img.alpha = noteStyle.splashAlpha
 
         val fps = 24 + (-2..2).random()
@@ -284,7 +412,7 @@ class Strumline(
                 if (frames.isEmpty()) {
                     img.removeFromParent()
                 } else {
-                    img.bitmap = frames.first()
+                    img.bitmap = frames.first().slice
                 }
             }
         }
@@ -334,29 +462,29 @@ private class Receptor(
 ) {
     val container: Container = Container().also { host.addChild(it) }
 
-    /**
-     * FNF's `StrumlineNote.fixOffsets`: while the "confirm" animation plays, the
-     * graphic is nudged to compensate for the glow the animation draws around
-     * the arrow.
-     */
-    private val confirmOffset = 13.0
+    companion object {
+        /** FNF's `StrumlineNote.CONFIRM_HOLD_TIME`. */
+        const val CONFIRM_HOLD_TIME = 0.15
+    }
 
-    private var state = "Static"
-    private var frames: List<AtlasSlice> = emptyList()
+    private var state = ""
+    private var frames: List<NoteStyle.TrimmedFrame> = emptyList()
     private var frameIndex = 0
     private var timer = 0.0
     private var finished = true
 
+    /**
+     * FNF's `StrumlineNote.confirmHoldTimer`: how long the confirm pose is kept
+     * after the confirm animation finished.
+     */
+    private var confirmTimer = -1.0
+
     private val image: Image = Container().let { _ ->
-        // The image lives in its own child container so the confirm offset can
-        // move the graphic without moving the receptor's lane position.
+        // The image is a plain child of the lane container; each animation frame
+        // is placed relative to the fixed logical centre computed below.
         Image(korlibs.image.bitmap.Bitmap32(1, 1, intArrayOf(0), false)).also { img ->
             container.addChild(img)
         }
-    }
-
-    init {
-        redraw()
     }
 
     private fun setState(next: String) {
@@ -366,7 +494,7 @@ private class Receptor(
         if (frames.isEmpty()) {
             // No animation for this state - fall back to the single sprite.
             val single = noteStyle.strumSlice(direction, next)
-            frames = listOf(single)
+            frames = listOf(NoteStyle.TrimmedFrame(single, 0, 0))
         }
         frameIndex = 0
         timer = 0.0
@@ -374,14 +502,63 @@ private class Receptor(
         redraw()
     }
 
+    private val receptorScale: Double = noteStyle.strumlineScale.toDouble()
+
+    /**
+     * Where every animation frame's *logical* centre lands, in the container's
+     * coordinates.
+     *
+     * Flixel's `StrumlineNote.setup` calls `updateHitbox()` while the atlas
+     * still points at its first frame, so the sprite's `width`/`height` - used
+     * by `centerOffsets` - never change afterwards. `playAnimation` then calls
+     * `centerOffsets()` + `centerOrigin()` (but never `updateHitbox`), which
+     * pins the logical frame's centre at `x + width / 2`, `y + height / 2` for
+     * *every* state. The container already carries `xPos(dir) + INITIAL_OFFSET`,
+     * so the centre within it is simply half of that fixed hitbox.
+     *
+     * `StrumlineNote.fixOffsets` exists in the sources but is never called in
+     * 0.8.6, so the confirm glow is *not* nudged.
+     */
+    private val baseSize: Pair<Int, Int> =
+        noteStyle.strumlineBaseSize() ?: (Constants.STRUMLINE_SIZE to Constants.STRUMLINE_SIZE)
+
+    private val centreX: Double = baseSize.first * receptorScale / 2.0
+    private val centreY: Double = baseSize.second * receptorScale / 2.0
+
+    init {
+        // The static pose has to be drawn up front, otherwise the receptor only
+        // appears once the player touches a key.
+        //
+        // This has to run *after* the properties above: Kotlin initialises
+        // properties in declaration order, so calling `setState` earlier would
+        // place the arrow with `centreX`/`centreY` still at zero, and it would
+        // only jump into place on the first key press.
+        state = ""
+        finished = false
+        setState("Static")
+    }
+
     private fun redraw() {
-        val slice = frames.getOrNull(frameIndex) ?: return
+        val frame = frames.getOrNull(frameIndex) ?: return
+        val slice = frame.slice
         image.bitmap = slice
-        image.anchor = Anchor2D.CENTER
-        image.scaleX = noteStyle.scale.toDouble()
-        image.scaleY = noteStyle.scale.toDouble()
-        image.x = if (state == "Confirm") -confirmOffset else 0.0
-        image.y = if (state == "Confirm") -confirmOffset else 0.0
+        // Flixel draws the trimmed artwork at
+        //   pos - offset + origin + scale * (frameTrim + q - origin)
+        // with `origin = frameWidth / 2` and `offset = (frameWidth - width) / 2`.
+        // The logical centre therefore stays at `pos + fixedHitbox / 2`, and the
+        // artwork's top-left lands at
+        //   centre + scale * (trimX - frameWidth / 2)
+        // where `trimX = -frameX` and `frameWidth` is the *current* frame's
+        // logical width (states use different sizes, which is what makes the
+        // arrow sink on press and bloom on confirm).
+        val s = receptorScale
+        val fw = if (frame.frameWidth > 0) frame.frameWidth.toDouble() else slice.width.toDouble()
+        val fh = if (frame.frameHeight > 0) frame.frameHeight.toDouble() else slice.height.toDouble()
+        image.anchor = Anchor2D.TOP_LEFT
+        image.scaleX = s
+        image.scaleY = s
+        image.x = centreX + s * (-frame.offsetX - fw / 2.0)
+        image.y = centreY + s * (-frame.offsetY - fh / 2.0)
         image.alpha = 0.95
         image.setPixelArt(noteStyle.isPixel)
     }
@@ -392,11 +569,17 @@ private class Receptor(
 
     fun confirm() {
         setState("Confirm")
+        // FNF's `StrumlineNote.onAnimationFinished` starts a timer, and
+        // `update` falls back to the static pose once it runs out.
+        confirmTimer = 0.0
     }
 
+    /** True while the receptor shows its idle pose. */
+    val isStatic: Boolean get() = state == "Static"
+
     /**
-     * FNF's `StrumlineNote.holdConfirm`: once the confirm animation has played
-     * out, the held receptor keeps the confirm pose.
+     * FNF's `StrumlineNote.holdConfirm`: the receptor keeps the confirm pose
+     * for as long as the hold note is being held.
      */
     fun holdConfirm() {
         if (state == "Confirm" && finished) setState("ConfirmHold")
@@ -407,21 +590,32 @@ private class Receptor(
         setState("Static")
     }
 
-    fun update(dt: Double) {
-        if (frames.size <= 1 || finished) return
-        val step = 1.0 / noteStyle.strumFrameRate
-        timer += dt
-        while (timer >= step) {
-            timer -= step
-            frameIndex++
-            if (frameIndex >= frames.size) {
-                frameIndex = frames.size - 1
-                finished = true
-                timer = 0.0
-                break
+    fun update(dt: Double, keyHeld: Boolean = false) {
+        if (frames.size > 1 && !finished) {
+            val step = 1.0 / noteStyle.strumFrameRate
+            timer += dt
+            while (timer >= step) {
+                timer -= step
+                frameIndex++
+                if (frameIndex >= frames.size) {
+                    frameIndex = frames.size - 1
+                    finished = true
+                    timer = 0.0
+                    break
+                }
+            }
+            redraw()
+        }
+        if (confirmTimer >= 0.0) {
+            confirmTimer += dt
+            // FNF's `CONFIRM_HOLD_TIME`: after the confirm glow, the receptor
+            // goes back to the static pose. The strumline's update loop then
+            // puts it back on the pressed one if the key is still down.
+            if (confirmTimer >= CONFIRM_HOLD_TIME) {
+                confirmTimer = -1.0
+                setState("Static")
             }
         }
-        redraw()
     }
 
     fun destroy() = container.removeFromParent()

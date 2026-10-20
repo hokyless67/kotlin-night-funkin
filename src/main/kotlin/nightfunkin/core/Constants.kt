@@ -76,6 +76,14 @@ object Constants {
     /** Health bar smoothing (0.8.6 PlayState.updateHealthBar). */
     const val HEALTH_LERP_RATE = 0.15f
 
+    /**
+     * FNF's `Constants.GHOST_TAP_DELAY` (3/8 s).
+     *
+     * A tap into empty air is forgiven for this long after a real hit, so
+     * hitting a note and immediately mashing does not cost you.
+     */
+    const val GHOST_TAP_DELAY = 3.0 / 8.0
+
     // ---- camera ---------------------------------------------------------
     const val DEFAULT_BOP_INTENSITY = 1.015f
     const val HUD_ZOOM_INTENSITY = 0.015f * 2.0f

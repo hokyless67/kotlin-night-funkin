@@ -160,6 +160,25 @@ class NoteStyle(val id: String) {
     }
 
     /**
+     * One frame of a strumline animation, with the offset of the artwork
+     * inside its logical frame.
+     *
+     * Flixel draws a frame's *trimmed* rectangle at the sprite's position plus
+     * the frame's trim (`FlxFrame.offset` is `frameX`/`frameY`), so the artwork of
+     * a padded frame sits off the sprite's origin. The receptor frames carry
+     * 37/38 px of padding, which is what puts the arrow below the top of the
+     * screen instead of being cut by it.
+     */
+    data class TrimmedFrame(
+        val slice: AtlasSlice,
+        val offsetX: Int,
+        val offsetY: Int,
+        /** The logical frame's size, which includes the trimmed-off margins. */
+        val frameWidth: Int = 0,
+        val frameHeight: Int = 0,
+    )
+
+    /**
      * Every frame of a strumline animation.
      *
      * FNF registers the receptors as animations, not single sprites:
@@ -173,13 +192,35 @@ class NoteStyle(val id: String) {
      * and `pressLeft0` / `confirmLeft0` are four-frame sequences, so swapping a
      * single PNG loses the whole squish.
      */
-    fun strumFrames(direction: Int, kind: String): List<AtlasSlice> {
+    fun strumFrames(direction: Int, kind: String): List<TrimmedFrame> {
         val style = active
         val asset = style.data.assets["noteStrumline"] ?: return emptyList()
         val atlas = style.atlasFor(asset.assetPath) ?: return emptyList()
         val key = "${style.arrowKeys[direction]}$kind"
         val prefix = asset.assetBy(key) ?: key
-        return atlas.framesByPrefix(prefix).map { atlas.slice(it) }
+        return atlas.framesByPrefix(prefix).map {
+            TrimmedFrame(atlas.slice(it), it.frameX, it.frameY, it.frameWidth, it.frameHeight)
+        }
+    }
+
+    /** `NoteStyle.getStrumlineScale()` - the receptor has its own scale. */
+    val strumlineScale: Float
+        get() = active.data.assets["noteStrumline"]?.scale ?: scale
+
+    /**
+     * Logical size of the first frame in the strumline atlas.
+     *
+     * FNF's `StrumlineNote.setup` runs `updateHitbox()` before any animation is
+     * played, so the receptor sprite's `width`/`height` - and through them the
+     * point Flixel's `centerOffsets` centres every animation frame on - are
+     * locked to this frame. Without it every state change would jump.
+     */
+    fun strumlineBaseSize(): Pair<Int, Int>? {
+        val style = active
+        val asset = style.data.assets["noteStrumline"] ?: return null
+        val atlas = style.atlasFor(asset.assetPath) ?: return null
+        val frame = atlas.firstFrame() ?: return null
+        return frame.logicalWidth to frame.logicalHeight
     }
 
     /** Frame rate of the strumline animations, `anim.frameRate ?? 24`. */
@@ -193,7 +234,7 @@ class NoteStyle(val id: String) {
      * 24 +/- 2 fps, killing the sprite when the animation ends. Showing a single
      * frame instead leaves a big bright arrow parked on the lane.
      */
-    fun splashVariants(direction: Int): List<List<AtlasSlice>> {
+    fun splashVariants(direction: Int): List<List<TrimmedFrame>> {
         val asset = active.data.assets["noteSplash"] ?: return emptyList()
         val atlas = atlasFor(asset.assetPath) ?: return emptyList()
         val key = when (direction) {
@@ -206,7 +247,7 @@ class NoteStyle(val id: String) {
         return arr.mapNotNull { entry ->
             val prefix = ((entry as? JsonObject)?.get("prefix") as? JsonPrimitive)?.content
                 ?: return@mapNotNull null
-            atlas.framesByPrefix(prefix).map { atlas.slice(it) }
+            atlas.framesByPrefix(prefix).map { TrimmedFrame(atlas.slice(it), it.frameX, it.frameY, it.frameWidth, it.frameHeight) }
         }.filter { it.isNotEmpty() }
     }
 
@@ -337,6 +378,55 @@ class NoteStyle(val id: String) {
     val isPixel: Boolean
         get() = active.data.assets["note"]?.isPixel
             ?: active.data.assets.values.any { it.isPixel }
+
+    /**
+     * The three animations of a hold note's cover.
+     *
+     * FNF's `NoteHoldCover` is a glow sprite that plays `holdCoverStart<Color>`
+     * when the note is hit, `holdCover<Color>` while it is held and
+     * `holdCoverEnd<Color>` when it is released.
+     */
+    data class HoldCoverAsset(
+        val start: List<TrimmedFrame>,
+        val hold: List<TrimmedFrame>,
+        val end: List<TrimmedFrame>,
+        val offsets: List<Double>,
+        val isPixel: Boolean,
+    )
+
+    /** The hold cover of one direction, or null when the skin has none. */
+    fun holdCover(direction: Int): HoldCoverAsset? {
+        val style = active
+        val asset = style.data.assets["holdNoteCover"] ?: return null
+        val root = asset.data ?: return null
+        if ((root["enabled"] as? kotlinx.serialization.json.JsonPrimitive)?.content == "false") return null
+        val key = when (direction) {
+            0 -> "left"
+            1 -> "down"
+            2 -> "up"
+            else -> "right"
+        }
+        val dirData = root[key] as? kotlinx.serialization.json.JsonObject ?: return null
+        val atlasPath = (dirData["assetPath"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+            ?: return null
+        val atlas = style.atlasFor(atlasPath) ?: return null
+
+        fun framesOf(name: String): List<TrimmedFrame> {
+            val prefix = ((dirData[name] as? kotlinx.serialization.json.JsonObject)
+                ?.get("prefix") as? kotlinx.serialization.json.JsonPrimitive)?.content ?: return emptyList()
+            return atlas.framesByPrefix(prefix).map {
+                TrimmedFrame(atlas.slice(it), it.frameX, it.frameY, it.frameWidth, it.frameHeight)
+            }
+        }
+
+        return HoldCoverAsset(
+            start = framesOf("start"),
+            hold = framesOf("hold"),
+            end = framesOf("end"),
+            offsets = asset.offsets,
+            isPixel = asset.isPixel,
+        )
+    }
 
     /**
      * The countdown graphic for a step.
