@@ -2,6 +2,7 @@ package nightfunkin.audio
 
 import korlibs.audio.sound.AudioChannel
 import korlibs.audio.sound.Sound
+import korlibs.audio.sound.infinitePlaybackTimes
 import korlibs.audio.sound.readSound
 import nightfunkin.core.KnfFiles
 import kotlin.time.Duration
@@ -26,9 +27,14 @@ class MusicPlayer {
     private var sound: Sound? = null
     private var channel: AudioChannel? = null
     private var stoppedAtMs: Double = 0.0
+    private var storedLengthMs: Double = 0.0
+    private var paused = false
 
     var loadedPath: String? = null
         private set
+
+    /** `FunkinSound.playMusic`'s `loop` flag (menu music metadata is looped). */
+    var loop: Boolean = false
 
     var volume: Double = 1.0
         set(value) {
@@ -45,8 +51,11 @@ class MusicPlayer {
 
     val exists: Boolean get() = sound != null
 
+    /** Set by [pause] and cleared by [play]/[stop]; unlike [playing] it survives a scene switch. */
+    val isPaused: Boolean get() = paused
+
     val totalMs: Double
-        get() = channel?.total?.toMsDouble() ?: 0.0
+        get() = channel?.total?.toMsDouble() ?: storedLengthMs
 
     val positionMs: Double
         get() = channel?.current?.toMsDouble() ?: stoppedAtMs
@@ -68,6 +77,10 @@ class MusicPlayer {
         this.volume = volume
         loadedPath = path
         stoppedAtMs = 0.0
+        // Sound.length is zero for KorGE's non-streaming SoundAudioData, but its
+        // decoded AudioData still knows the real duration. Freeplay needs this
+        // before playback starts to compute the preview window.
+        storedLengthMs = runCatching { s.decode().totalTime.toMsDouble() }.getOrDefault(0.0)
         return true
     }
 
@@ -75,11 +88,13 @@ class MusicPlayer {
         val s = sound ?: return
         channel?.stop()
         stoppedAtMs = startMs
+        paused = false
         val ac = AudioChannel()
         ac.volume = volume
         ac.pitch = pitch
         val offset: Duration = startMs.milliseconds
-        ac.play(s, startTime = offset)
+        if (loop) ac.play(s, times = infinitePlaybackTimes, startTime = offset)
+        else ac.play(s, startTime = offset)
         channel = ac
     }
 
@@ -88,6 +103,7 @@ class MusicPlayer {
         stoppedAtMs = positionMs
         channel?.stop()
         channel = null
+        paused = true
     }
 
     fun resume() = play(stoppedAtMs)
@@ -96,6 +112,7 @@ class MusicPlayer {
         channel?.stop()
         channel = null
         stoppedAtMs = 0.0
+        paused = false
     }
 
     /** Hard seek. Resumes only if we were playing. */
@@ -110,6 +127,7 @@ class MusicPlayer {
         stop()
         sound = null
         loadedPath = null
+        storedLengthMs = 0.0
     }
 }
 

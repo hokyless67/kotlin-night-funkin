@@ -8,7 +8,11 @@ import korlibs.korge.view.Text
 import korlibs.korge.view.addUpdater
 import korlibs.korge.view.solidRect
 import korlibs.korge.view.text
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import nightfunkin.audio.MenuMusic
+import nightfunkin.audio.SongPreviewPlayer
 import nightfunkin.core.Constants
 import nightfunkin.core.KnfInput
 import nightfunkin.data.SongEntry
@@ -25,6 +29,10 @@ import kotlin.math.min
 class SongSelectScene : Scene() {
 
     private val entries: List<SongEntry> by lazy { SongRegistry.songs }
+    private val menuMusic = MenuMusic.player
+    private val preview = SongPreviewPlayer()
+    private var previewJob: Job? = null
+    private var previewGeneration = 0
     private var selected = 0
     private var difficultyIndex = Constants.DEFAULT_DIFFICULTY_LIST.indexOf(Constants.DEFAULT_DIFFICULTY)
     private var variationIndex = 0
@@ -39,10 +47,6 @@ class SongSelectScene : Scene() {
     private lateinit var statusLine: Text
 
     override suspend fun SContainer.sceneInit() {
-        solidRect(
-            Constants.GAME_WIDTH * 2.0, Constants.GAME_HEIGHT * 2.0, Colors["#14141f"],
-        )
-
         val header = text("FREEPLAY", textSize = 46.0, color = Colors.WHITE)
         header.x = 56.0
         header.y = 34.0
@@ -90,6 +94,13 @@ class SongSelectScene : Scene() {
         }
         rebuildList()
         refreshInfo()
+
+        // FNF's first selection pauses freakyMenu, waits 0.25 s, then starts the
+        // selected song's partial instrumental preview.
+        if (entries.isNotEmpty()) {
+            menuMusic.pause()
+            requestPreview()
+        }
     }
 
     private fun currentVariations(): List<String> =
@@ -158,6 +169,40 @@ class SongSelectScene : Scene() {
         statusLine.text = msg
     }
 
+    /**
+     * `FreeplayState.changeSelection`: pause the menu track, wait
+     * `FADE_IN_DELAY`, then load the current variation's instrumental slice.
+     * Selection changes cancel an in-flight preview so a slow load can never
+     * start playing the previous song.
+     */
+    private fun requestPreview() {
+        previewGeneration++
+        val generation = previewGeneration
+        previewJob?.cancel()
+        previewJob = null
+        preview.stop()
+
+        val song = entries.getOrNull(selected) ?: return
+        val variation = currentVariation()
+        val metadata = song.metadataFor(variation)
+        val path = song.instrumentalPath(variation) ?: return
+        val previewStart = metadata.playData.previewStart
+        val previewEnd = metadata.playData.previewEnd
+
+        previewJob = launch {
+            delay(FADE_IN_DELAY_MS)
+            if (generation != previewGeneration) return@launch
+            preview.play(path, previewStart, previewEnd, isCurrent = { generation == previewGeneration })
+        }
+    }
+
+    private fun stopPreview() {
+        previewGeneration++
+        previewJob?.cancel()
+        previewJob = null
+        preview.stop()
+    }
+
     override suspend fun SContainer.sceneMain() {
         val knfInput = KnfInput(keys)
         addUpdater { dt ->
@@ -170,6 +215,8 @@ class SongSelectScene : Scene() {
                 if (statusTimer <= 0.0) statusLine.text = ""
             }
 
+            preview.update()
+
             if (entries.isNotEmpty()) {
                 // W / Up = previous song, S / Down = next song
                 if (knfInput.justPressed(2)) {
@@ -177,12 +224,14 @@ class SongSelectScene : Scene() {
                     variationIndex = 0
                     resetDifficultyForVariation()
                     rebuildList(); refreshInfo()
+                    requestPreview()
                 }
                 if (knfInput.justPressed(1)) {
                     selected = (selected + 1) % entries.size
                     variationIndex = 0
                     resetDifficultyForVariation()
                     rebuildList(); refreshInfo()
+                    requestPreview()
                 }
                 // Q / E cycle song variations (erect, nightmare, ...). The
                 // difficulty list belongs to the variation, not to the song.
@@ -196,6 +245,9 @@ class SongSelectScene : Scene() {
                     variationIndex = (variationIndex + variationDelta + vars.size) % vars.size
                     resetDifficultyForVariation()
                     refreshInfo()
+                    // `changeDiff` only reloads the preview when the variation
+                    // (and therefore the instrumental suffix) changes.
+                    requestPreview()
                 }
                 // A / Left and D / Right cycle this variation's difficulties.
                 val diffs = currentDifficulties()
@@ -210,8 +262,16 @@ class SongSelectScene : Scene() {
             }
 
             if (knfInput.accept) launch { startSelected() }
-            if (knfInput.back) launch { sceneContainer.changeTo<TitleScene>() }
+            if (knfInput.back) {
+                stopPreview()
+                launch { sceneContainer.changeTo<MainMenuScene>() }
+            }
         }
+    }
+
+    override suspend fun sceneDestroy() {
+        stopPreview()
+        preview.dispose()
     }
 
     private suspend fun startSelected() {
@@ -225,6 +285,12 @@ class SongSelectScene : Scene() {
         PlayRequest.songId = song.id
         PlayRequest.difficulty = diffs[difficultyIndex]
         PlayRequest.variation = vars[variationIndex]
+        stopPreview()
         sceneContainer.changeTo<PlayScene>()
+    }
+
+    private companion object {
+        /** `FreeplayState.FADE_IN_DELAY`. */
+        const val FADE_IN_DELAY_MS = 250L
     }
 }

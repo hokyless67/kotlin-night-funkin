@@ -12,6 +12,7 @@ import nightfunkin.play.PlayRequest
 import nightfunkin.play.PlayScene
 import nightfunkin.ui.LoadingScene
 import nightfunkin.ui.LoadingSceneTarget
+import nightfunkin.ui.MainMenuScene
 import nightfunkin.ui.SongSelectScene
 import nightfunkin.ui.TitleScene
 
@@ -19,7 +20,7 @@ suspend fun main() = Korge(
     windowSize = Size(Constants.GAME_WIDTH.toDouble(), Constants.GAME_HEIGHT.toDouble()),
     virtualSize = Size(Constants.GAME_WIDTH.toDouble(), Constants.GAME_HEIGHT.toDouble()),
     title = Knf.NAME,
-    backgroundColor = Colors["#12121c"],
+    backgroundColor = Colors["#000000"],
 ) {
     println("=== ${Knf.NAME} v${Knf.VERSION} (${Knf.SHORT}) ===")
     nightfunkin.core.Save.load()
@@ -38,6 +39,7 @@ suspend fun main() = Korge(
     // KorGE 6 constructs scenes through its Injector, so they must be registered.
     injector.root.mapPrototype { LoadingScene() }
     injector.root.mapPrototype { TitleScene() }
+    injector.root.mapPrototype { MainMenuScene() }
     injector.root.mapPrototype { SongSelectScene() }
     injector.root.mapPrototype { PlayScene() }
 

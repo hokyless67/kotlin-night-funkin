@@ -12,7 +12,7 @@ import korlibs.korge.view.addUpdater
 import korlibs.korge.view.image
 import korlibs.korge.view.solidRect
 import kotlinx.coroutines.launch
-import nightfunkin.audio.MusicPlayer
+import nightfunkin.audio.MenuMusic
 import nightfunkin.audio.SfxPlayer
 import nightfunkin.core.AnimateAtlas
 import nightfunkin.core.Constants
@@ -38,7 +38,7 @@ class TitleScene : Scene() {
 
     private var t = 0.0
     private var musicTime = 0.0
-    private val music = MusicPlayer()
+    private val music = MenuMusic.player
     private val sfx = SfxPlayer()
 
     private lateinit var titleGroup: Container
@@ -204,6 +204,15 @@ class TitleScene : Scene() {
     private fun startMusic() {
         if (musicStarted) return
         musicStarted = true
+
+        // `freakyMenu` persists between states in FNF. Returning here from the
+        // main menu must not restart the track or run through the old beats.
+        if (music.playing) {
+            musicTime = music.positionMs / 1000.0
+            lastTitleBeat = (musicTime / BEAT_SECONDS).toInt()
+            return
+        }
+
         musicTime = 0.0
         music.volume = if (playIntro) 0.0 else 1.0
         music.play()
@@ -220,13 +229,24 @@ class TitleScene : Scene() {
             if (!musicStarted && t >= 1.0) startMusic()
 
             if (musicStarted) {
-                musicTime = if (music.exists) music.positionMs / 1000.0 else musicTime + s
+                val nextMusicTime = if (music.exists) music.positionMs / 1000.0 else musicTime + s
+                // freakyMenu is looped in 0.8.6. FlxSound wraps its position
+                // back to zero, so reset the beat tracker instead of waiting
+                // for it to climb past the previous loop's last beat.
+                if (nextMusicTime + 0.25 < musicTime) lastTitleBeat = -1
+                musicTime = nextMusicTime
 
                 if (playIntro && !introDone) {
                     introElapsed = musicTime
                     music.volume = min(1.0, introElapsed / 4.0)
                     updateIntro(introElapsed)
                 }
+            }
+
+            // `TitleState.update`: once the intro is over, recover the menu
+            // track's volume if it came back from another state mid-fade.
+            if (musicStarted && introDone && music.exists && music.volume < 0.8) {
+                music.volume = min(1.0, music.volume + 0.5 * s)
             }
 
             updateTitle(s)
@@ -299,8 +319,7 @@ class TitleScene : Scene() {
     private fun moveToMenu() {
         if (movedToMenu) return
         movedToMenu = true
-        music.stop()
-        launch { sceneContainer.changeTo<SongSelectScene>() }
+        launch { sceneContainer.changeTo<MainMenuScene>() }
     }
 
     private fun updateIntro(elapsed: Double) {

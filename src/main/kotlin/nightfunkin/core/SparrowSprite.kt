@@ -17,6 +17,13 @@ class SparrowSprite(
     frames: List<TextureAtlas.AtlasFrame>,
     var fps: Double = 24.0,
     var loop: Boolean = true,
+    /**
+     * Centres the *logical* frame on the container origin, like an
+     * `AtlasMenuItem` with `centered = true` (`centerOrigin()` + `offset =
+     * origin`). Menu animations change size, so this offset is recalculated for
+     * every frame.
+     */
+    private val centered: Boolean = false,
 ) : Container() {
 
     private var frames: List<TextureAtlas.AtlasFrame> = frames
@@ -93,7 +100,9 @@ class SparrowSprite(
         // Flixel stores the trimmed rect at (x, y) and the logical frame at
         // (x - frameX, y - frameY), so the negative offset keeps the sprite's
         // origin fixed across differently trimmed frames.
-        image.x = -frame.frameX.toDouble()
-        image.y = -frame.frameY.toDouble()
+        val xOffset = if (centered) frame.logicalWidth / 2.0 else 0.0
+        val yOffset = if (centered) frame.logicalHeight / 2.0 else 0.0
+        image.x = -frame.frameX - xOffset
+        image.y = -frame.frameY - yOffset
     }
 }
