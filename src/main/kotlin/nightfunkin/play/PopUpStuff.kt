@@ -137,14 +137,11 @@ class PopUpStuff(
             }
             if (fadeStarted) {
                 fadeElapsed += s
-                // FNF fades over 0.2 s; pixel art uses a stepped easing, which
-                // keeps the sprite opaque for the first half.
+                // FNF fades over 0.2 s. Pixel art uses `EaseUtil.stepped(2)`,
+                // i.e. alpha 1.0 -> 0.5 -> 0.0, not a single jump to zero.
                 val t = (fadeElapsed / 0.2).coerceIn(0.0, 1.0)
-                img.alpha = if (stepped) {
-                    if (t < 0.5) 1.0 else 0.0
-                } else {
-                    1.0 - t
-                }
+                val eased = if (stepped) kotlin.math.floor(t * 2.0) / 2.0 else t
+                img.alpha = 1.0 - eased
                 if (t >= 1.0) img.removeFromParent()
             }
         }
