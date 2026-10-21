@@ -164,13 +164,14 @@ class TextureAtlas private constructor(
          * Cuts a `rotated="true"` region out and turns it upright.
          *
          * Starling stores those frames turned 90 degrees clockwise, so undoing
-         * it is a 90 degree *counter-clockwise* turn: `out[h-1-y, x] = src[x, y]`.
+         * it is a 90 degree *counter-clockwise* turn: `out[y, w-1-x] = src[x, y]`.
+         * The output is therefore `h` wide and `w` tall.
          */
         private fun extractRotatedCcw(src: Bitmap, x: Int, y: Int, w: Int, h: Int): Bitmap {
             val out = Bitmap32(h, w, false)
-            for (row in 0 until w) {
-                for (col in 0 until h) {
-                    out.setInt(h - 1 - col, row, src.getInt(x + col, y + row))
+            for (sy in 0 until h) {
+                for (sx in 0 until w) {
+                    out.setInt(sy, w - 1 - sx, src.getInt(x + sx, y + sy))
                 }
             }
             out.premultiplied = src.premultiplied

@@ -110,15 +110,18 @@ class GameplayCamera(
     // ---- per-frame ------------------------------------------------------
 
     fun update(dtSeconds: Double) {
-        // The camera eases towards the follow point, exactly like Flixel's
-        // `followLerp`: `focus += (target - focus) * rate`, per frame.
+        // FNF/Flixel applies `followLerp` once per 1/60 second. Raising the
+        // remaining distance to `dt * 60` keeps the same speed on high-refresh
+        // displays instead of making the camera lag more at 120/144 Hz.
         if (snapNextFrame) {
             focusX = targetX
             focusY = targetY
             snapNextFrame = false
         } else if (followEnabled) {
-            focusX += (targetX - focusX) * followRate
-            focusY += (targetY - focusY) * followRate
+            val rate = followRate.coerceIn(0.0, 1.0)
+            val follow = 1.0 - (1.0 - rate).pow((dtSeconds * 60.0).coerceAtLeast(0.0))
+            focusX += (targetX - focusX) * follow
+            focusY += (targetY - focusY) * follow
         }
 
         // Exponential decay, exactly like FNF's `pow(0.95, elapsed * 60)`.

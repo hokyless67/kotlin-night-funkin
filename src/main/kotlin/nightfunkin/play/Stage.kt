@@ -140,6 +140,9 @@ class Stage(id: String) : Container() {
     private val animatedProps = ArrayList<StageAnimationPlayer>()
     private val boppers = ArrayList<Pair<Double, StageAnimationPlayer>>()
 
+    /** Props addressable by their JSON `name`, like FNF's `getNamedProp`. */
+    private val namedProps = LinkedHashMap<String, Container>()
+
     init {
         // `Stage.refresh()` sorts every child by zIndex, ascending.
         for (prop in file.props.sortedBy { it.zIndex }) {
@@ -148,7 +151,18 @@ class Stage(id: String) : Container() {
             childZIndices += prop.zIndex
             loaded += img
             scrollFactors += (prop.scroll.getOrElse(0) { 1.0 } to prop.scroll.getOrElse(1) { 1.0 })
+            if (prop.name.isNotEmpty()) namedProps[prop.name] = img
         }
+
+        // spookyMansionErect's stage script starts with both lightning layers
+        // hidden (`buildStage()` sets them to 0.0001) and only flashes them on
+        // a strike. Without the script they would sit at full alpha over the
+        // dark layers and wash the whole mansion out.
+        if (id == "spookyMansionErect") {
+            namedProps["bgLight"]?.alpha = 0.0001
+            namedProps["stairsLight"]?.alpha = 0.0001
+        }
+
         if (loaded.isEmpty()) println("KNF: stage '$id' has no usable props")
     }
 
