@@ -8,9 +8,10 @@ import korlibs.korge.view.addUpdater
 import korlibs.math.geom.Size
 import nightfunkin.core.Constants
 import nightfunkin.core.Knf
-import nightfunkin.data.SongRegistry
 import nightfunkin.play.PlayRequest
 import nightfunkin.play.PlayScene
+import nightfunkin.ui.LoadingScene
+import nightfunkin.ui.LoadingSceneTarget
 import nightfunkin.ui.SongSelectScene
 import nightfunkin.ui.TitleScene
 
@@ -35,6 +36,7 @@ suspend fun main() = Korge(
     val scenes = sceneContainer()
 
     // KorGE 6 constructs scenes through its Injector, so they must be registered.
+    injector.root.mapPrototype { LoadingScene() }
     injector.root.mapPrototype { TitleScene() }
     injector.root.mapPrototype { SongSelectScene() }
     injector.root.mapPrototype { PlayScene() }
@@ -42,14 +44,14 @@ suspend fun main() = Korge(
     // Test hooks — boot straight into a song instead of the menus:
     //   KNF_SONG=bopeebo KNF_DIFFICULTY=hard KNF_AUTOPLAY=1 ./gradlew run
     val songId = System.getenv("KNF_SONG")
-    if (!songId.isNullOrBlank() && SongRegistry.get(songId) != null) {
+    if (!songId.isNullOrBlank()) {
         PlayRequest.songId = songId
         System.getenv("KNF_DIFFICULTY")?.takeIf { it.isNotBlank() }?.let { PlayRequest.difficulty = it }
         System.getenv("KNF_VARIATION")?.takeIf { it.isNotBlank() }?.let { PlayRequest.variation = it }
         PlayRequest.autoplay = System.getenv("KNF_AUTOPLAY") == "1"
-        println("KNF: booting straight into '$songId' (autoplay=${PlayRequest.autoplay})")
-        scenes.changeTo<PlayScene>()
-    } else {
-        scenes.changeTo<TitleScene>()
+        LoadingSceneTarget.toSong = true
+        println("KNF: requested boot song '$songId' (autoplay=${PlayRequest.autoplay})")
     }
+
+    scenes.changeTo<LoadingScene>()
 }
