@@ -107,13 +107,7 @@ class PlayScene : Scene() {
     private lateinit var opponent: Character
     private lateinit var girlfriend: Character
     private lateinit var player: Character
-    private var stageProps: Container? = null
-    private var girlfriendSinging = 0.0
-
-    companion object {
-        /** How often the girlfriend strikes a pose on her own. */
-        const val GIRLFRIEND_SING_INTERVAL = 3.2
-    }
+    private var stageProps: Stage? = null
 
     /**
      * FNF's desktop default is upscroll (`Preferences.downscroll == false`),
@@ -136,7 +130,7 @@ class PlayScene : Scene() {
     private fun buildStageProps() {
         val stage = Stage(chart.stage)
         if (stage.propCount == 0) return
-        cameraLayer.addChildAt(stage, 0)
+        stageLayer.addChild(stage)
         stageProps = stage
     }
 
@@ -210,6 +204,7 @@ class PlayScene : Scene() {
         stageFile = Stage.file(chart.stage)
         stageLayer = Container()
         cameraLayer.addChild(stageLayer)
+        buildStageProps()
 
         val chars = chart.characters
         opponent = Character.get(chars.opponent)
@@ -220,16 +215,18 @@ class PlayScene : Scene() {
         placeCharacter(girlfriend, "gf")
         placeCharacter(player, "bf")
 
-        // `Stage.refresh()` sorts every child by zIndex ascending; on mainStage
-        // that is gf (100) behind dad (200) behind bf (300).
+        // `Stage.refresh()` sorts every prop *and* character by zIndex ascending;
+        // tankmanBattlefield relies on foreground props (audience, bricks) having
+        // higher zIndex than the characters.
         val byZIndex = listOf(
             Triple("dad", opponent, opponentSlot.zIndex),
             Triple("gf", girlfriend, stageFile.characterFor("gf")?.zIndex ?: 0),
             Triple("bf", player, stageFile.characterFor("bf")?.zIndex ?: 0),
         ).sortedBy { it.third }
-        for ((_, character, _) in byZIndex) {
+        for ((_, character, zIndex) in byZIndex) {
             character.dance(forceRestart = true)
-            stageLayer.addChild(character)
+            val stage = stageProps
+            if (stage != null) stage.addCharacter(character, zIndex) else stageLayer.addChild(character)
         }
 
         // Some shipped characters are placeholders that resolve to nothing
@@ -248,11 +245,8 @@ class PlayScene : Scene() {
         // FNF's resetCamera with snap=true jumps to the focus point on the first frame.
 
         camera.setFocusImmediate(focusX, focusY)
+        camera.stageZoom = stageFile.cameraZoom
         camera.setZoomImmediate(stageFile.cameraZoom)
-
-        buildStageProps()
-
-
 
         val hudContainer = Container()
         addChild(hudContainer)
@@ -288,7 +282,7 @@ class PlayScene : Scene() {
         hud.setHealthIcons(player, opponent)
 
         // ---- audio -------------------------------------------------------
-        val instPath = song.instrumentalPath()
+        val instPath = song.instrumentalPath(PlayRequest.variation)
         if (instPath == null || !music.load(instPath)) {
             println("KNF: no instrumental found for '${song.name}'")
         } else if (KnfFiles.isMp3(instPath)) {
@@ -323,6 +317,7 @@ class PlayScene : Scene() {
         conductor.onStepHit = {
             val step = conductor.currentStep
             camera.onStep(step)
+            stageProps?.onStep(step)
             // FNF's `HealthIcon.onStepHit` bops on every beat
             // (`bopEvery = Constants.STEPS_PER_BEAT`), not on the hits.
             if (step % Constants.STEPS_PER_BEAT == 0) {
@@ -335,7 +330,7 @@ class PlayScene : Scene() {
 
         nextEventIndex = 0
         resetForSongStart()
-        println("KNF: playing '${song.name}' [${chart.difficulty}] notes=${chart.notes.size} inst=$instPath")
+        println("KNF: playing '${chart.songName}' [${chart.difficulty}] notes=${chart.notes.size} inst=$instPath")
         println(
             "KNF: layout scene=" + sceneContainer.size + " hud=" + hudContainer.size +
                 " player=(" + playerStrumline.container.x + "," + playerStrumline.container.y + ")" +
@@ -398,7 +393,7 @@ class PlayScene : Scene() {
         ).apply { y = Constants.GAME_HEIGHT * 1.08 }
 
         val label = layer.text(
-            "${song.name}\n${song.artist}",
+            "${chart.songName}\n${chart.artist}",
             textSize = 34.0,
             color = Colors["#5a4a7a"],
         )
@@ -414,13 +409,20 @@ class PlayScene : Scene() {
      * downscroll lifts it by the lane's own height instead.
      */
     private fun layoutStrumlines() {
-        val cutout = Constants.GAME_WIDTH / 2.5 / 2.0
+        // FNF:
+        //   cutoutSize = FullScreenScaleMode.gameCutoutSize.x / 2.5
+        //   player.x = FlxG.width / 2 + STRUMLINE_X_OFFSET + cutoutSize / 2
+        //   opponent.x = STRUMLINE_X_OFFSET + cutoutSize
+        // At 16:9 `gameCutoutSize.x` is zero, so the cutout must not move the
+        // lanes. Using `GAME_WIDTH / 2.5 / 2` pushed both rows 128 px right.
+        val cutout = 0.0
         val playerX = Constants.GAME_WIDTH / 2.0 + Constants.STRUMLINE_X_OFFSET + cutout / 2.0
         val opponentX = Constants.STRUMLINE_X_OFFSET.toDouble() + cutout
 
         val receptorH = playerStrumline.receptorHeight()
+        val receptorOffsetY = noteStyle.strumlineOffsets.getOrElse(1) { 0.0 }
         val strumY = if (downscroll) {
-            Constants.GAME_HEIGHT - receptorH - Constants.STRUMLINE_Y_OFFSET
+            Constants.GAME_HEIGHT - receptorH - Constants.STRUMLINE_Y_OFFSET - receptorOffsetY
         } else {
             Constants.STRUMLINE_Y_OFFSET.toDouble()
         }
@@ -483,7 +485,7 @@ class PlayScene : Scene() {
         opponent.update(dt)
         girlfriend.update(dt)
         player.update(dt)
-        if (girlfriendSinging > 0.0) girlfriendSinging -= dt
+        stageProps?.update(dt)
 
         if (avsyncDebug && !startingSong) measureAvSync()
         if (System.getenv("KNF_DEBUG_CHAR") == "1" && debugFrames == 300) dumpCharacters()
@@ -698,18 +700,13 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
      * Per-beat character behaviour.
      *
      * FNF's `BaseCharacter.onBeatHit` re-poses everyone (`danceEvery`, one beat
-     * by default); the girlfriend additionally picks a fresh pose on her own
-     * longer cycle.
+     * by default). Unlike KNF used to, it does not make the girlfriend sing on
+     * her own: her `sing` animations belong to scripted events only.
      */
     private fun onBeat() {
         player.dance()
         opponent.dance()
         girlfriend.dance()
-
-        if (girlfriendSinging <= 0.0) {
-            girlfriendSinging = GIRLFRIEND_SING_INTERVAL
-            girlfriend.sing((conductor.currentStep + 1) % 4, conductor.stepLengthMs.toDouble())
-        }
     }
 
     private fun goodNoteHit(note: NoteSprite) {
@@ -839,18 +836,27 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
             if (!note.isHoldNote) continue
             val lane = note.directionIndex
             if (note.isHolding) {
-                // FNF's `Strumline.holdConfirm`: the receptor keeps the confirm
-                // pose for as long as the note is held.
-                playerStrumline.holdConfirm(lane)
+                // Check the key *before* `holdConfirm`. FNF's hold-drop branch
+                // calls `playStatic`, so confirming first would leave the
+                // receptor stuck on the confirm/press pose after an early
+                // release.
                 if (!playerStrumline.isKeyHeld(lane)) {
-                    note.releaseClip()
+                    playerStrumline.playStatic(lane)
+                    note.releaseClip(conductor)
                     playerStrumline.endNoteHoldCover(lane)
                     continue
                 }
+                // FNF's `Strumline.holdConfirm`: the receptor keeps the confirm
+                // pose for as long as the note is held.
+                playerStrumline.holdConfirm(lane)
                 val remaining = note.fullSustainLength - (now - note.strumTime)
                 if (remaining <= 0f) {
-                    note.releaseClip()
+                    note.releaseClip(conductor)
                     playerStrumline.endNoteHoldCover(lane)
+                    // FNF: a completed hold leaves the receptor pressed while the
+                    // key is still down, otherwise it returns to static.
+                    if (playerStrumline.isKeyHeld(lane)) playerStrumline.pressKey(lane)
+                    else playerStrumline.playStatic(lane)
                     continue
                 }
                 // FNF grants a small health drip while the tail is held.
@@ -909,7 +915,8 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
 
             "ZoomCamera" -> {
                 val zoom = (ev.getFloat("zoom") ?: 1f).toDouble()
-                camera.tweenZoomTo(zoom)
+                val stageRelative = (ev.getString("mode") ?: "direct") == "stage"
+                camera.tweenZoomTo(zoom, relativeToStage = stageRelative)
             }
 
             "SetCameraBop" -> {

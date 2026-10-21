@@ -101,9 +101,17 @@ object KnfFiles {
      * directory: the Animate sheets live in a folder named after it while the
      * legacy atlases are `<prefix>.xml` / `<prefix>.png` sitting beside it.
      */
-    fun resolve(assetPath: String, suffix: String = ""): String? {
+    fun resolve(
+        assetPath: String,
+        suffix: String = "",
+        forcedLibrary: String? = null,
+    ): String? {
         val path = assetPath.substringAfter(':') + suffix
         library(assetPath)?.let { lib ->
+            val direct = "$lib/images/$path"
+            if (exists(direct)) return direct
+        }
+        forcedLibrary?.takeIf { it.isNotEmpty() }?.let { lib ->
             val direct = "$lib/images/$path"
             if (exists(direct)) return direct
         }
@@ -115,10 +123,16 @@ object KnfFiles {
     }
 
     /** Human-readable list of where [assetPath] was looked for. */
-    fun resolveCandidates(assetPath: String, suffix: String = ""): String {
+    fun resolveCandidates(
+        assetPath: String,
+        suffix: String = "",
+        forcedLibrary: String? = null,
+    ): String {
         val path = assetPath.substringAfter(':') + suffix
-        val roots = listOfNotNull(library(assetPath)?.let { "$it/images" }) +
-            imageLibraries.map { "$it/images" } + listOf("<root>")
+        val roots = listOfNotNull(
+            library(assetPath)?.let { "$it/images" },
+            forcedLibrary?.takeIf { it.isNotEmpty() }?.let { "$it/images" },
+        ) + imageLibraries.map { "$it/images" } + listOf("<root>")
         return roots.joinToString(", ") { "$it/$path" }
     }
 

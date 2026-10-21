@@ -100,10 +100,29 @@ class NoteStyle(val id: String) {
             ?: active.data.assets["noteStrumline"]?.scale
             ?: 1f
 
-    val splashEnabled: Boolean get() = active.data.assets["noteSplash"]?.enabled ?: true
-    val splashAlpha: Double get() = active.data.assets["noteSplash"]?.alpha ?: 0.8
+    val splashEnabled: Boolean
+        get() {
+            val asset = active.data.assets["noteSplash"]
+            val enabled = (asset?.data?.get("enabled") as? JsonPrimitive)?.content
+            return when (enabled) {
+                null -> asset?.enabled ?: true
+                else -> enabled.toBooleanStrictOrNull() ?: true
+            }
+        }
+    val splashAlpha: Double get() = active.data.assets["noteSplash"]?.alpha ?: 1.0
     val splashOffsets: List<Double>
-        get() = active.data.assets["noteSplash"]?.offsets ?: listOf(25.0, -5.0)
+        get() = active.data.assets["noteSplash"]?.offsets ?: listOf(0.0, 0.0)
+    val splashScale: Float
+        get() = active.data.assets["noteSplash"]?.scale ?: 1f
+    val splashFrameRate: Int
+        get() = ((active.data.assets["noteSplash"]?.data?.get("framerateDefault") as? JsonPrimitive)
+            ?.content?.toIntOrNull()) ?: 24
+    val splashFrameRateVariance: Int
+        get() = ((active.data.assets["noteSplash"]?.data?.get("framerateVariance") as? JsonPrimitive)
+            ?.content?.toIntOrNull()) ?: 2
+    val splashBlendMode: String
+        get() = (active.data.assets["noteSplash"]?.data?.get("blendMode") as? JsonPrimitive)
+            ?.content ?: "normal"
 
     /** Name of the atlas frame a direction's arrow resolves to, for diagnostics. */
     fun noteFrameName(direction: Int): String {
@@ -207,6 +226,10 @@ class NoteStyle(val id: String) {
     val strumlineScale: Float
         get() = active.data.assets["noteStrumline"]?.scale ?: scale
 
+    /** `NoteStyle.getStrumlineOffsets()` - applied to receptors, not note heads. */
+    val strumlineOffsets: List<Double>
+        get() = active.data.assets["noteStrumline"]?.offsets ?: listOf(0.0, 0.0)
+
     /**
      * Logical size of the first frame in the strumline atlas.
      *
@@ -293,6 +316,10 @@ class NoteStyle(val id: String) {
     /** `NoteStyle.fetchHoldNoteScale` - the hold note has its own scale. */
     val holdNoteScale: Float
         get() = active.data.assets["holdNote"]?.scale ?: 1f
+
+    /** `NoteStyle.getHoldNoteOffsets()` - baked into the trail's draw offset. */
+    val holdNoteOffsets: List<Double>
+        get() = active.data.assets["holdNote"]?.offsets ?: listOf(0.0, 0.0)
 
     /** `NoteStyle.isHoldNotePixel`. */
     val isHoldNotePixel: Boolean
@@ -391,6 +418,7 @@ class NoteStyle(val id: String) {
         val hold: List<TrimmedFrame>,
         val end: List<TrimmedFrame>,
         val offsets: List<Double>,
+        val scale: Double,
         val isPixel: Boolean,
     )
 
@@ -424,6 +452,7 @@ class NoteStyle(val id: String) {
             hold = framesOf("hold"),
             end = framesOf("end"),
             offsets = asset.offsets,
+            scale = asset.scale.toDouble(),
             isPixel = asset.isPixel,
         )
     }

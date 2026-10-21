@@ -7,7 +7,9 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import nightfunkin.core.AnimateAtlas
+import nightfunkin.core.Constants
 import nightfunkin.core.KnfFiles
+import nightfunkin.core.TextureAtlas
 import nightfunkin.core.setPixelArt
 import korlibs.math.geom.Anchor2D
 import korlibs.math.geom.degrees
@@ -33,12 +35,14 @@ data class StagePropData(
     val isPixel: Boolean = false,
     val flipX: Boolean = false,
     val flipY: Boolean = false,
-    /** `animateatlas`, `sparrow` or `packer`; only `animateatlas` is supported. */
+    /** `animateatlas`, `sparrow` or `packer`; FNF defaults to `sparrow`. */
     val animType: String = "",
     /** The animations the prop can play, as frame-label prefixes. */
     val animations: List<StagePropAnimation>? = null,
     /** Which of [animations] starts playing. */
     val startingAnimation: String? = null,
+    /** If non-zero, `danceLeft`/`danceRight` (or `idle`) replay every N beats. */
+    val danceEvery: Double = 0.0,
 )
 
 /** One of a prop's animations: a name and the frame-label prefix it plays. */
@@ -47,6 +51,13 @@ data class StagePropAnimation(
     val name: String = "",
     val prefix: String = "",
     val looped: Boolean = false,
+    val frameIndices: List<Int>? = null,
+    val frameRate: Int? = null,
+    /** `framelabel` for normal Animate labels, or `symbol` for a symbol clip. */
+    val animType: String = "framelabel",
+    val offsets: List<Double> = listOf(0.0, 0.0),
+    val flipX: Boolean = false,
+    val flipY: Boolean = false,
 )
 
 @Serializable
@@ -120,25 +131,75 @@ class Stage(id: String) : Container() {
     private val file = StageDataFile(id)
     private val loaded = ArrayList<Container>()
 
+    /** zIndex of every child in draw order, parallel to the container's children. */
+    private val childZIndices = ArrayList<Int>()
+
     /** Parallax factors of each loaded prop, parallel to [loaded]. */
     val scrollFactors = ArrayList<Pair<Double, Double>>()
+
+    private val animatedProps = ArrayList<StageAnimationPlayer>()
+    private val boppers = ArrayList<Pair<Double, StageAnimationPlayer>>()
 
     init {
         // `Stage.refresh()` sorts every child by zIndex, ascending.
         for (prop in file.props.sortedBy { it.zIndex }) {
             val img = buildProp(prop) ?: continue
             addChild(img)
+            childZIndices += prop.zIndex
             loaded += img
             scrollFactors += (prop.scroll.getOrElse(0) { 1.0 } to prop.scroll.getOrElse(1) { 1.0 })
         }
         if (loaded.isEmpty()) println("KNF: stage '$id' has no usable props")
     }
 
+    /**
+     * Adds a character to the stage in FNF's global draw order.
+     *
+     * FNF puts props and characters in the same `FlxSpriteGroup` and calls
+     * `refresh()`, which sorts *all* of them by `zIndex`. Keeping characters in
+     * a separate layer makes every character draw over foreground props such as
+     * tankmanBattlefield's audience.
+     */
+    fun addCharacter(character: Container, zIndex: Int) {
+        var index = 0
+        while (index < childZIndices.size && childZIndices[index] <= zIndex) index++
+        addChildAt(character, index)
+        childZIndices.add(index, zIndex)
+    }
+
+    /** Advances every animated prop, matching Flixel's per-frame sprite updates. */
+    fun update(dt: Double) {
+        for (prop in animatedProps) prop.update(dt)
+    }
+
+    /**
+     * FNF's `Bopper.onStepHit`: replay the dance animation every
+     * `danceEvery * STEPS_PER_BEAT` steps.
+     */
+    fun onStep(step: Int) {
+        for ((danceEvery, prop) in boppers) {
+            val steps = (danceEvery * Constants.STEPS_PER_BEAT).toInt()
+            if (steps > 0 && step % steps == 0) prop.dance(forceRestart = true)
+        }
+    }
+
     private fun buildProp(prop: StagePropData): Container? {
         if (prop.assetPath.isEmpty()) return null
         if (prop.assetPath.startsWith("#")) return buildSolidColor(prop)
-        if (prop.animType == "animateatlas") return buildAnimateProp(prop)
 
+        if (!prop.animations.isNullOrEmpty()) {
+            val animated = when (prop.animType) {
+                "animateatlas" -> buildAnimateProp(prop)
+                "packer" -> buildLegacyAnimatedProp(prop, packer = true)
+                else -> buildLegacyAnimatedProp(prop, packer = false)
+            }
+            if (animated != null) return animated
+        }
+
+        return buildStaticProp(prop)
+    }
+
+    private fun buildStaticProp(prop: StagePropData): Container? {
         val bmp: Bitmap = resolveAsset(prop.assetPath) ?: return null
         val img = Image(bmp)
         apply(img, prop, bmp.width.toDouble(), bmp.height.toDouble())
@@ -150,16 +211,10 @@ class Stage(id: String) : Container() {
     /**
      * A prop drawn from an Adobe Animate atlas.
      *
-     * FNF's `Stage.addProp`:
-     *
-     * ```haxe
-     * case 'animateatlas':
-     *     propSprite.loadTextureAtlas(dataProp.assetPath, _data.directory, cast dataProp.atlasSettings);
-     * ```
-     *
-     * The "animation" of such a prop is a frame *label* in the atlas' main
-     * timeline - `halloweenBG` plays the `static` label, `sniper` the `Idle` one -
-     * so the prop is the union of the sprites of that label's first frame.
+     * FNF's `Stage.addProp` loads the atlas and then `FlxAnimationUtil` resolves
+     * each animation through `addByFrameLabel` (or `addBySymbol`). A prop can
+     * therefore have several clips - tankman's sniper idles and sips, the
+     * spooky mansion background starts `static` and flashes `thunder`.
      */
     private fun buildAnimateProp(prop: StagePropData): Container? {
         val dir = KnfFiles.findAnimateDir(file.directory, prop.assetPath)
@@ -173,49 +228,155 @@ class Stage(id: String) : Container() {
             return null
         }
 
-        val prefix = prop.animations
-            ?.firstOrNull { it.name == (prop.startingAnimation ?: "idle") }
-            ?.prefix
-            ?: prop.animations?.firstOrNull()?.prefix
-            ?: return null
+        val allFrames = atlas.poses.indices.toList()
+        val animations = LinkedHashMap<String, StageAnimation>()
+        for (def in prop.animations.orEmpty()) {
+            val labelled = atlas.labelFrames(def.prefix)
+            // `animType: "symbol"` references a symbol clip, not a frame label.
+            // Our flattened pose list cannot address arbitrary symbol timelines,
+            // so play the main timeline for those clips. This keeps the two
+            // shipped symbol props (mallXmasErect's boppers and tankman's guy)
+            // animated instead of dropping them entirely.
+            val base = when {
+                labelled.isNotEmpty() -> labelled
+                def.animType == "symbol" || def.prefix.isEmpty() -> allFrames
+                else -> emptyList()
+            }
+            val frames = if (def.frameIndices.isNullOrEmpty()) {
+                base
+            } else {
+                def.frameIndices.mapNotNull { base.getOrNull(it) }
+            }
+            if (frames.isEmpty()) continue
+            animations[def.name] = def.toStageAnimation(frames)
+        }
 
-        val frames = atlas.labelFrames(prefix)
-        if (frames.isEmpty()) {
-            println("KNF: stage prop '${file.id}' has no frame labelled '$prefix' in $dir")
+        if (animations.isEmpty()) {
+            println("KNF: stage prop '${file.id}' has no playable animation in $dir")
             return null
         }
 
-        val pose = atlas.poses.getOrNull(frames.first()) ?: return null
-        val box = atlas.boundsOf(frames.first())
-
         val container = Container()
-        for (part in pose.parts) {
-            val def = atlas.sprites[part.sprite] ?: continue
-            val img = Image(def.slice)
-            img.anchor = Anchor2D.CENTER
-            val m = part.matrix
-            val (cx, cy) = m.xform(def.width / 2.0, def.height / 2.0)
-            img.x = cx - box.minX
-            img.y = cy - box.minY
-            // The same decomposition `Character.renderPose` uses: a negative
-            // determinant means the symbol is mirrored, not rotated.
-            img.scaleX = hypot(m.a, m.b) * (if (m.a * m.d - m.c * m.b < 0.0) -1.0 else 1.0)
-            img.scaleY = hypot(m.c, m.d)
-            img.rotation = ((if (def.turned) -90.0 else 0.0) +
-                Math.toDegrees(atan2(m.b, m.a))).degrees
-            img.setPixelArt(prop.isPixel)
-            container.addChild(img)
+        placeAnimatedContainer(container, prop)
+
+        val box = atlas.bounds.takeUnless { it.empty } ?: atlas.boundsOf(0)
+        val originX = box.minX
+        val originY = box.minY
+        val images = ArrayList<Image>()
+        val placeholder = atlas.sprites.values.firstOrNull()?.slice
+
+        fun render(anim: StageAnimation, frameIndex: Int) {
+            val pose = atlas.poses.getOrNull(frameIndex) ?: return
+            if (placeholder != null) {
+                while (images.size < pose.parts.size) {
+                    val img = Image(placeholder)
+                    img.anchor = Anchor2D.CENTER
+                    img.setPixelArt(prop.isPixel)
+                    images += img
+                    container.addChild(img)
+                }
+            }
+            for (i in images.indices) {
+                val img = images[i]
+                val part = pose.parts.getOrNull(i)
+                val def = part?.let { atlas.sprites[it.sprite] }
+                if (part == null || def == null) {
+                    img.visible = false
+                    continue
+                }
+                img.visible = true
+                img.bitmap = def.slice
+                val m = part.matrix
+                val (cx, cy) = m.xform(def.width / 2.0, def.height / 2.0)
+                img.x = cx - originX - anim.offsetX
+                img.y = cy - originY - anim.offsetY
+                // The same decomposition `Character.renderPose` uses: a negative
+                // determinant means the symbol is mirrored, not rotated.
+                img.scaleX = hypot(m.a, m.b)
+                img.scaleY = hypot(m.c, m.d)
+                if (m.a * m.d - m.c * m.b < 0.0) img.scaleY = -img.scaleY
+                img.rotation = ((if (def.turned) -90.0 else 0.0) +
+                    Math.toDegrees(atan2(m.b, m.a))).degrees
+            }
         }
 
-        val sx = prop.scale.getOrElse(0) { 1.0 }
-        val sy = prop.scale.getOrElse(1) { 1.0 }
-        container.scaleX = sx
-        container.scaleY = sy
+        val player = StageAnimationPlayer(animations, ::render, prop.startingAnimation)
+        animatedProps += player
+        if (prop.danceEvery > 0.0) boppers += prop.danceEvery to player
+        return container
+    }
+
+    /**
+     * A `sparrow` or `packer` prop with animations. These are ordinary Flixel
+     * sprites whose frames come from an XML or spirit frame list, so animation
+     * data uses frame-name prefixes and optional indices into that prefix run.
+     */
+    private fun buildLegacyAnimatedProp(prop: StagePropData, packer: Boolean): Container? {
+        val suffix = if (packer) ".txt" else ".xml"
+        val path = KnfFiles.resolve(prop.assetPath, suffix, file.directory)
+        if (path == null) {
+            println("KNF: stage prop atlas missing: ${prop.assetPath}$suffix")
+            return null
+        }
+        val atlas = if (packer) TextureAtlas.tryLoadPacker(path) else TextureAtlas.tryLoad(path)
+        if (atlas == null || atlas.frames.isEmpty()) {
+            println("KNF: stage prop atlas failed to load: $path")
+            return null
+        }
+
+        val ordered = atlas.frames.values.toList()
+        val animations = LinkedHashMap<String, StageAnimation>()
+        for (def in prop.animations.orEmpty()) {
+            val matching = ordered.indices.filter { ordered[it].name.startsWith(def.prefix) }
+            val frames = if (def.frameIndices.isNullOrEmpty()) {
+                matching
+            } else if (packer) {
+                // Packer props call `animation.add(name, frameIndices)` directly,
+                // so those indices address the whole frame list.
+                def.frameIndices.filter { it in ordered.indices }
+            } else {
+                def.frameIndices.mapNotNull { matching.getOrNull(it) }
+            }
+            if (frames.isEmpty()) continue
+            animations[def.name] = def.toStageAnimation(frames)
+        }
+        if (animations.isEmpty()) {
+            println("KNF: stage prop '${file.id}' has no matching frames for ${prop.assetPath}")
+            return null
+        }
+
+        val container = Container()
+        placeAnimatedContainer(container, prop)
+        val img = Image(atlas.slice(ordered.first()))
+        img.setPixelArt(prop.isPixel)
+        container.addChild(img)
+
+        fun render(anim: StageAnimation, frameIndex: Int) {
+            val frame = ordered.getOrNull(frameIndex) ?: return
+            img.bitmap = atlas.slice(frame)
+            img.scaleX = if (anim.flipX) -1.0 else 1.0
+            img.scaleY = if (anim.flipY) -1.0 else 1.0
+            // `Bopper.getScreenPosition` subtracts the per-animation offsets
+            // after scaling. Frame trimming shifts the drawn rect inside the
+            // logical frame, exactly like `TextureAtlas.addImage`.
+            img.x = (if (anim.flipX) frame.logicalWidth - frame.frameX else -frame.frameX) - anim.offsetX
+            img.y = (if (anim.flipY) frame.logicalHeight - frame.frameY else -frame.frameY) - anim.offsetY
+            img.visible = true
+        }
+
+        val player = StageAnimationPlayer(animations, ::render, prop.startingAnimation)
+        animatedProps += player
+        if (prop.danceEvery > 0.0) boppers += prop.danceEvery to player
+        return container
+    }
+
+    private fun placeAnimatedContainer(container: Container, prop: StagePropData) {
         container.x = prop.position.getOrElse(0) { 0.0 }
         container.y = prop.position.getOrElse(1) { 0.0 }
+        container.scaleX = prop.scale.getOrElse(0) { 1.0 }
+        container.scaleY = prop.scale.getOrElse(1) { 1.0 }
         container.alpha = prop.alpha
         container.rotation = prop.angle.degrees
-        return container
     }
 
     /**
@@ -265,10 +426,13 @@ class Stage(id: String) : Container() {
      * See [KnfFiles.resolve].
      */
     private fun resolveAsset(assetPath: String): Bitmap? {
-        val path = KnfFiles.resolve(assetPath, ".png")
+        // Static stage props use FNF's `Paths.image` while the stage's library
+        // is active. Without forcing it, same-named assets from an earlier week
+        // (for example week1's `erect/bg`) win over the stage's own artwork.
+        val path = KnfFiles.resolve(assetPath, ".png", file.directory)
         if (path == null) {
             println("KNF: stage prop asset missing: $assetPath")
-            println("KNF:   tried " + KnfFiles.resolveCandidates(assetPath, ".png"))
+            println("KNF:   tried " + KnfFiles.resolveCandidates(assetPath, ".png", file.directory))
             return null
         }
         return KnfFiles.bitmapOrNull(path)
@@ -288,6 +452,102 @@ class Stage(id: String) : Container() {
         fun file(id: String): StageDataFile = cache.getOrPut(id) { StageDataFile(id) }
     }
 }
+
+/**
+ * One playable stage clip. [frames] are renderer-specific frame numbers: atlas
+ * indices for sparrow/packer props, main-timeline pose indices for Animate.
+ */
+private data class StageAnimation(
+    val name: String,
+    val frames: List<Int>,
+    val frameRate: Double,
+    val looped: Boolean,
+    val offsetX: Double,
+    val offsetY: Double,
+    val flipX: Boolean,
+    val flipY: Boolean,
+)
+
+private class StageAnimationPlayer(
+    private val animations: Map<String, StageAnimation>,
+    private val render: (StageAnimation, Int) -> Unit,
+    startingAnimation: String?,
+) {
+    private var current: StageAnimation? = null
+    private var frameIndex = 0
+    private var frameTime = 0.0
+    private var danced = false
+
+    init {
+        val start = startingAnimation?.let { animations[it] }
+        if (start != null) {
+            current = start
+            draw()
+        } else {
+            // With no startingAnimation, FNF leaves the sprite on its initial
+            // frame instead of auto-playing.
+            animations.values.firstOrNull()?.let { render(it, it.frames.first()) }
+        }
+    }
+
+    fun update(dt: Double) {
+        val anim = current ?: return
+        if (anim.frames.size <= 1) return
+        val step = 1.0 / anim.frameRate.coerceAtLeast(1.0)
+        frameTime += dt
+        while (frameTime >= step) {
+            frameTime -= step
+            if (frameIndex + 1 < anim.frames.size) {
+                frameIndex++
+            } else if (anim.looped) {
+                frameIndex = 0
+            } else {
+                // Flixel holds the final frame of a play-once animation.
+                frameTime = 0.0
+                break
+            }
+            draw()
+        }
+    }
+
+    /** FNF's `Bopper.dance`: alternate `danceLeft`/`danceRight`, else `idle`. */
+    fun dance(forceRestart: Boolean = false) {
+        val left = animations["danceLeft"]
+        val right = animations["danceRight"]
+        val name = if (left != null && right != null) {
+            (if (danced) "danceRight" else "danceLeft").also { danced = !danced }
+        } else {
+            "idle"
+        }
+        play(name, forceRestart)
+    }
+
+    fun play(name: String, restart: Boolean = false) {
+        val anim = animations[name] ?: return
+        if (anim === current && !restart) return
+        current = anim
+        frameIndex = 0
+        frameTime = 0.0
+        draw()
+    }
+
+    private fun draw() {
+        val anim = current ?: return
+        val frame = anim.frames.getOrNull(frameIndex) ?: return
+        render(anim, frame)
+    }
+}
+
+private fun StagePropAnimation.toStageAnimation(frames: List<Int>) = StageAnimation(
+    name = name,
+    frames = frames,
+    frameRate = (frameRate ?: 24).toDouble(),
+    looped = looped,
+    offsetX = offsets.getOrElse(0) { 0.0 },
+    offsetY = offsets.getOrElse(1) { 0.0 },
+    flipX = flipX,
+    flipY = flipY,
+)
 
 private val stageJson = Json {
     ignoreUnknownKeys = true

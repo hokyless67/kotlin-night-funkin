@@ -345,11 +345,10 @@ class Character(val id: String) : Container() {
      * Legacy sheet animations, resolved the way Flixel does it on a plain
      * `FlxSprite` loaded from the whole PNG.
      *
-     * With no prefix list to index into, `frameIndices` are absolute positions in
-     * the sheet's frame collection, so `spooky`'s `danceRight` `[8..15]` picks the
-     * second half of its sixteen `spooky dance idle0` frames. Without them the
-     * prefix match runs over every frame name in sheet order, which is the same
-     * order the exporter wrote them in.
+     * FNF resolves them with `addByIndices(name, prefix, indices)`, so each
+     * index addresses the run of frames whose names start with `prefix`.
+     * `spooky`'s `danceRight` `[8..15]` therefore picks the second half of its
+     * sixteen `spooky dance idle0` frames.
      */
     /**
      * Every main-timeline frame carrying [prefix], expanded over each keyframe's
@@ -406,10 +405,14 @@ class Character(val id: String) : Container() {
 
     private fun legacyAnimationFrames(def: CharacterAnimationDef): List<Int> {
         val order = sprites.keys.toList()
-        if (def.frameIndices.isNullOrEmpty()) {
-            return order.indices.filter { order[it].startsWith(def.prefix) }
-        }
-        return def.frameIndices.filter { it in order.indices }
+        // FNF uses `FlxSprite.animation.addByIndices(name, prefix, indices)`,
+        // so the indices are relative to the frames matching `prefix`, not to
+        // the whole sheet. gfTankmen puts all "GF Crying" frames before the
+        // "GF Dancing" ones; treating 30 as a sheet index made every dance
+        // pose play a crying frame.
+        val matching = order.indices.filter { order[it].startsWith(def.prefix) }
+        if (def.frameIndices.isNullOrEmpty()) return matching
+        return def.frameIndices.mapNotNull { matching.getOrNull(it) }
     }
 
     // ======================================================================
@@ -612,10 +615,20 @@ class Character(val id: String) : Container() {
      */
     fun cameraFocusPoint(stageCameraOffsets: List<Double>): Pair<Double, Double> {
         // `scaleX` is negative when the sheet is flipped (bf is), so the centre
-        // has to follow the sign — otherwise the focus lands a whole width to
+        // has to follow the sign - otherwise the focus lands a whole width to
         // the wrong side and the camera flies off after a FocusCamera event.
-        val cx = x + localWidth * scaleX / 2.0 + data.cameraOffsets.getOrElse(0) { 0.0 }
-        val cy = y + localHeight * scaleY / 2.0 + data.cameraOffsets.getOrElse(1) { 0.0 }
+        //
+        // `_data.offsets` are *position* offsets and are deliberately not part
+        // of the focus: FNF computes it from `originalPosition + width/2`, which
+        // is the stage-space feet point before `setScale` adds those offsets.
+        // The current x already contains them, so remove them here. Otherwise
+        // every character's camera sits a few pixels low/right (dad by 13,3).
+        val positionOffsetX = data.offsets.getOrElse(0) { 0.0 }
+        val positionOffsetY = data.offsets.getOrElse(1) { 0.0 }
+        val cx = x + localWidth * scaleX / 2.0 - positionOffsetX +
+            data.cameraOffsets.getOrElse(0) { 0.0 }
+        val cy = y + localHeight * scaleY / 2.0 - positionOffsetY +
+            data.cameraOffsets.getOrElse(1) { 0.0 }
         return (cx + stageCameraOffsets.getOrElse(0) { 0.0 }) to
             (cy + stageCameraOffsets.getOrElse(1) { 0.0 })
     }

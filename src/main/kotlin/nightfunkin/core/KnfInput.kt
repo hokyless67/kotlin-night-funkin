@@ -32,6 +32,10 @@ class KnfInput(private val inputKeys: InputKeys) {
     val back: Boolean get() = anyJustPressed(Key.X, Key.ESCAPE, Key.BACKSPACE)
     val restart: Boolean get() = inputKeys.justPressed(Key.R)
 
+    /** Freeplay song-variation cycling. */
+    val previousVariation: Boolean get() = inputKeys.justPressed(Key.Q)
+    val nextVariation: Boolean get() = inputKeys.justPressed(Key.E)
+
     /** Nudges the global audio offset, the way FNF's options do. */
     val offsetDown: Boolean get() = anyJustPressed(Key.OPEN_BRACKET, Key.MINUS)
     val offsetUp: Boolean get() = anyJustPressed(Key.CLOSE_BRACKET, Key.EQUAL)

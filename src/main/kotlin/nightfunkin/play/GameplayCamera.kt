@@ -69,8 +69,13 @@ class GameplayCamera(
         focusY = y
     }
 
-    fun tweenZoomTo(value: Double) {
-        targetZoom = value
+    /**
+     * FNF's `ZoomCamera` supports `mode: "stage"`, where the event value is a
+     * multiplier on the stage's default zoom, and `mode: "direct"`, where it is
+     * an absolute zoom.
+     */
+    fun tweenZoomTo(value: Double, relativeToStage: Boolean = false) {
+        targetZoom = if (relativeToStage) value * stageZoom else value
     }
 
     fun setZoomImmediate(value: Double) {
@@ -79,10 +84,14 @@ class GameplayCamera(
     }
 
     fun setBop(intensity: Double, rate: Int = bopRate, offset: Int = bopOffset) {
-        bopIntensity = intensity
+        // FNF's SetCameraBop intensity is a multiplier on the *bop amount*,
+        // not a direct zoom multiplier. A value of 0.5 means half of the
+        // default +1.5%, not a 0.5x camera zoom.
+        val bopAmount = Constants.DEFAULT_BOP_INTENSITY - 1.0
+        bopIntensity = bopAmount * intensity + 1.0
+        hudZoomIntensity = bopAmount * intensity * 2.0
         bopRate = rate
         bopOffset = offset
-        hudZoomIntensity = (intensity - 1.0) * 2.0
     }
 
     fun snap() {

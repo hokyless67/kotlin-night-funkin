@@ -70,6 +70,14 @@ class SustainTrail(
     private val bottomHeightPx: Double =
         (noteStyle.holdNoteSheetHeight() ?: 0) * noteStyle.holdNoteScale.toDouble() * endOffset
 
+    /**
+     * `SustainTrail.updateHitbox` stores the skin offsets in `offset`, and the
+     * custom triangle draw subtracts them from the position before laying out
+     * its vertices. The whole trail therefore moves by `-offsets`.
+     */
+    private val offsetX: Double = noteStyle.holdNoteOffsets.getOrElse(0) { 0.0 }
+    private val offsetY: Double = noteStyle.holdNoteOffsets.getOrElse(1) { 0.0 }
+
     init {
         // FNF: `holdNoteSprite.x = this.x + getXPos(dir) + STRUMLINE_SIZE / 2 - holdNote.width / 2;`
         // The tail's artwork is centred on the lane, exactly like the note head.
@@ -176,8 +184,8 @@ class SustainTrail(
         // The body hangs from the attachment, in the direction the note came
         // from; the cap then closes the far end (`flipY` mirrors both in FNF).
         val bodyTop = if (downscroll) attachY - bodyHeight else attachY
-        b.x = -widthPx / 2.0
-        b.y = bodyTop
+        b.x = -widthPx / 2.0 - offsetX
+        b.y = bodyTop - offsetY
         b.scaleX = widthPx / b.bitmap.width.toDouble().coerceAtLeast(1.0)
         b.scaleY = bodyHeight / b.bitmap.height.toDouble().coerceAtLeast(1.0)
 
@@ -188,8 +196,8 @@ class SustainTrail(
         val capScreenHeight = c.bitmap.height.toDouble() * noteStyle.holdNoteScale.toDouble()
         c.scaleX = noteStyle.holdNoteScale.toDouble()
         c.scaleY = noteStyle.holdNoteScale.toDouble()
-        c.x = -widthPx / 2.0
-        c.y = if (downscroll) bodyTop - capScreenHeight else bodyTop + bodyHeight
+        c.x = -widthPx / 2.0 - offsetX
+        c.y = (if (downscroll) bodyTop - capScreenHeight else bodyTop + bodyHeight) - offsetY
     }
 
     fun kill() = removeFromParent()

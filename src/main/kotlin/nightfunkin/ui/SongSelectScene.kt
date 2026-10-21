@@ -92,11 +92,25 @@ class SongSelectScene : Scene() {
         refreshInfo()
     }
 
-    private fun currentDifficulties(): List<String> =
-        entries.getOrNull(selected)?.difficulties ?: Constants.DEFAULT_DIFFICULTY_LIST
-
     private fun currentVariations(): List<String> =
         listOf(Constants.DEFAULT_VARIATION) + (entries.getOrNull(selected)?.metadata?.playData?.songVariations ?: emptyList())
+
+    private fun currentVariation(): String {
+        val vars = currentVariations()
+        val index = variationIndex.coerceIn(0, (vars.size - 1).coerceAtLeast(0))
+        return vars.getOrElse(index) { Constants.DEFAULT_VARIATION }
+    }
+
+    private fun currentDifficulties(): List<String> =
+        entries.getOrNull(selected)?.difficultiesFor(currentVariation())
+            ?: Constants.DEFAULT_DIFFICULTY_LIST
+
+    /** Keep the usual difficulty when it exists; otherwise use the first one. */
+    private fun resetDifficultyForVariation() {
+        val diffs = currentDifficulties()
+        val defaultIndex = diffs.indexOf(Constants.DEFAULT_DIFFICULTY)
+        difficultyIndex = if (defaultIndex >= 0) defaultIndex else 0
+    }
 
     private fun rebuildList() {
         listLayer.removeChildren()
@@ -123,15 +137,19 @@ class SongSelectScene : Scene() {
             varText.text = ""
             return
         }
-        val diffs = currentDifficulties()
-        difficultyIndex = difficultyIndex.coerceIn(0, (diffs.size - 1).coerceAtLeast(0))
-        infoText.text = "artist: ${song.artist}    charter: ${song.charter ?: "?"}    stage: ${song.metadata.playData.stage}"
-        diffText.text = diffs.joinToString("   ") { if (it == diffs[difficultyIndex]) "[$it]" else it }
         val vars = currentVariations()
         variationIndex = variationIndex.coerceIn(0, (vars.size - 1).coerceAtLeast(0))
+
+        val variation = vars.getOrElse(variationIndex) { Constants.DEFAULT_VARIATION }
+        val metadata = song.metadataFor(variation)
+        val diffs = song.difficultiesFor(variation)
+        difficultyIndex = difficultyIndex.coerceIn(0, (diffs.size - 1).coerceAtLeast(0))
+        infoText.text = "artist: ${metadata.artist}    charter: ${metadata.charter ?: "?"}" +
+            "    stage: ${metadata.playData.stage}"
+        diffText.text = diffs.joinToString("   ") { if (it == diffs[difficultyIndex]) "[$it]" else it }
         varText.text = "variation: " + vars.joinToString("   ") {
             if (it == vars[variationIndex]) "[$it]" else it
-        }
+        } + "    song: ${metadata.songName}"
     }
 
     private fun setStatus(msg: String) {
@@ -156,13 +174,30 @@ class SongSelectScene : Scene() {
                 // W / Up = previous song, S / Down = next song
                 if (knfInput.justPressed(2)) {
                     selected = (selected - 1 + entries.size) % entries.size
+                    variationIndex = 0
+                    resetDifficultyForVariation()
                     rebuildList(); refreshInfo()
                 }
                 if (knfInput.justPressed(1)) {
                     selected = (selected + 1) % entries.size
+                    variationIndex = 0
+                    resetDifficultyForVariation()
                     rebuildList(); refreshInfo()
                 }
-                // A / Left and D / Right cycle difficulty
+                // Q / E cycle song variations (erect, nightmare, ...). The
+                // difficulty list belongs to the variation, not to the song.
+                val vars = currentVariations()
+                val variationDelta = when {
+                    knfInput.nextVariation -> 1
+                    knfInput.previousVariation -> -1
+                    else -> 0
+                }
+                if (variationDelta != 0) {
+                    variationIndex = (variationIndex + variationDelta + vars.size) % vars.size
+                    resetDifficultyForVariation()
+                    refreshInfo()
+                }
+                // A / Left and D / Right cycle this variation's difficulties.
                 val diffs = currentDifficulties()
                 if (knfInput.justPressed(0)) {
                     difficultyIndex = (difficultyIndex - 1 + diffs.size) % diffs.size

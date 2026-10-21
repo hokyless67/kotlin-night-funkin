@@ -1,6 +1,7 @@
 package nightfunkin.play
 
 import korlibs.korge.view.Container
+import korlibs.korge.blend.BlendMode
 import korlibs.math.geom.Anchor2D
 import korlibs.korge.view.Image
 import korlibs.korge.view.addUpdater
@@ -80,6 +81,9 @@ class Strumline(
     // ======================================================================
 
     private fun buildReceptors() {
+        val offsets = noteStyle.strumlineOffsets
+        val offsetX = offsets.getOrElse(0) { 0.0 }
+        val offsetY = offsets.getOrElse(1) { 0.0 }
         for (i in 0 until Constants.KEY_COUNT) {
             receptors[i] = Receptor(container, i, noteStyle).also {
                 // Receptor, note head and tail all sit on the same lane centre.
@@ -88,8 +92,10 @@ class Strumline(
                 // hold tail visibly off to the right of its arrow.
                 // FNF: child.x = getXPos(dir) + INITIAL_OFFSET; child.y = 0; - the receptors
                 // are children of the strumline, so the lane offset is added here.
-                it.container.x = xPos(i) + Constants.INITIAL_OFFSET.toDouble()
-                it.container.y = 0.0
+                // `applyStrumlineOffsets` then shifts only the receptor, which is
+                // why note heads and hold trails use the unshifted lane centre.
+                it.container.x = xPos(i) + Constants.INITIAL_OFFSET + offsetX
+                it.container.y = offsetY
                 // FNF: `this.strumlineNotes.zIndex = 10;`
                 it.container.zIndex = 10.0
             }
@@ -378,8 +384,9 @@ class Strumline(
 
         val frames = variants.random().toMutableList()
         val first = frames.first()
-        val ox = noteStyle.splashOffsets.getOrElse(0) { 0.0 }
-        val oy = noteStyle.splashOffsets.getOrElse(1) { 0.0 }
+        val scale = noteStyle.splashScale.toDouble()
+        val ox = noteStyle.splashOffsets.getOrElse(0) { 0.0 } * scale
+        val oy = noteStyle.splashOffsets.getOrElse(1) { 0.0 } * scale
 
         val img = layer.image(first.slice)
         img.anchor = Anchor2D.TOP_LEFT
@@ -392,16 +399,38 @@ class Strumline(
         // offset.set(width * 0.3, height * 0.3);
         // ```
         //
-        // The splash sprite never gets `centerOrigin`, so its origin stays zero
-        // and the artwork ends up 30% of its size up and to the left of the lane
-        // - which is what centres the impact graphic on the note.
-        val w = first.slice.width.toDouble()
-        val h = first.slice.height.toDouble()
-        img.x = xPos(direction) + Constants.INITIAL_OFFSET + ox - w * 0.3 - first.offsetX
-        img.y = -Constants.INITIAL_OFFSET + oy - h * 0.3 - first.offsetY
+        // `NoteStyle.buildSplashSprite` first calls `updateHitbox()`, which
+        // centres the origin on the *logical* frame and leaves `width` at
+        // `frameWidth * scale`. Replacing the offset then draws the trimmed
+        // artwork at `origin - offset + scale * (trim - origin)`, which reduces
+        // to the expression below.
+        val fw = (if (first.frameWidth > 0) first.frameWidth else first.slice.width).toDouble()
+        val fh = (if (first.frameHeight > 0) first.frameHeight else first.slice.height).toDouble()
+        // The hitbox (and therefore the origin) is fixed from the first frame,
+        // but the visible art moves inside its logical frame when the exporter
+        // trims frames differently. FNF gets that for free from `FlxFrame.offset`;
+        // place each frame against the same logical top-left here.
+        val baseX = xPos(direction) + Constants.INITIAL_OFFSET + ox +
+            fw * (0.5 - 0.8 * scale)
+        val baseY = -Constants.INITIAL_OFFSET + oy +
+            fh * (0.5 - 0.8 * scale)
+        fun place(frame: NoteStyle.TrimmedFrame) {
+            img.x = baseX - frame.offsetX * scale
+            img.y = baseY - frame.offsetY * scale
+        }
+        img.scaleX = scale
+        img.scaleY = scale
+        place(first)
         img.alpha = noteStyle.splashAlpha
+        img.setPixelArt(noteStyle.isPixel)
+        if (noteStyle.splashBlendMode.equals("screen", ignoreCase = true)) {
+            img.blendMode = BlendMode.SCREEN
+        }
 
-        val fps = 24 + (-2..2).random()
+        val baseFps = noteStyle.splashFrameRate
+        val variance = noteStyle.splashFrameRateVariance.coerceAtLeast(0)
+        val fps = (baseFps + if (variance > 0) (-variance..variance).random() else 0)
+            .coerceAtLeast(1)
         val step = 1.0 / fps
         var elapsed = 0.0
         img.addUpdater { dt ->
@@ -412,7 +441,9 @@ class Strumline(
                 if (frames.isEmpty()) {
                     img.removeFromParent()
                 } else {
-                    img.bitmap = frames.first().slice
+                    val next = frames.first()
+                    img.bitmap = next.slice
+                    place(next)
                 }
             }
         }

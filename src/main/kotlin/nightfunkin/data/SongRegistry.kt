@@ -22,6 +22,9 @@ class SongDifficulty(
     val difficulty: String,
     private val chart: SongChartData,
 ) {
+    /** Variation metadata, e.g. erect's stage/audio/characters/time changes. */
+    private val metadata: SongMetadata = song.metadataFor(variation)
+
     /** Notes sorted by hit time — required for the strumline's streaming index. */
     val notes: List<SongNoteData> =
         chart.notes[difficulty].orEmpty().sortedBy { it.time }
@@ -35,15 +38,18 @@ class SongDifficulty(
             ?: 1f
 
     val timeChanges: List<SongTimeChange> =
-        song.metadata.timeChanges.map {
+        metadata.timeChanges.map {
             SongTimeChange(it.timeStamp, it.bpm, it.numerator, it.denominator, it.beatTuplets)
         }
 
-    val offsets: SongOffsets get() = song.metadata.offsets
-    val characters: SongCharacterData get() = song.metadata.playData.characters
-    val stage: String get() = song.metadata.playData.stage
-    val noteStyle: String get() = song.metadata.playData.noteStyle
-    val rating: Int get() = song.metadata.playData.ratings[difficulty] ?: 0
+    val songName: String get() = metadata.songName
+    val artist: String get() = metadata.artist
+    val charter: String? get() = metadata.charter
+    val offsets: SongOffsets get() = metadata.offsets
+    val characters: SongCharacterData get() = metadata.playData.characters
+    val stage: String get() = metadata.playData.stage
+    val noteStyle: String get() = metadata.playData.noteStyle
+    val rating: Int get() = metadata.playData.ratings[difficulty] ?: 0
 
     /** Events can be shared across variations; merge in the variation's own if any. */
     fun allEvents(): List<SongEventData> = events
@@ -53,9 +59,24 @@ class SongDifficulty(
 class SongEntry(val id: String) {
 
     private val chartCache = HashMap<String, SongChartData?>()
+    private val variationMetadataCache = HashMap<String, SongMetadata>()
 
     val metadata: SongMetadata by lazy {
         decodeMetadata(KnfFiles.text(KnfFiles.songMetadata(id)))
+    }
+
+    /**
+     * FNF stores a separate metadata file per variation. Its playData controls
+     * the stage, characters, note skin, timing and instrumental, so using the
+     * default metadata for an erect/pico run silently renders the wrong song.
+     */
+    fun metadataFor(variation: String = Constants.DEFAULT_VARIATION): SongMetadata {
+        if (variation == Constants.DEFAULT_VARIATION) return metadata
+        return variationMetadataCache.getOrPut(variation) {
+            KnfFiles.textOrNull(KnfFiles.songMetadata(id, variation))
+                ?.let { decodeMetadata(it, metadata) }
+                ?: metadata
+        }
     }
 
     val name: String get() = metadata.songName
@@ -65,8 +86,12 @@ class SongEntry(val id: String) {
     val variations: List<String>
         get() = listOf(Constants.DEFAULT_VARIATION) + metadata.playData.songVariations
 
-    val difficulties: List<String>
-        get() = metadata.playData.difficulties.ifEmpty { Constants.DEFAULT_DIFFICULTY_LIST }
+    val difficulties: List<String> get() = difficultiesFor()
+
+    fun difficultiesFor(variation: String = Constants.DEFAULT_VARIATION): List<String> =
+        metadataFor(variation).playData.difficulties
+            .ifEmpty { metadata.playData.difficulties }
+            .ifEmpty { Constants.DEFAULT_DIFFICULTY_LIST }
 
     fun chart(variation: String = Constants.DEFAULT_VARIATION): SongChartData? =
         chartCache.getOrPut(variation) {
@@ -91,8 +116,11 @@ class SongEntry(val id: String) {
      * but not Ogg, so MP3 wins when both exist (the player compensates for the
      * decoder latency via `Constants.MP3_DELAY_MS`).
      */
-    fun instrumentalPath(instId: String = ""): String? {
-        val chars = charactersOrNull()
+    fun instrumentalPath(
+        variation: String = Constants.DEFAULT_VARIATION,
+        instId: String = "",
+    ): String? {
+        val chars = charactersOrNull(variation)
         val suffix = if (instId.isNotEmpty() && chars?.altInstrumentals?.contains(instId) == true) "-$instId"
         else chars?.instrumental?.takeIf { it.isNotEmpty() }?.let { "-$it" } ?: ""
         return KnfFiles.resolveSound(KnfFiles.instrumentalStem(id, suffix))
@@ -118,12 +146,12 @@ class SongEntry(val id: String) {
         return null
     }
 
-    fun charactersOrNull(): SongCharacterData? =
-        runCatching { metadata.playData.characters }.getOrNull()
+    fun charactersOrNull(variation: String = Constants.DEFAULT_VARIATION): SongCharacterData? =
+        runCatching { metadataFor(variation).playData.characters }.getOrNull()
 
-    private fun decodeMetadata(text: String): SongMetadata =
+    private fun decodeMetadata(text: String, fallback: SongMetadata? = null): SongMetadata =
         runCatching { knfJson.decodeFromString<SongMetadata>(text) }
-            .getOrElse { SongMetadata(songName = id, artist = "unknown") }
+            .getOrElse { fallback ?: SongMetadata(songName = id, artist = "unknown") }
 
     override fun toString() = "$id ($name)"
 }
