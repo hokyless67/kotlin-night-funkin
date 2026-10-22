@@ -306,9 +306,14 @@ class AnimateAtlas(
             if (s.w <= 0 || s.h <= 0) continue
             // Better TA stores rotated sprites turned 90В° clockwise in the sheet.
             if (s.rotated) {
+                // BetterTA keeps `w`/`h` as the size of the packed (rotated)
+                // rectangle in the sheet while FlxAnimate swaps them for the
+                // logical sprite size and rotates the frame by -90 degrees.
+                // Slicing `h x w` here grabbed neighbouring sprites instead,
+                // which made results characters appear giant and misplaced.
                 out[s.name] = SpriteDef(
                     name = s.name,
-                    slice = bitmap.sliceWithSize(s.x, s.y, s.h, s.w),
+                    slice = bitmap.sliceWithSize(s.x, s.y, s.w, s.h),
                     width = s.h,
                     height = s.w,
                     turned = true,

@@ -10,6 +10,7 @@ import nightfunkin.core.Constants
 import nightfunkin.core.Knf
 import nightfunkin.play.PlayRequest
 import nightfunkin.play.PlayScene
+import nightfunkin.play.ResultScene
 import nightfunkin.ui.LoadingScene
 import nightfunkin.ui.LoadingSceneTarget
 import nightfunkin.ui.MainMenuScene
@@ -42,6 +43,7 @@ suspend fun main() = Korge(
     injector.root.mapPrototype { MainMenuScene() }
     injector.root.mapPrototype { SongSelectScene() }
     injector.root.mapPrototype { PlayScene() }
+    injector.root.mapPrototype { ResultScene() }
 
     // Test hooks — boot straight into a song instead of the menus:
     //   KNF_SONG=bopeebo KNF_DIFFICULTY=hard KNF_AUTOPLAY=1 ./gradlew run

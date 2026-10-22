@@ -3,12 +3,115 @@ package nightfunkin.play
 import nightfunkin.core.Constants
 
 /** Timing verdict for a note. Order matters: `>=` when compared in a `when`. */
-enum class Judgement(val label: String, val color: Int) {
-    SICK("sick", 0xFF3DD6D0.toInt()),
-    GOOD("good", 0xFF66FF66.toInt()),
-    BAD("bad", 0xFFFFAA00.toInt()),
-    SHIT("shit", 0xFFFF6600.toInt()),
-    MISS("miss", 0xFFFF0000.toInt()),
+enum class Judgement(val label: String) {
+    SICK("sick"),
+    GOOD("good"),
+    BAD("bad"),
+    SHIT("shit"),
+    MISS("miss"),
+}
+
+/**
+ * FNF's `SaveScoreTallyData` / `Highscore.tallies`, the numbers the results
+ * screen counts up. Kept mutable because gameplay updates them one note at a
+ * time, exactly like `Highscore.tallies` in `PlayState.applyScore`.
+ */
+class ScoreTallies(
+    var sick: Int = 0,
+    var good: Int = 0,
+    var bad: Int = 0,
+    var shit: Int = 0,
+    var missed: Int = 0,
+    var combo: Int = 0,
+    var maxCombo: Int = 0,
+    var totalNotesHit: Int = 0,
+    var totalNotes: Int = 0,
+) {
+    fun reset() {
+        sick = 0
+        good = 0
+        bad = 0
+        shit = 0
+        missed = 0
+        combo = 0
+        maxCombo = 0
+        totalNotesHit = 0
+    }
+
+    fun copy(): ScoreTallies = ScoreTallies(
+        sick = sick,
+        good = good,
+        bad = bad,
+        shit = shit,
+        missed = missed,
+        combo = combo,
+        maxCombo = maxCombo,
+        totalNotesHit = totalNotesHit,
+        totalNotes = totalNotes,
+    )
+
+    /** `Scoring.tallyCompletion`: (sick + good - missed) / totalNotes. */
+    val completion: Float
+        get() {
+            if (totalNotes <= 0) return 0f
+            return ((sick + good - missed).toFloat() / totalNotes).coerceIn(0f, 1f)
+        }
+}
+
+/**
+ * FNF 0.8.6's `ScoringRank`. `key` is the JSON field name used by playable
+ * character files (`perfectGold`, `loss`, ...), [assetName] is the name used by
+ * the results screen assets.
+ */
+enum class ScoringRank(val key: String, val assetName: String) {
+    PERFECT_GOLD("perfectGold", "PERFECT"),
+    PERFECT("perfect", "PERFECT"),
+    EXCELLENT("excellent", "EXCELLENT"),
+    GREAT("great", "GREAT"),
+    GOOD("good", "GOOD"),
+    SHIT("loss", "LOSS"),
+    ;
+
+    /** `ScoringRank.getHorTextAsset`. */
+    val horTextAsset: String get() = "resultScreen/rankText/rankScroll$assetName"
+
+    /** `ScoringRank.getVerTextAsset`. */
+    val verTextAsset: String get() = "resultScreen/rankText/rankText$assetName"
+
+    /** Delays from `Scoring.hx`, in 24 fps frames, converted to seconds. */
+    val musicDelay: Double
+        get() = when (this) {
+            PERFECT_GOLD, PERFECT -> 95.0 / 24.0
+            EXCELLENT -> 0.0
+            GREAT -> 5.0 / 24.0
+            GOOD -> 3.0 / 24.0
+            SHIT -> 2.0 / 24.0
+        }
+
+    val bfDelay: Double
+        get() = when (this) {
+            PERFECT_GOLD, PERFECT -> 95.0 / 24.0
+            EXCELLENT -> 97.0 / 24.0
+            else -> 95.0 / 24.0
+        }
+
+    val flashDelay: Double
+        get() = when (this) {
+            PERFECT_GOLD, PERFECT -> 129.0 / 24.0
+            EXCELLENT -> 122.0 / 24.0
+            GREAT -> 109.0 / 24.0
+            GOOD -> 107.0 / 24.0
+            SHIT -> 186.0 / 24.0
+        }
+
+    val highscoreDelay: Double
+        get() = when (this) {
+            PERFECT_GOLD, PERFECT -> 140.0 / 24.0
+            EXCELLENT -> 140.0 / 24.0
+            GREAT -> 129.0 / 24.0
+            GOOD -> 127.0 / 24.0
+            SHIT -> 207.0 / 24.0
+        }
 }
 
 /**
@@ -55,5 +158,26 @@ object Scoring {
         accuracy >= 0.95f -> PBOT1_RANKS[1]
         accuracy >= 0.90f -> PBOT1_RANKS[2]
         else -> PBOT1_RANKS[3]
+    }
+
+    /**
+     * FNF's `Scoring.calculateRank`.
+     *
+     * Perfect Gold is a full Sick clear; everything else is graded from
+     * `tallyCompletion`. The original returns `null` for a chart with no notes,
+     * which `ResultState` then treats as SHIT.
+     */
+    fun calculateRank(tallies: ScoreTallies?): ScoringRank {
+        if (tallies == null || tallies.totalNotes <= 0) return ScoringRank.SHIT
+        if (tallies.sick == tallies.totalNotes) return ScoringRank.PERFECT_GOLD
+
+        val completion = tallies.completion
+        return when {
+            completion == Constants.RANK_PERFECT_THRESHOLD -> ScoringRank.PERFECT
+            completion >= Constants.RANK_EXCELLENT_THRESHOLD -> ScoringRank.EXCELLENT
+            completion >= Constants.RANK_GREAT_THRESHOLD -> ScoringRank.GREAT
+            completion >= Constants.RANK_GOOD_THRESHOLD -> ScoringRank.GOOD
+            else -> ScoringRank.SHIT
+        }
     }
 }

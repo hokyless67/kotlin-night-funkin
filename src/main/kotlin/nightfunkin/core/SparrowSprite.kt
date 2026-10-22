@@ -69,6 +69,22 @@ class SparrowSprite(
         applyFrame(0)
     }
 
+    /** Jumps to [index] and continues playing from there. */
+    fun seekTo(index: Int) {
+        if (frames.isEmpty()) return
+        frameIndex = index.coerceIn(0, frames.size - 1)
+        elapsed = 0.0
+        appliedFrame = -1
+        playing = true
+        applyFrame(frameIndex)
+    }
+
+    /** Number of frames in the current animation. */
+    val frameCount: Int get() = frames.size
+
+    /** True once a non-looping animation has reached its last frame. */
+    val finished: Boolean get() = !playing && frameIndex >= frames.size - 1
+
     /** Advances the animation by [dt] seconds. */
     fun update(dt: Double) {
         if (!playing || frames.isEmpty() || fps <= 0.0) return

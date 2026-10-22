@@ -5,10 +5,12 @@ import korlibs.image.bitmap.sliceWithSize
 import korlibs.korge.scene.Scene
 import korlibs.korge.view.Container
 import korlibs.korge.view.SContainer
+import korlibs.korge.view.SolidRect
 import korlibs.korge.view.addUpdater
 import korlibs.korge.view.image
 import korlibs.korge.view.solidRect
 import korlibs.korge.view.text
+import kotlinx.coroutines.launch
 import nightfunkin.audio.MusicPlayer
 import nightfunkin.audio.SfxPlayer
 import nightfunkin.audio.dtSeconds
@@ -76,15 +78,23 @@ class PlayScene : Scene() {
     /** When the bot should let go of each lane, in song milliseconds. */
     private val autoReleaseAt = HashMap<Int, Float>()
     private lateinit var camera: GameplayCamera
+    private lateinit var sceneRoot: SContainer
 
     // ---- gameplay state -------------------------------------------------
     private var score = 0
     private var combo = 0
     private var hits = 0
     private var misses = 0
+    private val tallies = ScoreTallies()
     private var startingSong = true
     private var songEnded = false
     private var paused = false
+
+    /** FNF's `isSongEnd`: the results transition is running. */
+    private var ending = false
+    private var endingTimer = 0.0
+    private var endingTransitionStarted = false
+    private var fadeOverlay: SolidRect? = null
     private var startTimestampMs = 0.0
     private var prePosition = 0f
 
@@ -366,6 +376,7 @@ class PlayScene : Scene() {
     }
 
     override suspend fun SContainer.sceneMain() {
+        sceneRoot = this
         addUpdater { dt -> tick(dt.dtSeconds()) }
     }
 
@@ -441,11 +452,21 @@ class PlayScene : Scene() {
         combo = 0
         hits = 0
         misses = 0
+        tallies.reset()
+        tallies.totalNotes = totalNotes
         songEnded = false
+        ending = false
+        endingTimer = 0.0
+        endingTransitionStarted = false
+        fadeOverlay = null
         startingSong = true
         paused = false
         countdownStep = -1
         countdownTimer = 0.0
+        hudContainer.alpha = 1.0
+        music.volume = 1.0
+        vocals.volume = 1.0
+        opponentVocals.volume = 1.0
         playerStrumline.clean()
         opponentStrumline.clean()
         playerStrumline.setNoteData(chart.notes.filter { it.isPlayerNote })
@@ -466,14 +487,18 @@ class PlayScene : Scene() {
 
         if (paused) return
 
-        updateClock(dt)
-        if (startingSong) {
-            updateCountdown(dt)
-        } else if (!songEnded) {
-            processSongEvents()
-            processInput()
-            processNotes()
-            checkSongEnd()
+        if (!ending) {
+            updateClock(dt)
+            if (startingSong) {
+                updateCountdown(dt)
+            } else if (!songEnded) {
+                processSongEvents()
+                processInput()
+                processNotes()
+                checkSongEnd()
+            }
+        } else {
+            updateEnding(dt)
         }
 
         camera.update(dt)
@@ -593,7 +618,93 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         val length = music.totalMs
         if (length > 0 && music.positionMs >= length - 120) {
             songEnded = true
-            finishSong()
+            endSong()
+        }
+    }
+
+    /**
+     * FNF's `PlayState.endSong` / `zoomIntoResultsScreen`.
+     *
+     * The music is muted rather than stopped (FNF does the same), the ending
+     * transition is armed, and the score data is persisted for the results
+     * screen. Gameplay is frozen from here on, so notes stop and the beat no
+     * longer drives the characters' dance poses.
+     */
+    private fun endSong() {
+        if (ending) return
+        ending = true
+        endingTimer = 0.0
+        endingTransitionStarted = false
+
+        music.volume = 0.0
+        vocals.volume = 0.0
+        opponentVocals.volume = 0.0
+        gameInput.reset()
+
+        tallies.totalNotes = totalNotes
+        val rank = Scoring.calculateRank(tallies)
+        val scoreKey = "${song.id}:${chart.difficulty}:${chart.variation}"
+        val previousBest = Save.highscore(scoreKey)
+        val isNewHighscore = Save.submitHighscore(scoreKey, score)
+        Save.setSongRating(scoreKey, rank.key)
+
+        if (avsyncDebug && avcount > 0) {
+            val avg = avsum / avcount
+            println("KNF: AVSYNC notes=$avcount avg=${"%.2f".format(avg)}ms audio-vs-chart")
+            println("KNF: AVSYNC conductor=${conductor.songPosition}ms audio=${music.positionMs}ms offset=${conductor.combinedOffset}ms")
+        }
+        println(
+            "KNF: song finished $rank (${(tallies.completion * 100).roundToInt()}%), " +
+                "score $score (best was $previousBest, new=$isNewHighscore)"
+        )
+
+        // FNF follows GF (or BF when there is no GF) with targetOffset (20, -350).
+        // Flixel's `updateFollow` adds `targetOffset` to the target midpoint, so
+        // the same sign applies here (earlier this was inverted).
+        camera.bopEnabled = false
+        camera.tweenZoomTo(camera.zoom)
+        camera.followRate = 0.05
+        val dadIsGf = opponent.localWidth > 0.0 && opponent.id == "gf"
+        val follow = when {
+            girlfriend.localWidth <= 0.0 && !dadIsGf ->
+                player.cameraFocusPoint(stageFile.characterFor("bf")?.cameraOffsets.orEmpty())
+            dadIsGf ->
+                opponent.cameraFocusPoint(stageFile.characterFor("dad")?.cameraOffsets.orEmpty())
+            else ->
+                girlfriend.cameraFocusPoint(stageFile.characterFor("gf")?.cameraOffsets.orEmpty())
+        }
+        camera.setFocus(follow.first + 20.0, follow.second - 350.0)
+
+        // Fade the HUD, then fade the whole screen to black over 0.6 s.
+        val overlay = Container()
+        sceneRoot.addChild(overlay)
+        fadeOverlay = overlay.solidRect(
+            Constants.GAME_WIDTH * 2.0,
+            Constants.GAME_HEIGHT * 2.0,
+            Colors.BLACK,
+        ).apply { alpha = 0.0 }
+
+        ResultRequest.data = ResultData(
+            songId = song.id,
+            title = "${chart.songName} by ${chart.artist}",
+            difficultyId = chart.difficulty,
+            variationId = chart.variation,
+            characterId = chart.characters.player,
+            score = score,
+            tallies = tallies.copy(),
+            isNewHighscore = isNewHighscore,
+        )
+    }
+
+    private fun updateEnding(dt: Double) {
+        endingTimer += dt
+        val t = (endingTimer / ENDING_FADE_SECONDS).coerceIn(0.0, 1.0)
+        hudContainer.alpha = 1.0 - t
+        fadeOverlay?.alpha = t
+
+        if (!endingTransitionStarted && endingTimer >= ENDING_FADE_SECONDS) {
+            endingTransitionStarted = true
+            launch { sceneContainer.changeTo<ResultScene>() }
         }
     }
 
@@ -622,20 +733,6 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
                 "ms nextNote=" + "%.0f".format(lead) +
                 "ms ahead=" + "%.0f".format(lead - conductor.songPosition.toDouble())
         )
-    }
-
-    private fun finishSong() {
-        music.stop()
-        vocals.stop()
-        opponentVocals.stop()
-        val accuracy = if (totalNotes > 0) hits.toFloat() / totalNotes else 0f
-        val rank = Scoring.rankFor(accuracy)
-        if (avsyncDebug && avcount > 0) {
-            val avg = avsum / avcount
-            println("KNF: AVSYNC notes=$avcount avg=${"%.2f".format(avg)}ms audio-vs-chart")
-            println("KNF: AVSYNC conductor=${conductor.songPosition}ms audio=${music.positionMs}ms offset=${conductor.combinedOffset}ms")
-        }
-        println("KNF: song finished $rank (${(accuracy * 100).roundToInt()}%), score $score")
     }
 
     // ======================================================================
@@ -732,8 +829,28 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         note.hideHead()
 
         score += Scoring.scoreNote(absError)
-        combo++
         hits++
+        when (judgement) {
+            Judgement.SICK -> tallies.sick++
+            Judgement.GOOD -> tallies.good++
+            Judgement.BAD -> tallies.bad++
+            Judgement.SHIT -> tallies.shit++
+            Judgement.MISS -> tallies.missed++
+        }
+        tallies.totalNotesHit++
+
+        // FNF's `applyScore`: BAD and SHIT break the combo, everything else
+        // extends it. The tallies are authoritative; the local `combo` is just
+        // a mirror used by the HUD.
+        if (judgement == Judgement.BAD || judgement == Judgement.SHIT) {
+            if (tallies.combo >= 10) hud.showComboBreak()
+            tallies.combo = 0
+        } else {
+            tallies.combo++
+            if (tallies.combo > tallies.maxCombo) tallies.maxCombo = tallies.combo
+        }
+        combo = tallies.combo
+
         hud.setScore(score)
         hud.showJudgement(judgement)
         hud.showCombo(combo)
@@ -751,8 +868,11 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
     }
 
     private fun ghostTap() {
-        combo = 0
-        misses++
+        // FNF's ghost miss only takes health and score. It intentionally does
+        // not touch the tallies (so it can't lower the results completion) and
+        // does not reset the combo.
+        score += Constants.SCORE_GHOST_MISS_PENALTY.toInt()
+        hud.setScore(score)
         hud.addHealth(Constants.HEALTH_GHOST_MISS_PENALTY)
     }
 
@@ -815,6 +935,10 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
                 note.handledMiss = true
                 combo = 0
                 misses++
+                tallies.missed++
+                tallies.combo = 0
+                score += Constants.PBOT1_MISS_SCORE
+                hud.setScore(score)
                 hud.addHealth(Constants.HEALTH_MISS_PENALTY)
                 hud.showJudgement(Judgement.MISS)
                 // FNF hides the tail of a dropped hold note:
@@ -1018,6 +1142,11 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
     }
 
     private val variation: String get() = PlayRequest.variation
+
+    private companion object {
+        /** FNF's `camTransition.fade(..., 0.6, ...)` and HUD fade. */
+        const val ENDING_FADE_SECONDS = 0.6
+    }
 
     /** Picks the playable audio file for an extension-less stem. */
     private fun resolveSfx(stem: String): String = KnfFiles.resolveSound(stem) ?: "$stem.mp3"

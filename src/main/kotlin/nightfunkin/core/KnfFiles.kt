@@ -144,9 +144,17 @@ object KnfFiles {
 
     fun bytesOrNull(path: String): ByteArray? = fileOrNull(path)?.readBytes()
 
-    fun text(path: String): String = bytes(path).decodeToString()
+    fun text(path: String): String = bytes(path).decodeToString().stripBom()
 
-    fun textOrNull(path: String): String? = bytesOrNull(path)?.decodeToString()
+    fun textOrNull(path: String): String? = bytesOrNull(path)?.decodeToString()?.stripBom()
+
+    /**
+     * Adobe Animate's exported `spritemap1.json` files start with a UTF-8 BOM.
+     * kotlinx.serialization rejects the resulting U+FEFF, so drop it before
+     * handing any text asset to a JSON decoder.
+     */
+    private fun String.stripBom(): String =
+        if (startsWith('\uFEFF')) substring(1) else this
 
     // ---- audio format negotiation --------------------------------------
 

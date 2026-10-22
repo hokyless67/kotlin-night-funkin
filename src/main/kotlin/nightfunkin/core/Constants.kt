@@ -56,6 +56,8 @@ object Constants {
     const val PBOT1_SCORING_SLOPE = 0.080f
     const val PBOT1_MIN_SCORE = 9f
     const val PBOT1_MISS_SCORE = -100
+    /** `Constants.SCORE_GHOST_MISS_PENALTY`: ghost taps cost points, not tallies. */
+    const val SCORE_GHOST_MISS_PENALTY = -10f
 
     // ---- health ---------------------------------------------------------
     const val HEALTH_MAX = 2.0f
@@ -72,6 +74,12 @@ object Constants {
     const val HEALTH_GHOST_MISS_PENALTY = -4.0f / 100f * HEALTH_MAX
     const val HEALTH_HOLD_DROP_PENALTY_PER_SECOND = 0f
     const val HEALTH_MINE_PENALTY = -15.0f / 100f * HEALTH_MAX
+
+    // ---- results screen rank thresholds (Constants.hx) -------------------
+    const val RANK_PERFECT_THRESHOLD = 1.00f
+    const val RANK_EXCELLENT_THRESHOLD = 0.90f
+    const val RANK_GREAT_THRESHOLD = 0.80f
+    const val RANK_GOOD_THRESHOLD = 0.60f
 
     /** Health bar smoothing (0.8.6 PlayState.updateHealthBar). */
     const val HEALTH_LERP_RATE = 0.15f
