@@ -1,9 +1,12 @@
 package nightfunkin.audio
 
 import korlibs.audio.sound.AudioChannel
+import korlibs.audio.sound.PlaybackTimes
 import korlibs.audio.sound.Sound
-import korlibs.audio.sound.infinitePlaybackTimes
 import korlibs.audio.sound.readSound
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.withContext
 import nightfunkin.core.KnfFiles
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -29,6 +32,15 @@ class MusicPlayer {
     private var stoppedAtMs: Double = 0.0
     private var storedLengthMs: Double = 0.0
     private var paused = false
+
+    /**
+     * KorGE's `SoundAudioData` registers its `onCancel` stop hook on the
+     * coroutine context it was decoded in. Loading a persistent track while a
+     * scene is alive therefore ties it to that scene's lifetime: switching
+     * scenes cancels the job and silences the song. Playback runs on this
+     * player-owned context instead so `freakyMenu` survives the title screen.
+     */
+    private val playbackContext = SupervisorJob()
 
     var loadedPath: String? = null
         private set
@@ -66,21 +78,32 @@ class MusicPlayer {
     suspend fun load(path: String, volume: Double = 1.0): Boolean {
         if (loadedPath == path && sound != null) return true
         stop()
-        val bytes = KnfFiles.bytesOrNull(path)
-        if (bytes == null) {
+
+        // Reading and decoding a full instrumental is CPU/file-bound and can
+        // easily take a few hundred milliseconds. KorGE's main dispatcher
+        // drains scene callbacks per frame, so doing this there stalls the game
+        // and logs "Too many callbacks to handle in this frame".
+        val loaded = withContext(Dispatchers.Default) {
+            val bytes = KnfFiles.bytesOrNull(path) ?: return@withContext null
+            val loadedSound = bytes.readSound()
+            // Sound.length is zero for KorGE's non-streaming SoundAudioData, but
+            // its decoded AudioData still knows the real duration. Freeplay
+            // needs this before playback starts to compute the preview window.
+            val lengthMs = runCatching { loadedSound.decode().totalTime.toMsDouble() }.getOrDefault(0.0)
+            loadedSound to lengthMs
+        }
+        if (loaded == null) {
             println("KNF: audio missing: $path")
             return false
         }
-        val s = bytes.readSound()
+
+        val (s, lengthMs) = loaded
         s.volume = volume
         sound = s
         this.volume = volume
         loadedPath = path
         stoppedAtMs = 0.0
-        // Sound.length is zero for KorGE's non-streaming SoundAudioData, but its
-        // decoded AudioData still knows the real duration. Freeplay needs this
-        // before playback starts to compute the preview window.
-        storedLengthMs = runCatching { s.decode().totalTime.toMsDouble() }.getOrDefault(0.0)
+        storedLengthMs = lengthMs
         return true
     }
 
@@ -93,8 +116,8 @@ class MusicPlayer {
         ac.volume = volume
         ac.pitch = pitch
         val offset: Duration = startMs.milliseconds
-        if (loop) ac.play(s, times = infinitePlaybackTimes, startTime = offset)
-        else ac.play(s, startTime = offset)
+        val times = if (loop) PlaybackTimes.INFINITE else PlaybackTimes.ONE
+        ac.play(s, times, offset, playbackContext)
         channel = ac
     }
 
@@ -125,6 +148,7 @@ class MusicPlayer {
 
     fun dispose() {
         stop()
+        playbackContext.cancel()
         sound = null
         loadedPath = null
         storedLengthMs = 0.0

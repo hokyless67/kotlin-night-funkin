@@ -141,5 +141,7 @@ class GameplayCamera(
     /** Screen-space -> content-space, used for HUD placement inside the camera. */
     fun screenToContentX(sx: Double): Double = (sx - cam.x) / cam.scaleX
 
+    fun screenToContentY(sy: Double): Double = (sy - cam.y) / cam.scaleY
+
     fun contentToScreenY(cy: Double): Double = cy * cam.scaleY + cam.y
 }

@@ -14,7 +14,10 @@ import nightfunkin.core.setPixelArt
 import korlibs.math.geom.Anchor2D
 import korlibs.math.geom.degrees
 import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.hypot
+import kotlin.math.sin
+import kotlin.random.Random
 
 // ===========================================================================
 // preload/data/stages/<id>.json
@@ -128,6 +131,7 @@ class StageDataFile(val id: String) {
  */
 class Stage(id: String) : Container() {
 
+    private val stageId = id
     private val file = StageDataFile(id)
     private val loaded = ArrayList<Container>()
 
@@ -143,6 +147,30 @@ class Stage(id: String) : Container() {
     /** Props addressable by their JSON `name`, like FNF's `getNamedProp`. */
     private val namedProps = LinkedHashMap<String, Container>()
 
+    /** Per-prop transform state used to emulate Flixel scroll factors. */
+    private class PlacedProp(
+        val container: Container,
+        var baseX: Double,
+        var baseY: Double,
+        val scrollX: Double,
+        val scrollY: Double,
+        var rotationDegrees: Double,
+        val pivotX: Double = 0.0,
+        val pivotY: Double = 0.0,
+        val hasPivot: Boolean = false,
+    )
+
+    private val placedProps = ArrayList<PlacedProp>()
+    private val placedByName = HashMap<String, PlacedProp>()
+
+    /** Stage-scripted rotation origins, keyed by prop name. */
+    private val propPivots = HashMap<String, Pair<Double, Double>>()
+
+    // tankmanBattlefield.hx: the tank rolls in a large circle.
+    private var tankAngle = 0.0
+    private var tankSpeed = 0.0
+    private val tankX = 400.0
+
     init {
         // `Stage.refresh()` sorts every child by zIndex, ascending.
         for (prop in file.props.sortedBy { it.zIndex }) {
@@ -150,8 +178,31 @@ class Stage(id: String) : Container() {
             addChild(img)
             childZIndices += prop.zIndex
             loaded += img
-            scrollFactors += (prop.scroll.getOrElse(0) { 1.0 } to prop.scroll.getOrElse(1) { 1.0 })
-            if (prop.name.isNotEmpty()) namedProps[prop.name] = img
+            val scroll = prop.scroll.getOrElse(0) { 1.0 } to prop.scroll.getOrElse(1) { 1.0 }
+            scrollFactors += scroll
+            val pivot = propPivots[prop.name]
+            val placed = PlacedProp(
+                container = img,
+                baseX = img.x,
+                baseY = img.y,
+                scrollX = scroll.first,
+                scrollY = scroll.second,
+                rotationDegrees = prop.angle,
+                pivotX = pivot?.first ?: 0.0,
+                pivotY = pivot?.second ?: 0.0,
+                hasPivot = pivot != null,
+            )
+            placedProps += placed
+            if (prop.name.isNotEmpty()) {
+                namedProps[prop.name] = img
+                placedByName[prop.name] = placed
+            }
+        }
+
+        if (stageId == "tankmanBattlefield") {
+            tankAngle = Random.nextInt(-90, 46).toDouble()
+            tankSpeed = Random.nextDouble(5.0, 7.0)
+            moveTank(0.0)
         }
 
         // spookyMansionErect's stage script starts with both lightning layers
@@ -162,6 +213,8 @@ class Stage(id: String) : Container() {
             namedProps["bgLight"]?.alpha = 0.0001
             namedProps["stairsLight"]?.alpha = 0.0001
         }
+
+        update(0.0)
 
         if (loaded.isEmpty()) println("KNF: stage '$id' has no usable props")
     }
@@ -181,9 +234,48 @@ class Stage(id: String) : Container() {
         childZIndices.add(index, zIndex)
     }
 
-    /** Advances every animated prop, matching Flixel's per-frame sprite updates. */
-    fun update(dt: Double) {
+    /**
+     * Advances every animated prop and applies Flixel's per-prop `scrollFactor`.
+     *
+     * [viewLeft]/[viewTop] are the camera's top-left corner in stage space.
+     * Flixel draws a sprite at `(position - scroll * scrollFactor)`, so a prop
+     * with factor `s` needs to be shifted by `(1 - s) * scroll` inside our
+     * single shared camera transform.
+     */
+    fun update(dt: Double, viewLeft: Double = 0.0, viewTop: Double = 0.0) {
         for (prop in animatedProps) prop.update(dt)
+        if (stageId == "tankmanBattlefield") moveTank(dt)
+        for (prop in placedProps) {
+            val x = prop.baseX + (1.0 - prop.scrollX) * viewLeft
+            val y = prop.baseY + (1.0 - prop.scrollY) * viewTop
+            prop.container.rotation = prop.rotationDegrees.degrees
+            if (!prop.hasPivot) {
+                prop.container.x = x
+                prop.container.y = y
+                continue
+            }
+            // Flixel rotates sprites around their centre. KorGE rotates a
+            // container around (0,0), so compensate by the rotated pivot.
+            val radians = Math.toRadians(prop.rotationDegrees)
+            val cosA = cos(radians)
+            val sinA = sin(radians)
+            val rotPivotX = cosA * prop.container.scaleX * prop.pivotX -
+                sinA * prop.container.scaleY * prop.pivotY
+            val rotPivotY = sinA * prop.container.scaleX * prop.pivotX +
+                cosA * prop.container.scaleY * prop.pivotY
+            prop.container.x = x + prop.pivotX - rotPivotX
+            prop.container.y = y + prop.pivotY - rotPivotY
+        }
+    }
+
+    /** `TankmanBattlefieldStage.moveTank`. */
+    private fun moveTank(elapsed: Double) {
+        val tank = placedByName["tankRolling"] ?: return
+        tankAngle += elapsed * tankSpeed
+        val radians = Math.toRadians(tankAngle + 180.0)
+        tank.baseX = tankX + cos(radians) * 1500.0
+        tank.baseY = 1300.0 + sin(radians) * 1100.0
+        tank.rotationDegrees = tankAngle - 90.0 + 15.0
     }
 
     /**
@@ -339,6 +431,11 @@ class Stage(id: String) : Container() {
         }
 
         val ordered = atlas.frames.values.toList()
+        if (stageId == "tankmanBattlefield" && prop.name == "tankRolling") {
+            val first = ordered.first()
+            propPivots[prop.name] =
+                first.logicalWidth / 2.0 to first.logicalHeight / 2.0
+        }
         val animations = LinkedHashMap<String, StageAnimation>()
         for (def in prop.animations.orEmpty()) {
             val matching = ordered.indices.filter { ordered[it].name.startsWith(def.prefix) }

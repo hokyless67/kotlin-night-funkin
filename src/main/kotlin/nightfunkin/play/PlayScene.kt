@@ -485,7 +485,11 @@ class PlayScene : Scene() {
         opponent.update(dt)
         girlfriend.update(dt)
         player.update(dt)
-        stageProps?.update(dt)
+        stageProps?.update(
+            dt,
+            camera.screenToContentX(0.0),
+            camera.screenToContentY(0.0),
+        )
 
         if (avsyncDebug && !startingSong) measureAvSync()
         if (System.getenv("KNF_DEBUG_CHAR") == "1" && debugFrames == 300) dumpCharacters()
@@ -897,7 +901,13 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
     private fun handleSongEvent(ev: SongEventData) {
         when (ev.kind) {
             "FocusCamera" -> {
-                val char = ev.getInt("char") ?: (ev.valueAsStruct()["char"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() ?: 0
+                // Legacy charts (week 7 among them) store a bare `"v": 1`
+                // instead of `{"char": 1}`. FocusCameraSongEvent falls back to
+                // `cast data.value`; without that fallback every event was
+                // interpreted as char 0, pinning the camera to BF.
+                val char = ev.getInt("char")
+                    ?: (ev.value as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull()
+                    ?: 0
                 val px = ev.getFloat("x") ?: 0f
                 val py = ev.getFloat("y") ?: 0f
                 val duration = ev.getFloat("duration") ?: 4f
