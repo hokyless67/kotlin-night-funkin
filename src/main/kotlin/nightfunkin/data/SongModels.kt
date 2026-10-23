@@ -52,7 +52,10 @@ data class SongOffsets(
 @Serializable
 data class SongCharacterData(
     val player: String = "bf",
-    val girlfriend: String = "gf",
+    // FNF's `SongCharacterData.girlfriend` defaults to an empty string. Songs
+    // that want a girlfriend declare her explicitly; the Tutorial deliberately
+    // has none because its opponent *is* GF.
+    val girlfriend: String = "",
     val opponent: String = "dad",
     val instrumental: String = "",
     val altInstrumentals: List<String> = emptyList(),

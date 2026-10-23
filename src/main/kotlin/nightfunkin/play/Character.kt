@@ -166,7 +166,13 @@ class Character(val id: String) : Container() {
     private val poses: List<Pose> =
         if (legacyAtlas != null) legacyPoses() else animateAtlas?.poses ?: emptyList()
 
-    private val anims: Map<String, List<Int>> = runCatching { loadAnimations() }.getOrElse { emptyMap() }
+    private data class Playback(
+        val frames: List<Int>,
+        val looped: Boolean,
+        val frameRate: Double,
+    )
+
+    private val anims: Map<String, Playback> = runCatching { loadAnimations() }.getOrElse { emptyMap() }
 
     /**
      * Legacy sheets have no timeline, so the bounds come from a single frame
@@ -178,9 +184,9 @@ class Character(val id: String) : Container() {
      */
     private val bounds: Bounds = legacyAtlas?.let { atlas ->
         val order = sprites.keys.toList()
-        var index = anims["idle"]?.firstOrNull() ?: -1
-        if (index < 0) index = anims["danceLeft"]?.firstOrNull() ?: -1
-        if (index < 0) index = anims.values.firstOrNull()?.firstOrNull() ?: -1
+        var index = anims["idle"]?.frames?.firstOrNull() ?: -1
+        if (index < 0) index = anims["danceLeft"]?.frames?.firstOrNull() ?: -1
+        if (index < 0) index = anims.values.firstOrNull()?.frames?.firstOrNull() ?: -1
         if (index < 0) index = 0
         val frame = order.getOrNull(index)?.let { atlas.frame(it) }
         if (frame == null) {
@@ -248,8 +254,8 @@ class Character(val id: String) : Container() {
     private var currentAnim: String? = null
     private var frameTime = 0.0
     private var frameIndex = 0
-
-    private val frameRate: Double = animateAtlas?.frameRate ?: 24.0
+    /** FNF's `FlxAnimation.finished`; non-looped poses hold their last frame. */
+    private var animFinished = false
 
     private var singTimer = 0.0
     private var dancing = true
@@ -274,10 +280,11 @@ class Character(val id: String) : Container() {
 
     /** Debug helper: prints the parts of the first frame of every animation. */
     private fun dumpParts() {
-        for ((name, frames) in anims) {
-            println("KNF: char $id anim $name = [" + frames.joinToString(",") + "]")
+        for ((name, playback) in anims) {
+            println("KNF: char $id anim $name = [" + playback.frames.joinToString(",") + "]")
         }
-        for ((name, frames) in anims) {
+        for ((name, playback) in anims) {
+            val frames = playback.frames
             val pose = poses.getOrNull(frames.firstOrNull() ?: continue) ?: continue
             val list = pose.parts.mapNotNull { p ->
                 val d = sprites[p.sprite] ?: return@mapNotNull "MISSING:" + p.sprite
@@ -383,9 +390,9 @@ class Character(val id: String) : Container() {
      * frame `Idle` run, so frame `12` never plays - reading it as an absolute
      * index would show `singUP`'s first frame for a single frame of dad's idle.
      */
-    private fun loadAnimations(): Map<String, List<Int>> {
+    private fun loadAnimations(): Map<String, Playback> {
         if (animateAtlas == null && legacyAtlas == null) return emptyMap()
-        val out = LinkedHashMap<String, List<Int>>()
+        val out = LinkedHashMap<String, Playback>()
 
         for (def in data.animations) {
             val frames = if (legacyAtlas != null) {
@@ -396,10 +403,18 @@ class Character(val id: String) : Container() {
             } else {
                 labelFrames(def.prefix)
             }
-            if (frames.isNotEmpty()) out[def.name] = frames
+            if (frames.isNotEmpty()) {
+                out[def.name] = Playback(
+                    frames = frames,
+                    looped = def.looped,
+                    frameRate = def.frameRate?.toDouble() ?: animateAtlas?.frameRate ?: 24.0,
+                )
+            }
         }
 
-        if (out.isEmpty()) out["idle"] = poses.indices.toList()
+        if (out.isEmpty()) {
+            out["idle"] = Playback(poses.indices.toList(), looped = true, frameRate = 24.0)
+        }
         return out
     }
 
@@ -432,45 +447,80 @@ class Character(val id: String) : Container() {
      * singing and idling.
      */
     fun dance(forceRestart: Boolean = false) {
-        if (!forceRestart && isSinging) return
+        if (!forceRestart) {
+            if (isSinging) return
+            // FNF also refuses to chop a non-idle special animation (hey,
+            // cheer, death, ...) that is still playing.
+            val anim = currentAnim
+            if (anim != null && !anim.startsWith("dance") && !anim.startsWith("idle") && !animFinished) return
+        }
         if (anims.containsKey("danceLeft") && anims.containsKey("danceRight")) {
             dancing = true
             play(if (danceFlipped) "danceRight" else "danceLeft", forceRestart)
             danceFlipped = !danceFlipped
         } else {
             dancing = true
-            play("idle", forceRestart)
+            // `idle` is a one-shot animation here (`bf.json` leaves `looped`
+            // out, which defaults to false). It is authored to be roughly one
+            // beat long, so FNF restarts it on every beat through
+            // `FlxAnimation.play` seeing `finished`. The frame clock and the
+            // song/audio clock are independent, though, and when the beat
+            // lands while the last frame is still on screen the animation is
+            // not marked finished yet - the restart then slips a whole beat.
+            // Treat the final frame as spent so the beat can always restart it.
+            play("idle", forceRestart || isOnLastFrame())
         }
+    }
+
+    /**
+     * Whether a non-looped animation is already showing its last frame.
+     *
+     * `FlxAnimation.play` would still return early here; the only reason to
+     * look at this is the beat/clock skew described in [dance].
+     */
+    private fun isOnLastFrame(): Boolean {
+        val anim = currentAnim?.let { anims[it] } ?: return false
+        return !anim.looped && anim.frames.size > 1 && frameIndex >= anim.frames.lastIndex
     }
 
     /**
      * Holds a sing pose for FNF's `singTime`, which is counted in 16th-note
      * steps rather than seconds (8 steps = two beats at any tempo).
      */
-    fun sing(direction: Int, stepLengthMs: Double) {
-        val anim = when (direction) {
-            0 -> "singLEFT"
-            1 -> "singDOWN"
-            2 -> "singUP"
-            3 -> "singRIGHT"
+    fun sing(direction: Int, stepLengthMs: Double, miss: Boolean = false) {
+        val dir = when (direction) {
+            0 -> "LEFT"
+            1 -> "DOWN"
+            2 -> "UP"
+            3 -> "RIGHT"
             else -> return
         }
+        // FNF's `playSingAnimation`: 'sing${dir}${miss ? "miss" : ""}'.
+        val anim = "sing$dir" + if (miss) "miss" else ""
         if (!anims.containsKey(anim)) return
         dancing = false
         play(anim, forceRestart = true)
-        singTimer = data.singTime * stepLengthMs / 1000.0
+        // `BaseCharacter.update` doubles the pose time for miss animations:
+        // `if (getCurrentAnimation().endsWith('miss')) singTimeSec *= 2;`
+        singTimer = data.singTime * stepLengthMs / 1000.0 * if (miss) 2.0 else 1.0
     }
 
     fun play(anim: String, forceRestart: Boolean = false) {
-        if (anim == currentAnim && !forceRestart) return
+        // `FlxAnimation.play` bails out only while the animation is still
+        // running: `if (!Force && !finished && reversed == Reversed) return;`.
+        // A non-looped animation that already reached its last frame therefore
+        // restarts on the next `dance()` call, which is how BF's 30-frame idle
+        // keeps bobbing even though `idle` is declared `looped: false`.
+        if (anim == currentAnim && !forceRestart && !animFinished) return
         if (!anims.containsKey(anim)) return
         if (System.getenv("KNF_DEBUG_CHAR") == "1") {
-            val fr = anims[anim]?.firstOrNull()
+            val fr = anims[anim]?.frames?.firstOrNull()
             println("KNF: char $id -> $anim  poseParts=" + (fr?.let { poses.getOrNull(it)?.parts?.size }))
         }
         currentAnim = anim
         frameTime = 0.0
         frameIndex = 0
+        animFinished = false
         renderPose()
     }
 
@@ -483,21 +533,33 @@ class Character(val id: String) : Container() {
             }
         }
 
-        val frames = currentAnim?.let { anims[it] } ?: return
-        if (frames.isEmpty()) return
+        val anim = currentAnim?.let { anims[it] } ?: return
+        if (anim.frames.isEmpty() || animFinished) return
 
         frameTime += dt
-        val step = 1.0 / frameRate
-        while (frameTime >= step) {
+        val step = 1.0 / anim.frameRate.coerceAtLeast(1.0)
+        while (frameTime >= step && !animFinished) {
             frameTime -= step
-            frameIndex = (frameIndex + 1) % frames.size
-            // FNF hands over to `<anim>-hold` once a pose runs out, so dad keeps
-            // his eyes flickering while idle and Darnell keeps his lighter lit.
-            // `BaseCharacter.update` documents this as working for sing poses
-            // too, and `singUP-hold` is authored as the settle frames at the end
-            // of the UP pose. The sing timer still owns the return to idle.
-            val hold = holdAnimFor(frames)
-            if (hold != null && frameIndex == 0) play(hold, forceRestart = true) else renderPose()
+            if (anim.looped) {
+                frameIndex = (frameIndex + 1) % anim.frames.size
+                renderPose()
+                continue
+            }
+
+            if (frameIndex < anim.frames.lastIndex) {
+                frameIndex++
+                renderPose()
+                continue
+            }
+
+            // FNF's FlxAnimation freezes on the last frame of a non-looped
+            // animation. `BaseCharacter.update` then hands over to `<anim>-hold`
+            // if one exists, so dad keeps his eyes flickering and Darnell keeps
+            // his lighter lit. Previously every animation wrapped around, which
+            // made idle/sing poses repeat instead of settling.
+            animFinished = true
+            val hold = holdAnimFor(anim.frames)
+            if (hold != null) play(hold, forceRestart = true)
         }
     }
 
@@ -511,7 +573,7 @@ class Character(val id: String) : Container() {
     }
 
     private fun renderPose() {
-        val frames = currentAnim?.let { anims[it] } ?: return
+        val frames = currentAnim?.let { anims[it]?.frames } ?: return
         if (frames.isEmpty()) return
         val pose = poses.getOrNull(frames[frameIndex % frames.size]) ?: return
 

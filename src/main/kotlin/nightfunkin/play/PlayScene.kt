@@ -115,7 +115,8 @@ class PlayScene : Scene() {
     // ---- stage layout (screen coordinates, inside the camera layer) -------
     private lateinit var stageLayer: Container
     private lateinit var opponent: Character
-    private lateinit var girlfriend: Character
+    /** FNF only creates a GF when the song names one; the Tutorial has none. */
+    private var girlfriend: Character? = null
     private lateinit var player: Character
     private var stageProps: Stage? = null
 
@@ -217,20 +218,24 @@ class PlayScene : Scene() {
         buildStageProps()
 
         val chars = chart.characters
-        opponent = Character.get(chars.opponent)
-        girlfriend = Character.get(chars.girlfriend)
-        player = Character.get(chars.player)
+        // FNF's `fetchCharacter()` constructs a new character for every slot.
+        // Reusing one cached instance made Tutorial's GF serve as both the
+        // opponent and the girlfriend, so her dance()/update() ran twice per
+        // beat and the idle always ended on the same side.
+        opponent = Character(chars.opponent)
+        girlfriend = chars.girlfriend.takeIf { it.isNotEmpty() }?.let { Character(it) }
+        player = Character(chars.player)
 
         val opponentSlot = placeCharacter(opponent, "dad")
-        placeCharacter(girlfriend, "gf")
+        girlfriend?.let { placeCharacter(it, "gf") }
         placeCharacter(player, "bf")
 
         // `Stage.refresh()` sorts every prop *and* character by zIndex ascending;
         // tankmanBattlefield relies on foreground props (audience, bricks) having
         // higher zIndex than the characters.
-        val byZIndex = listOf(
+        val byZIndex = listOfNotNull(
             Triple("dad", opponent, opponentSlot.zIndex),
-            Triple("gf", girlfriend, stageFile.characterFor("gf")?.zIndex ?: 0),
+            girlfriend?.let { Triple("gf", it, stageFile.characterFor("gf")?.zIndex ?: 0) },
             Triple("bf", player, stageFile.characterFor("bf")?.zIndex ?: 0),
         ).sortedBy { it.third }
         for ((_, character, zIndex) in byZIndex) {
@@ -242,7 +247,7 @@ class PlayScene : Scene() {
         // Some shipped characters are placeholders that resolve to nothing
         // (`gf-tankmen` points at a folder that does not exist). Hiding them keeps
         // a missing asset from dragging the camera focus around.
-        for ((slot, ch) in listOf("dad" to opponent, "gf" to girlfriend, "bf" to player)) {
+        for ((slot, ch) in listOfNotNull("dad" to opponent, girlfriend?.let { "gf" to it }, "bf" to player)) {
             if (ch.localWidth <= 0.0 || ch.localHeight <= 0.0) {
                 ch.visible = false
                 println("KNF: character '" + ch.id + "' for slot " + slot + " has no art")
@@ -350,8 +355,9 @@ class PlayScene : Scene() {
         println(
             "KNF: chars dad='" + opponent.id + "'@" + opponent.x + "," + opponent.y +
                 " " + opponent.localWidth + "x" + opponent.localHeight +
-                " | gf='" + girlfriend.id + "'@" + girlfriend.x + "," + girlfriend.y +
-                " " + girlfriend.localWidth + "x" + girlfriend.localHeight +
+                " | gf=" + (girlfriend?.let {
+                    "'" + it.id + "'@" + it.x + "," + it.y + " " + it.localWidth + "x" + it.localHeight
+                } ?: "<none>") +
                 " | bf='" + player.id + "'@" + player.x + "," + player.y +
                 " " + player.localWidth + "x" + player.localHeight +
                 " | camFocus=" + camera.focusX + "," + camera.focusY + " zoom=" + stageFile.cameraZoom
@@ -487,6 +493,16 @@ class PlayScene : Scene() {
 
         if (paused) return
 
+        // Characters advance before the conductor dispatches this frame's
+        // step/beat events, matching `PlayState.update` where `super.update()`
+        // runs before `Conductor.instance.update()`. With the opposite order a
+        // non-looped animation that reaches its last frame on the same frame as
+        // a beat is still marked unfinished when `dance()` runs, so the restart
+        // slips to the following beat.
+        opponent.update(dt)
+        girlfriend?.update(dt)
+        player.update(dt)
+
         if (!ending) {
             updateClock(dt)
             if (startingSong) {
@@ -507,9 +523,6 @@ class PlayScene : Scene() {
         playerStrumline.update(conductor, startTimestampMs.toFloat(), dt)
         opponentStrumline.update(conductor, startTimestampMs.toFloat(), dt)
 
-        opponent.update(dt)
-        girlfriend.update(dt)
-        player.update(dt)
         stageProps?.update(
             dt,
             camera.screenToContentX(0.0),
@@ -665,13 +678,14 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         camera.tweenZoomTo(camera.zoom)
         camera.followRate = 0.05
         val dadIsGf = opponent.localWidth > 0.0 && opponent.id == "gf"
+        val gf = girlfriend
         val follow = when {
-            girlfriend.localWidth <= 0.0 && !dadIsGf ->
+            (gf == null || gf.localWidth <= 0.0) && !dadIsGf ->
                 player.cameraFocusPoint(stageFile.characterFor("bf")?.cameraOffsets.orEmpty())
             dadIsGf ->
                 opponent.cameraFocusPoint(stageFile.characterFor("dad")?.cameraOffsets.orEmpty())
             else ->
-                girlfriend.cameraFocusPoint(stageFile.characterFor("gf")?.cameraOffsets.orEmpty())
+                gf!!.cameraFocusPoint(stageFile.characterFor("gf")?.cameraOffsets.orEmpty())
         }
         camera.setFocus(follow.first + 20.0, follow.second - 350.0)
 
@@ -763,7 +777,7 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         if (candidates.isEmpty()) {
             // FNF's `Strumline.mayGhostTap`: a tap into empty air only counts
             // when no note is in range and none was hit just before.
-            if (playerStrumline.mayGhostTap()) ghostTap()
+            if (playerStrumline.mayGhostTap()) ghostTap(lane)
             return
         }
         val note = candidates.first()
@@ -782,7 +796,7 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
 
     /** Debug helper: where each character actually ended up on screen. */
     private fun dumpCharacters() {
-        for ((label, ch) in listOf("dad" to opponent, "gf" to girlfriend, "bf" to player)) {
+        for ((label, ch) in listOfNotNull("dad" to opponent, girlfriend?.let { "gf" to it }, "bf" to player)) {
             val box = ch.getBounds()
             val vis = ch.children.count { it.visible }
             println(
@@ -807,7 +821,7 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
     private fun onBeat() {
         player.dance()
         opponent.dance()
-        girlfriend.dance()
+        girlfriend?.dance()
     }
 
     private fun goodNoteHit(note: NoteSprite) {
@@ -867,13 +881,16 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         }
     }
 
-    private fun ghostTap() {
+    private fun ghostTap(lane: Int) {
         // FNF's ghost miss only takes health and score. It intentionally does
         // not touch the tallies (so it can't lower the results completion) and
         // does not reset the combo.
         score += Constants.SCORE_GHOST_MISS_PENALTY.toInt()
         hud.setScore(score)
         hud.addHealth(Constants.HEALTH_GHOST_MISS_PENALTY)
+        // `GhostMissNoteScriptEvent.playAnim` defaults to true and
+        // `BaseCharacter.onNoteGhostMiss` turns it into BF's miss pose.
+        player.sing(lane, conductor.stepLengthMs.toDouble(), miss = true)
     }
 
     private fun processNotes() {
@@ -941,6 +958,9 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
                 hud.setScore(score)
                 hud.addHealth(Constants.HEALTH_MISS_PENALTY)
                 hud.showJudgement(Judgement.MISS)
+                // `BaseCharacter.onNoteMiss` plays the matching miss pose for
+                // every player note that leaves the window.
+                player.sing(note.directionIndex, conductor.stepLengthMs.toDouble(), miss = true)
                 // FNF hides the tail of a dropped hold note:
                 // `holdNote.missedNote = true; holdNote.visible = false;`
                 note.killTrail()
@@ -1078,7 +1098,8 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         val target: Pair<Double, Double> = when (char) {
             0 -> player.cameraFocusPoint(stageFile.characterFor("bf")?.cameraOffsets.orEmpty())
             1 -> opponent.cameraFocusPoint(stageFile.characterFor("dad")?.cameraOffsets.orEmpty())
-            2 -> girlfriend.cameraFocusPoint(stageFile.characterFor("gf")?.cameraOffsets.orEmpty())
+            2 -> girlfriend?.cameraFocusPoint(stageFile.characterFor("gf")?.cameraOffsets.orEmpty())
+                ?: return // FNF: "No GF to focus on."
             else -> defaultCameraFocus
         }
         val dx = if (char < 0) x.toDouble() else 0.0

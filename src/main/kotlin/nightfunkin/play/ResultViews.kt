@@ -360,11 +360,33 @@ private class ScoreNum(
             if (goneFrames.isNotEmpty()) view.play(goneFrames, restart = true)
         }
 
-    /** Seconds before the shuffle starts, in 1/24 s frames. */
-    var startDelay: Double = 0.0
+    /**
+     * Seconds before the shuffle starts, in 1/24 s frames.
+     *
+     * `ResultScore.animateNumbers` only arms the digits that the score actually
+     * occupies; leading zeroes must stay on `DISABLED`. The original never
+     * shuffles them because `shuffle()` is called from `animateNumbers` alone,
+     * so a default of 0 here would make them cycle and settle on `9`
+     * (`floor(1.0 * 10)` clamped by `playDigit`), which is not a real digit.
+     */
+    var startDelay: Double = Double.POSITIVE_INFINITY
 
     /** Frames to wait after settling before replaying the final animation. */
     var finalDelay: Double = 0.0
+
+    /**
+     * FNF's `animateNumbers` starts a fresh `FlxTimer` per digit, so the wait
+     * begins when the digit is armed, not when the results screen was built.
+     * Resetting here keeps the digits staggered instead of starting their
+     * shuffle in lockstep on the first update after arming.
+     */
+    fun schedule(shuffleDelay: Double, settleDelay: Double) {
+        startDelay = shuffleDelay
+        finalDelay = settleDelay
+        timer = 0.0
+        phase = Phase.WAITING
+        shuffleElapsed = 0.0
+    }
 
     private var phase = Phase.WAITING
     private var timer = 0.0
@@ -489,8 +511,10 @@ class ResultScore(
 
     fun animateNumbers() {
         for (i in (nums.size - scoreStart) until nums.size) {
-            nums[i].startDelay = (i - 1).coerceAtLeast(0) / 24.0
-            nums[i].finalDelay = (scoreStart - (i - 1)).coerceAtLeast(0) / 24.0
+            nums[i].schedule(
+                shuffleDelay = (i - 1).coerceAtLeast(0) / 24.0,
+                settleDelay = (scoreStart - (i - 1)).coerceAtLeast(0) / 24.0,
+            )
         }
     }
 
