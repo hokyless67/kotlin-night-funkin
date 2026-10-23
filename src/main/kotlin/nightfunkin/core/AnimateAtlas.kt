@@ -73,10 +73,39 @@ data class Mat(
     fun xform(x: Double, y: Double) = a * x + c * y + tx to b * x + d * y + ty
 }
 
-private fun matOf(mx: List<Double>?): Mat {
-    if (mx == null || mx.size < 6) return Mat()
+/**
+ * Resolves an element transform the way flixel-animate's `MatrixJson.resolve`
+ * does: prefer the 2D `MX` array, otherwise flatten the 16-value `M3D` array.
+ *
+ * BetterTextureAtlas exports most Animate symbol instances with `M3D` instead
+ * of `MX`; ignoring it collapses the whole character onto the stage origin.
+ */
+private fun matOf(mx: List<Double>?, m3d: List<Double>? = null): Mat {
+    if (mx != null && mx.size >= 6) {
+        return Mat(
+            a = mx[0], b = mx[1], c = mx[2], d = mx[3], tx = mx[4], ty = mx[5],
+        )
+    }
+    if (m3d == null || m3d.size < 16) return Mat()
+
+    // No perspective: keep the 2D components directly.
+    val hasPerspective = m3d[3] != 0.0 || m3d[7] != 0.0 || m3d[11] != 0.0 || m3d[15] != 1.0
+    if (!hasPerspective) {
+        return Mat(a = m3d[0], b = m3d[1], c = m3d[4], d = m3d[5], tx = m3d[12], ty = m3d[13])
+    }
+
+    fun project(x: Double, y: Double): Pair<Double, Double> {
+        val z = m3d[3] * x + m3d[7] * y + m3d[15]
+        return (m3d[0] * x + m3d[4] * y + m3d[12] / z) to
+            (m3d[1] * x + m3d[5] * y + m3d[13] / z)
+    }
+    val (p0x, p0y) = project(0.0, 0.0)
+    val (p1x, p1y) = project(1.0, 0.0)
+    val (p2x, p2y) = project(0.0, 1.0)
     return Mat(
-        a = mx[0], b = mx[1], c = mx[2], d = mx[3], tx = mx[4], ty = mx[5],
+        a = p1x - p0x, b = p1y - p0y,
+        c = p2x - p0x, d = p2y - p0y,
+        tx = p0x, ty = p0y,
     )
 }
 
@@ -92,6 +121,7 @@ data class AnimAtlasInstance(
     /** Name of the sprite in `spritemap1.json`. */
     @SerialName("N") val name: String = "",
     @SerialName("MX") val matrix: List<Double>? = null,
+    @SerialName("M3D") val matrix3D: List<Double>? = null,
 )
 
 /**
@@ -106,6 +136,7 @@ data class AnimSymbolInstance(
     /** `LP` (loop), `PO` (play once) or `SF` (single frame). */
     @SerialName("LP") val loop: String = "LP",
     @SerialName("MX") val matrix: List<Double>? = null,
+    @SerialName("M3D") val matrix3D: List<Double>? = null,
 )
 
 @Serializable
@@ -220,7 +251,7 @@ class Bounds {
  * The JSON is a *tree*, not a flat sprite list:
  *
  * ```
- * AN.TL.L[*].FR[*].E[].SI   instance of a symbol, placed by MX, started at FF
+ * AN.TL.L[*].FR[*].E[].SI   instance of a symbol, placed by MX/M3D, started at FF
  *   +- SD.S[i].TL.L[*]...  that symbol's own timeline
  *        +- ...E[].ASI     finally: one sprite out of spritemap1.json
  * ```
@@ -376,13 +407,13 @@ class AnimateAtlas(
                 val asi = event.atlas
                 if (asi != null) {
                     val def = sprites[asi.name] ?: continue
-                    out += PosePart(asi.name, matOf(asi.matrix).under(parent))
+                    out += PosePart(asi.name, matOf(asi.matrix, asi.matrix3D).under(parent))
                     continue
                 }
                 val si = event.instance ?: continue
                 val child = symbolByName[si.symbolName] ?: continue
                 val childFrame = resolveSymbolFrame(si, frameIndex, keyframe.start, child)
-                collect(child, childFrame, matOf(si.matrix).under(parent), out, depth + 1)
+                collect(child, childFrame, matOf(si.matrix, si.matrix3D).under(parent), out, depth + 1)
             }
         }
     }

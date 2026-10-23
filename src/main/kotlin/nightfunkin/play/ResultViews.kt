@@ -181,11 +181,21 @@ class ResultAnimateSprite(
     private val poses = atlas.poses
     private val bounds: Bounds = atlas.bounds
 
+    /**
+     * FlxAnimate scales around the centre of the timeline bounds, not around
+     * the top-left corner. Keep the outer node at the authored x/y and offset
+     * the scaled content by `origin * (1 - scale)`.
+     */
+    private val content = Container()
+
     var onFinished: (() -> Unit)? = null
 
     init {
-        this.scaleX = scale
-        this.scaleY = scale
+        content.scaleX = scale
+        content.scaleY = scale
+        content.x = bounds.width / 2.0 * (1.0 - scale)
+        content.y = bounds.height / 2.0 * (1.0 - scale)
+        addChild(content)
         render()
     }
 
@@ -249,7 +259,7 @@ class ResultAnimateSprite(
         val pose = poses.getOrNull(frames[frameIndex % frames.size]) ?: return
 
         while (images.size < pose.parts.size) {
-            images += Image(EMPTY_BITMAP, Anchor2D.CENTER).also { addChild(it) }
+            images += Image(EMPTY_BITMAP, Anchor2D.CENTER).also { content.addChild(it) }
         }
         for (i in images.indices) {
             val img = images[i]
