@@ -194,7 +194,15 @@ data class AnimTimeline(@SerialName("L") val layers: List<AnimLayer> = emptyList
 }
 
 @Serializable
-data class AnimSymbol(@SerialName("TL") val timeline: AnimTimeline = AnimTimeline())
+data class AnimSymbol(
+    @SerialName("TL") val timeline: AnimTimeline = AnimTimeline(),
+    /** `STI` вЂ” the symbol's placement on the Animate stage, when exported. */
+    @SerialName("STI") val stageInstance: AnimStageInstance? = null,
+)
+
+/** `STI.SI`: BetterTextureAtlas keeps the stage matrix inside the instance. */
+@Serializable
+data class AnimStageInstance(@SerialName("SI") val instance: AnimSymbolInstance? = null)
 
 /** `SD.S` вЂ” the symbol dictionary, keyed by the symbol name `SI.SN` refers to. */
 @Serializable
@@ -218,6 +226,143 @@ data class AnimRoot(
     @SerialName("AN") val animation: AnimSymbol = AnimSymbol(),
     @SerialName("SD") val symbolDefs: AnimSymbolDefs = AnimSymbolDefs(),
     @SerialName("MD") val metadata: AnimMetadata = AnimMetadata(),
+)
+
+// ===========================================================================
+// Older Adobe Animate exports
+// ===========================================================================
+
+/**
+ * Several shipped sheets (A-Bot's `abotSystem` and `systemEyes`) use the older
+ * Adobe Animate export shape instead of BetterTextureAtlas' `AN`/`SD`/`MD`.
+ * FNF's `FlxAnimate` accepts both, so KNF has to as well.
+ *
+ * The data means the same thing, it is only spelled differently:
+ *
+ * ```json
+ * { "ANIMATION": { "TIMELINE": { "LAYERS": [...] } },
+ *   "SYMBOL_DICTIONARY": { "Symbols": [...] },
+ *   "metadata": { "framerate": 24 } }
+ * ```
+ *
+ * [toTimeline] folds it into the same internal model so the existing pose
+ * walker and bounds code do not need a second implementation.
+ */
+@Serializable
+data class LegacyAnimRoot(
+    @SerialName("ANIMATION") val animation: LegacyAnimSymbol = LegacyAnimSymbol(),
+    @SerialName("SYMBOL_DICTIONARY") val dictionary: LegacyAnimDictionary = LegacyAnimDictionary(),
+    @SerialName("metadata") val metadata: LegacyAnimMetadata = LegacyAnimMetadata(),
+)
+
+@Serializable
+data class LegacyAnimSymbol(
+    @SerialName("TIMELINE") val timeline: LegacyTimeline = LegacyTimeline(),
+)
+
+@Serializable
+data class LegacyAnimDictionary(
+    @SerialName("Symbols") val symbols: List<LegacySymbolDef> = emptyList(),
+)
+
+@Serializable
+data class LegacySymbolDef(
+    @SerialName("SYMBOL_name") val name: String = "",
+    @SerialName("TIMELINE") val timeline: LegacyTimeline = LegacyTimeline(),
+)
+
+@Serializable
+data class LegacyTimeline(
+    @SerialName("LAYERS") val layers: List<LegacyLayer> = emptyList(),
+) {
+    fun toTimeline(): AnimTimeline = AnimTimeline(
+        layers = layers.map { layer ->
+            AnimLayer(
+                name = layer.name,
+                frames = layer.frames.map { frame ->
+                    AnimFrame(
+                        start = frame.index,
+                        duration = frame.duration,
+                        events = frame.elements.mapNotNull { it.toEvent() },
+                    )
+                },
+            )
+        },
+    )
+}
+
+@Serializable
+data class LegacyLayer(
+    @SerialName("Layer_name") val name: String = "",
+    @SerialName("Frames") val frames: List<LegacyFrame> = emptyList(),
+)
+
+@Serializable
+data class LegacyFrame(
+    val index: Int = 0,
+    val duration: Int = 1,
+    val elements: List<LegacyElement> = emptyList(),
+)
+
+@Serializable
+data class LegacyElement(
+    @SerialName("SYMBOL_Instance") val symbol: LegacySymbolInstance? = null,
+    @SerialName("ATLAS_SPRITE_instance") val atlas: LegacyAtlasSprite? = null,
+) {
+    fun toEvent(): AnimEvent? {
+        atlas?.let { sprite ->
+            return AnimEvent(
+                atlas = AnimAtlasInstance(
+                    name = sprite.name,
+                    matrix = sprite.matrix?.toList(),
+                ),
+            )
+        }
+        symbol?.let { instance ->
+            return AnimEvent(
+                instance = AnimSymbolInstance(
+                    symbolName = instance.symbolName,
+                    firstFrame = instance.firstFrame,
+                    loop = instance.loop,
+                    matrix = instance.matrix?.toList(),
+                ),
+            )
+        }
+        return null
+    }
+}
+
+@Serializable
+data class LegacySymbolInstance(
+    @SerialName("SYMBOL_name") val symbolName: String = "",
+    @SerialName("firstFrame") val firstFrame: Int = 0,
+    val loop: String = "loop",
+    @SerialName("Matrix3D") val matrix: LegacyMatrix3D? = null,
+)
+
+@Serializable
+data class LegacyAtlasSprite(
+    val name: String = "",
+    @SerialName("Matrix3D") val matrix: LegacyMatrix3D? = null,
+)
+
+/** Only the 2D components matter here; the 3D rows are ignored. */
+@Serializable
+data class LegacyMatrix3D(
+    val m00: Double = 1.0,
+    val m01: Double = 0.0,
+    val m10: Double = 0.0,
+    val m11: Double = 1.0,
+    val m30: Double = 0.0,
+    val m31: Double = 0.0,
+) {
+    /** Flatten to the `MX` layout that [matOf] already understands. */
+    fun toList(): List<Double> = listOf(m00, m01, m10, m11, m30, m31)
+}
+
+@Serializable
+data class LegacyAnimMetadata(
+    @SerialName("framerate") val frameRate: Double = 24.0,
 )
 
 // ===========================================================================
@@ -263,14 +408,34 @@ class AnimateAtlas(
     /** The folder holding `Animation.json` and `spritemap1.png`. */
     val dir: String,
 ) {
+    private val animationJson: String =
+        KnfFiles.textOrNull("$dir/Animation.json") ?: "{}"
+
     private val anim: AnimRoot? = runCatching {
-        knfJson.decodeFromString<AnimRoot>(KnfFiles.textOrNull("$dir/Animation.json") ?: "{}")
-    }.getOrNull()
+        knfJson.decodeFromString<AnimRoot>(animationJson)
+    }.getOrNull()?.takeIf { it.animation.timeline.layers.isNotEmpty() }
+
+    /**
+     * Older Adobe Animate exports (A-Bot, for example) have no `AN` key.
+     * Decoding them with [AnimRoot] would silently produce an empty sheet, so
+     * keep a second, explicitly-shaped parse and prefer it when it has layers.
+     */
+    private val legacyAnim: LegacyAnimRoot? = runCatching {
+        knfJson.decodeFromString<LegacyAnimRoot>(animationJson)
+    }.getOrNull()?.takeIf { it.animation.timeline.layers.isNotEmpty() }
+
+    /** The main timeline, regardless of which export shape the sheet uses. */
+    private val rootTimeline: AnimTimeline? =
+        anim?.animation?.timeline ?: legacyAnim?.animation?.timeline?.toTimeline()
 
     val sprites: Map<String, SpriteDef> = loadSprites(dir)
 
     private val symbolByName: Map<String, AnimTimeline> =
         anim?.symbolDefs?.symbols.orEmpty().associate { it.name to it.timeline }
+            .ifEmpty {
+                legacyAnim?.dictionary?.symbols.orEmpty()
+                    .associate { it.name to it.timeline.toTimeline() }
+            }
 
     /** One pose per frame of the main timeline. */
     val poses: List<Pose> = loadPoses()
@@ -278,8 +443,20 @@ class AnimateAtlas(
     /** The union of every sprite in every pose - FNF's `Timeline._bounds`. */
     val bounds: Bounds = computeBounds()
 
-    /** `MD.FRT`, the sheet's frame rate. */
-    val frameRate: Double get() = anim?.metadata?.frameRate ?: 24.0
+    /**
+     * `AN.STI.SI.MX` вЂ” `FlxAnimate.library.matrix`. Only used when the prop's
+     * `atlasSettings.applyStageMatrix` is enabled; applying it positions an
+     * exported symbol exactly where it sat on the Animate stage.
+     */
+    val stageMatrix: Mat = anim?.animation?.stageInstance?.instance
+        ?.let { matOf(it.matrix, it.matrix3D) }
+        ?: Mat()
+
+    /** `MD.FRT` / `metadata.framerate`, the sheet's frame rate. */
+    val frameRate: Double
+        get() = anim?.metadata?.frameRate
+            ?: legacyAnim?.metadata?.frameRate
+            ?: 24.0
 
     /**
      * Every main-timeline frame carrying [prefix], expanded over each keyframe's
@@ -291,7 +468,7 @@ class AnimateAtlas(
      * of a label is stripped (`frame.name.rtrim()`).
      */
     fun labelFrames(prefix: String): List<Int> {
-        val timeline = anim?.animation?.timeline ?: return emptyList()
+        val timeline = rootTimeline ?: return emptyList()
         for (layer in timeline.layers) {
             val out = ArrayList<Int>()
             for (frame in layer.frames) {
@@ -373,7 +550,7 @@ class AnimateAtlas(
      * differently.
      */
     fun loadPoses(): List<Pose> {
-        val timeline = anim?.animation?.timeline ?: return emptyList()
+        val timeline = rootTimeline ?: return emptyList()
         val total = timeline.frameCount
         if (total <= 0) return emptyList()
 

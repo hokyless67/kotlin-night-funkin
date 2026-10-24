@@ -13,6 +13,7 @@ import nightfunkin.core.TextureAtlas
 import nightfunkin.core.setPixelArt
 import korlibs.math.geom.Anchor2D
 import korlibs.math.geom.degrees
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
@@ -46,7 +47,13 @@ data class StagePropData(
     val startingAnimation: String? = null,
     /** If non-zero, `danceLeft`/`danceRight` (or `idle`) replay every N beats. */
     val danceEvery: Double = 0.0,
+    /** Extra Animate atlas settings, e.g. `applyStageMatrix`. */
+    val atlasSettings: AtlasSettings = AtlasSettings(),
 )
+
+/** `atlasSettings` from a stage prop's JSON. */
+@Serializable
+data class AtlasSettings(val applyStageMatrix: Boolean = false)
 
 /** One of a prop's animations: a name and the frame-label prefix it plays. */
 @Serializable
@@ -166,6 +173,15 @@ class Stage(id: String) : Container() {
     /** Stage-scripted rotation origins, keyed by prop name. */
     private val propPivots = HashMap<String, Pair<Double, Double>>()
 
+    /**
+     * Rotation origins for ordinary props with an `angle`.
+     *
+     * Flixel rotates a sprite around `origin * scale` (its centre after
+     * `updateHitbox`), while KorGE rotates a container around its top-left.
+     * Static props need their own pivot because their image carries the scale.
+     */
+    private val staticPivots = HashMap<Container, Pair<Double, Double>>()
+
     // tankmanBattlefield.hx: the tank rolls in a large circle.
     private var tankAngle = 0.0
     private var tankSpeed = 0.0
@@ -180,7 +196,7 @@ class Stage(id: String) : Container() {
             loaded += img
             val scroll = prop.scroll.getOrElse(0) { 1.0 } to prop.scroll.getOrElse(1) { 1.0 }
             scrollFactors += scroll
-            val pivot = propPivots[prop.name]
+            val pivot = staticPivots[img] ?: propPivots[prop.name]
             val placed = PlacedProp(
                 container = img,
                 baseX = img.x,
@@ -237,17 +253,19 @@ class Stage(id: String) : Container() {
     /**
      * Advances every animated prop and applies Flixel's per-prop `scrollFactor`.
      *
-     * [viewLeft]/[viewTop] are the camera's top-left corner in stage space.
-     * Flixel draws a sprite at `(position - scroll * scrollFactor)`, so a prop
-     * with factor `s` needs to be shifted by `(1 - s) * scroll` inside our
-     * single shared camera transform.
+     * [scrollLeft]/[scrollTop] must be Flixel's `camera.scroll`, i.e. the
+     * top-left of the **unzoomed** view - not the visible world rectangle at
+     * the current zoom. Flixel draws a sprite at
+     * `(position - scroll * scrollFactor)`, so a prop with factor `s` needs to
+     * be shifted by `(1 - s) * scroll` inside our single shared camera
+     * transform.
      */
-    fun update(dt: Double, viewLeft: Double = 0.0, viewTop: Double = 0.0) {
+    fun update(dt: Double, scrollLeft: Double = 0.0, scrollTop: Double = 0.0) {
         for (prop in animatedProps) prop.update(dt)
         if (stageId == "tankmanBattlefield") moveTank(dt)
         for (prop in placedProps) {
-            val x = prop.baseX + (1.0 - prop.scrollX) * viewLeft
-            val y = prop.baseY + (1.0 - prop.scrollY) * viewTop
+            val x = prop.baseX + (1.0 - prop.scrollX) * scrollLeft
+            val y = prop.baseY + (1.0 - prop.scrollY) * scrollTop
             prop.container.rotation = prop.rotationDegrees.degrees
             if (!prop.hasPivot) {
                 prop.container.x = x
@@ -311,7 +329,14 @@ class Stage(id: String) : Container() {
         apply(img, prop, bmp.width.toDouble(), bmp.height.toDouble())
         // FNF: `propSprite.antialiasing = !dataProp.isPixel;`
         img.setPixelArt(prop.isPixel)
-        return Container().also { it.addChild(img) }
+        val container = Container().also { it.addChild(img) }
+        if (prop.angle != 0.0) {
+            val sx = prop.scale.getOrElse(0) { 1.0 }
+            val sy = prop.scale.getOrElse(1) { 1.0 }
+            staticPivots[container] =
+                abs(bmp.width * sx) / 2.0 to abs(bmp.height * sy) / 2.0
+        }
+        return container
     }
 
     /**
@@ -366,8 +391,14 @@ class Stage(id: String) : Container() {
         placeAnimatedContainer(container, prop)
 
         val box = atlas.bounds.takeUnless { it.empty } ?: atlas.boundsOf(0)
-        val originX = box.minX
-        val originY = box.minY
+        val applyStageMatrix = prop.atlasSettings.applyStageMatrix
+        // `FlxAnimate.prepareDrawMatrix`: with `applyStageMatrix` the timeline
+        // bounds translation is cancelled and `library.matrix` is applied, so
+        // the atlas is rendered in Animate-stage coordinates instead of being
+        // shifted to its own top-left. Without it, Flixel renders at
+        // `-bounds.min` (the old behaviour).
+        val originX = if (applyStageMatrix) 0.0 else box.minX
+        val originY = if (applyStageMatrix) 0.0 else box.minY
         val images = ArrayList<Image>()
         val placeholder = atlas.sprites.values.firstOrNull()?.slice
 
@@ -392,7 +423,11 @@ class Stage(id: String) : Container() {
                 }
                 img.visible = true
                 img.bitmap = def.slice
-                val m = part.matrix
+                val m = if (applyStageMatrix) {
+                    part.matrix.under(atlas.stageMatrix)
+                } else {
+                    part.matrix
+                }
                 val (cx, cy) = m.xform(def.width / 2.0, def.height / 2.0)
                 img.x = cx - originX - anim.offsetX
                 img.y = cy - originY - anim.offsetY
@@ -504,7 +539,9 @@ class Stage(id: String) : Container() {
         )
         val img = Image(bmp)
         apply(img, prop, w, h, extraScaleX = w, extraScaleY = h)
-        return Container().also { it.addChild(img) }
+        val container = Container().also { it.addChild(img) }
+        if (prop.angle != 0.0) staticPivots[container] = w / 2.0 to h / 2.0
+        return container
     }
 
     private fun apply(
@@ -523,7 +560,8 @@ class Stage(id: String) : Container() {
         img.x = prop.position.getOrElse(0) { 0.0 } + if (prop.flipX) width * sx else 0.0
         img.y = prop.position.getOrElse(1) { 0.0 } + if (prop.flipY) height * sy else 0.0
         img.alpha = prop.alpha
-        img.rotation = prop.angle.degrees
+        // Rotation is applied by [Stage.update] on the prop's container, so a
+        // static image must not rotate itself as well.
         img.visible = true
     }
 

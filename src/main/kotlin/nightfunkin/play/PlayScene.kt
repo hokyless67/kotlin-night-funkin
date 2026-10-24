@@ -26,11 +26,13 @@ import nightfunkin.data.SongEntry
 import nightfunkin.data.SongEventData
 import nightfunkin.data.SongRegistry
 import nightfunkin.timing.Conductor
+import nightfunkin.ui.SongSelectScene
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.random.Random
 
 /** What to play вЂ” stashed before switching scenes. */
 object PlayRequest {
@@ -66,6 +68,9 @@ class PlayScene : Scene() {
     private val opponentVocals = MusicPlayer()
     private val sfx = SfxPlayer()
 
+    /** FNF's `PauseSubState` plays `shared/music/breakfast` under the menu. */
+    private val pauseMusic = MusicPlayer()
+
     private lateinit var gameInput: KnfInput
     private lateinit var noteStyle: NoteStyle
 
@@ -89,6 +94,12 @@ class PlayScene : Scene() {
     private var startingSong = true
     private var songEnded = false
     private var paused = false
+
+    /** Non-null while the pause overlay is up. */
+    private var pauseMenu: PauseMenu? = null
+    private var pauseMusicFade = 0.0
+    private var pauseMusicGeneration = 0
+    private var scrollSound = ""
 
     /** FNF's `isSongEnd`: the results transition is running. */
     private var ending = false
@@ -119,6 +130,26 @@ class PlayScene : Scene() {
     private var girlfriend: Character? = null
     private lateinit var player: Character
     private var stageProps: Stage? = null
+
+    /** Nene/Otis' A-Bot speaker rigs, kept in sync with their character. */
+    private val speakerSupports = ArrayList<SpeakerSupport>()
+
+    /**
+     * Characters that use a stage-specific `scroll` factor.
+     *
+     * Flixel applies scroll factors in `getScreenPosition`, but a character's
+     * `x`/`y` stay in world space (the stage scripts and camera focus depend on
+     * that). KNF therefore keeps the character in a wrapper whose only job is
+     * the parallax shift: `(1 - scroll) * camera.scroll`.
+     */
+    private class CharacterLayer(
+        val character: Character,
+        val container: Container,
+        val scrollX: Double,
+        val scrollY: Double,
+    )
+
+    private val characterLayers = ArrayList<CharacterLayer>()
 
     /**
      * FNF's desktop default is upscroll (`Preferences.downscroll == false`),
@@ -238,10 +269,27 @@ class PlayScene : Scene() {
             girlfriend?.let { Triple("gf", it, stageFile.characterFor("gf")?.zIndex ?: 0) },
             Triple("bf", player, stageFile.characterFor("bf")?.zIndex ?: 0),
         ).sortedBy { it.third }
-        for ((_, character, zIndex) in byZIndex) {
+        for ((slot, character, zIndex) in byZIndex) {
             character.dance(forceRestart = true)
+            val support = SpeakerSupport.forCharacter(character, music)
             val stage = stageProps
-            if (stage != null) stage.addCharacter(character, zIndex) else stageLayer.addChild(character)
+            val scroll = stageFile.characterFor(slot)?.scroll.orEmpty()
+            val layer = Container().also { it.addChild(character) }
+            characterLayers += CharacterLayer(
+                character = character,
+                container = layer,
+                scrollX = scroll.getOrElse(0) { 1.0 },
+                scrollY = scroll.getOrElse(1) { 1.0 },
+            )
+            if (stage != null) {
+                // A-Bot sits ten zIndexes under its character, like the scripts.
+                support?.let { stage.addCharacter(it, zIndex - 10) }
+                stage.addCharacter(layer, zIndex)
+            } else {
+                support?.let { stageLayer.addChild(it) }
+                stageLayer.addChild(layer)
+            }
+            support?.let { speakerSupports += it }
         }
 
         // Some shipped characters are placeholders that resolve to nothing
@@ -253,6 +301,7 @@ class PlayScene : Scene() {
                 println("KNF: character '" + ch.id + "' for slot " + slot + " has no art")
             }
         }
+        for (support in speakerSupports) support.update(0.0)
 
         // FNF opens the camera on the opponent's focus point, at the stage zoom.
         val (focusX, focusY) = opponent.cameraFocusPoint(opponentSlot.cameraOffsets)
@@ -326,6 +375,8 @@ class PlayScene : Scene() {
         sfx.preload(resolveSfx("shared/sounds/gameplay/countdown/funkin/introGO"))
         missSound = resolveSfx("shared/sounds/missnote1")
         sfx.preload(missSound)
+        scrollSound = resolveSfx("preload/sounds/scrollMenu")
+        sfx.preload(scrollSound)
 
         // Attached only now: `Conductor.update` dispatches step hits immediately,
         // and `onBeat()` needs the characters to already exist.
@@ -390,6 +441,7 @@ class PlayScene : Scene() {
         music.stop()
         vocals.stop()
         opponentVocals.stop()
+        pauseMusic.dispose()
         sfx.stopAll()
         playerStrumline.destroy()
         opponentStrumline.destroy()
@@ -479,6 +531,12 @@ class PlayScene : Scene() {
         opponentStrumline.setNoteData(chart.notes.filter { !it.isPlayerNote })
         hud.resetHealth()
         hud.setScore(0)
+        // `SongEventData.activated` is runtime state, but the chart (and its
+        // event objects) is cached by SongEntry across scene changes. Without
+        // clearing it, every event stays suppressed after a restart/replay and
+        // the camera keeps staring at the opponent for the whole song.
+        chart.events.forEach { it.activated = false }
+        nextEventIndex = 0
         conductor.update(prePosition, false)
     }
 
@@ -489,6 +547,27 @@ class PlayScene : Scene() {
     private fun tick(dt: Double) {
         wallClock += dt * 1000.0
         gameInput.update()
+
+        // While the substate is open, only it is updated: PlayState freezes
+        // gameplay, the stage and the conductor until it closes.
+        val menu = pauseMenu
+        if (menu != null) {
+            menu.update(dt, gameInput)
+            if (pauseMenu != null) {
+                pauseMusicFade += dt
+                pauseMusic.volume = PAUSE_MUSIC_VOLUME *
+                    (pauseMusicFade / PAUSE_MUSIC_FADE_SECONDS).coerceIn(0.0, 1.0)
+            }
+            return
+        }
+
+        // `PlayState.pause`: no pausing during the countdown, after the song
+        // ended, or while the results transition runs.
+        if (!startingSong && !songEnded && !ending && gameInput.pause) {
+            openPause()
+            return
+        }
+
         handleOffsetKeys()
 
         if (paused) return
@@ -502,6 +581,7 @@ class PlayScene : Scene() {
         opponent.update(dt)
         girlfriend?.update(dt)
         player.update(dt)
+        for (support in speakerSupports) support.update(dt)
 
         if (!ending) {
             updateClock(dt)
@@ -518,16 +598,16 @@ class PlayScene : Scene() {
         }
 
         camera.update(dt)
+        for (layer in characterLayers) {
+            layer.container.x = (1.0 - layer.scrollX) * camera.scrollX
+            layer.container.y = (1.0 - layer.scrollY) * camera.scrollY
+        }
         hud.popUps.beatLengthMs = conductor.beatLengthMs.toDouble()
         hud.update(dt)
         playerStrumline.update(conductor, startTimestampMs.toFloat(), dt)
         opponentStrumline.update(conductor, startTimestampMs.toFloat(), dt)
 
-        stageProps?.update(
-            dt,
-            camera.screenToContentX(0.0),
-            camera.screenToContentY(0.0),
-        )
+        stageProps?.update(dt, camera.scrollX, camera.scrollY)
 
         if (avsyncDebug && !startingSong) measureAvSync()
         if (System.getenv("KNF_DEBUG_CHAR") == "1" && debugFrames == 300) dumpCharacters()
@@ -569,6 +649,94 @@ class PlayScene : Scene() {
         if (!changed) return
         val ms = conductor.globalOffset
         Save.globalOffsetMs = ms
+    }
+
+    // ======================================================================
+    // pause menu
+    // ======================================================================
+
+    /**
+     * `PlayState.pause()` -> `PauseSubState`. The overlay lives on top of the
+     * gameplay scene so the stage keeps its last frame visible behind it.
+     */
+    private fun openPause() {
+        if (pauseMenu != null) return
+        paused = true
+
+        val menu = PauseMenu(
+            songName = chart.songName,
+            artistName = chart.artist,
+            difficulty = chart.difficulty,
+            difficulties = song.difficultiesFor(chart.variation),
+            offsetMs = conductor.globalOffset,
+            onScroll = { sfx.play(scrollSound, 0.4) },
+            onResume = { closePause() },
+            onRestartSong = { restartSong() },
+            onChangeDifficulty = { difficulty -> restartSong(difficulty) },
+            onExitToMenu = { exitToSongSelect() },
+        )
+        pauseMenu = menu
+        sceneRoot.addChild(menu)
+
+        // `openSubState`: the instrumental and both vocal stems stop where they
+        // are; `closeSubState` resumes them from the same position.
+        music.pause()
+        vocals.pause()
+        opponentVocals.pause()
+
+        pauseMusic.loop = true
+        pauseMusicGeneration++
+        val generation = pauseMusicGeneration
+        launch {
+            if (!pauseMusic.load(resolvePauseMusic())) return@launch
+            if (generation != pauseMusicGeneration) return@launch
+            pauseMusicFade = 0.0
+            pauseMusic.volume = 0.0
+            // `startPauseMusic`: start somewhere in the first half.
+            val half = (pauseMusic.totalMs / 2.0).toInt().coerceAtLeast(0)
+            pauseMusic.play(Random.nextInt(0, half + 1).toDouble())
+        }
+    }
+
+    /** `PauseSubState.resume`: close the overlay and unpause the song. */
+    private fun closePause() {
+        if (pauseMenu == null) return
+        pauseMusicGeneration++
+        pauseMenu?.removeFromParent()
+        pauseMenu = null
+        paused = false
+        pauseMusic.stop()
+        // Restart all three stems from the instrumental's paused sample. Their
+        // own positions can differ by a whole WaveOut buffer (~90 ms), and the
+        // JVM backend's per-channel pause leaves those queues frozen, so
+        // resuming each track where it happened to stop makes the vocals drift
+        // from the instrumental after every pause.
+        val resumeAt = music.pausedAtMs
+        music.play(resumeAt)
+        vocals.play(resumeAt)
+        opponentVocals.play(resumeAt)
+    }
+
+    /** `PauseSubState.restartPlayState`: rebuild the scene from `PlayRequest`. */
+    private fun restartSong(difficulty: String? = null) {
+        pauseMenu?.removeFromParent()
+        pauseMenu = null
+        // Keep the scene frozen until the replacement is ready.
+        paused = true
+        pauseMusicGeneration++
+        pauseMusic.stop()
+        if (difficulty != null) PlayRequest.difficulty = difficulty
+        launch { sceneContainer.changeTo<PlayScene>() }
+    }
+
+    /** `PauseSubState.quitToMenu`: back to the song list, as the results screen does. */
+    private fun exitToSongSelect() {
+        pauseMenu?.removeFromParent()
+        pauseMenu = null
+        paused = true
+        pauseMusicGeneration++
+        pauseMusic.stop()
+        launch { sceneContainer.changeTo<SongSelectScene>() }
     }
 
     /**
@@ -822,6 +990,7 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         player.dance()
         opponent.dance()
         girlfriend?.dance()
+        for (support in speakerSupports) support.onBeat()
     }
 
     private fun goodNoteHit(note: NoteSprite) {
@@ -1167,6 +1336,47 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
     private companion object {
         /** FNF's `camTransition.fade(..., 0.6, ...)` and HUD fade. */
         const val ENDING_FADE_SECONDS = 0.6
+
+        /** `PauseSubState.MUSIC_FINAL_VOLUME` / `MUSIC_FADE_IN_TIME`. */
+        const val PAUSE_MUSIC_VOLUME = 0.75
+        const val PAUSE_MUSIC_FADE_SECONDS = 5.0
+    }
+
+    /**
+     * `PauseSubState.startPauseMusic` plays
+     * `breakfast$musicSuffix/breakfast$musicSuffix`. The suffix is assigned by
+     * character scripts when they are created (`bf-pixel.hxc` -> `-pixel`,
+     * Pico's scripts -> `-pico`); FNF constructs GF, dad, then BF, so the last
+     * matching character wins.
+     */
+    private fun pauseMusicSuffix(): String {
+        var suffix = ""
+        val chars = chart.characters
+        for (id in listOf(chars.girlfriend, chars.opponent, chars.player)) {
+            when (id) {
+                "bf-pixel", "pico-pixel" -> suffix = "-pixel"
+                "pico-playable", "pico-blazin", "pico-holding-nene" -> suffix = "-pico"
+            }
+        }
+        return suffix
+    }
+
+    /**
+     * `Paths.music`: the current stage library wins, then `shared`, then
+     * `preload`. `LoadingState` sets that library from the stage's `directory`,
+     * which is why Week 6 resolves `week6/music/breakfast-pixel`.
+     */
+    private fun resolvePauseMusic(): String {
+        val suffix = pauseMusicSuffix()
+        val stem = "breakfast$suffix/breakfast$suffix"
+        val candidates = buildList {
+            if (stageFile.directory.isNotEmpty()) add("${stageFile.directory}/music/$stem")
+            add("shared/music/$stem")
+            add("preload/music/$stem")
+            add("music/$stem")
+        }
+        for (candidate in candidates) KnfFiles.resolveSound(candidate)?.let { return it }
+        return "shared/music/$stem.mp3"
     }
 
     /** Picks the playable audio file for an extension-less stem. */

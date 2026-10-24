@@ -43,6 +43,16 @@ class GameplayCamera(
     var stageZoom: Double = 1.0
     var targetZoom: Double = 1.0
 
+    /**
+     * Flixel's `camera.scroll`: the top-left of the **unzoomed** view.
+     *
+     * This is not the same as [screenToContentX]`(0)`. At zoom `z` the visible
+     * world starts `width/2 * (1 - 1/z)` inside `scroll`, and scroll factors
+     * must use `scroll` itself.
+     */
+    val scrollX: Double get() = focusX - viewportWidth / 2.0
+    val scrollY: Double get() = focusY - viewportHeight / 2.0
+
     /** Multiplier applied on top of [zoom] while the beat "bop" is active. */
     private var bopMultiplier: Double = 1.0
     private var bopIntensity: Double = Constants.DEFAULT_BOP_INTENSITY.toDouble()

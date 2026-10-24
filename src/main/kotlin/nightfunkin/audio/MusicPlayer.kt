@@ -3,6 +3,7 @@ package nightfunkin.audio
 import korlibs.audio.sound.AudioChannel
 import korlibs.audio.sound.PlaybackTimes
 import korlibs.audio.sound.Sound
+import korlibs.audio.sound.SoundChannel
 import korlibs.audio.sound.readSound
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -20,18 +21,29 @@ fun Duration.toMsDouble(): Double = toDouble(DurationUnit.MILLISECONDS)
 /**
  * One playing music track.
  *
- * KorGE 6's `AudioChannel` reports playback position as a `Duration` with
- * sub-millisecond precision, which is exactly what the Conductor needs. Pause
- * is implemented as "remember position, stop the channel" so it works on every
- * backend, and seeking always restarts the channel at the new offset.
+ * KorGE 6's `SoundChannel` reports playback position as a `Duration` with
+ * sub-millisecond precision, which is exactly what the Conductor needs.
+ *
+ * Pause is "remember the position, drop the channel" rather than the audio
+ * backend's `pause()`. On the JVM WaveOut backend every channel owns a separate
+ * native device, whose queue keeps playing for ~100 ms after `pause()` and
+ * whose resume timing differs per stem. That made every pause leave the
+ * instrumental and both vocal tracks permanently offset from each other. The
+ * caller resumes every stem from one shared position instead (see
+ * `PlayScene.closePause`), which rebuilds all queues from the same sample.
+ *
+ * Seeks use the channel's `current` setter. `SoundAudioData` ignores
+ * `PlaybackParameters.startTime` (KorGE 6.0.0), so [play] applies the offset
+ * explicitly once the channel exists.
  */
 class MusicPlayer {
 
     private var sound: Sound? = null
-    private var channel: AudioChannel? = null
+    private var channel: SoundChannel? = null
     private var stoppedAtMs: Double = 0.0
     private var storedLengthMs: Double = 0.0
     private var paused = false
+    private var analyzer: SpectrumAnalyzer? = null
 
     /**
      * KorGE's `SoundAudioData` registers its `onCancel` stop hook on the
@@ -72,7 +84,7 @@ class MusicPlayer {
     val positionMs: Double
         get() = channel?.current?.toMsDouble() ?: stoppedAtMs
 
-    val playing: Boolean get() = channel?.playing == true
+    val playing: Boolean get() = channel?.state?.playing == true
 
     /** Loads [path] (an asset key relative to the FNF asset root). */
     suspend fun load(path: String, volume: Double = 1.0): Boolean {
@@ -89,17 +101,20 @@ class MusicPlayer {
             // Sound.length is zero for KorGE's non-streaming SoundAudioData, but
             // its decoded AudioData still knows the real duration. Freeplay
             // needs this before playback starts to compute the preview window.
-            val lengthMs = runCatching { loadedSound.decode().totalTime.toMsDouble() }.getOrDefault(0.0)
-            loadedSound to lengthMs
+            // The same samples also feed A-Bot's spectrum display.
+            val audio = runCatching { loadedSound.decode() }.getOrNull()
+            val lengthMs = audio?.totalTime?.toMsDouble() ?: 0.0
+            Triple(loadedSound, lengthMs, audio)
         }
         if (loaded == null) {
             println("KNF: audio missing: $path")
             return false
         }
 
-        val (s, lengthMs) = loaded
+        val (s, lengthMs, audio) = loaded
         s.volume = volume
         sound = s
+        analyzer = audio?.let { runCatching { SpectrumAnalyzer(it) }.getOrNull() }
         this.volume = volume
         loadedPath = path
         stoppedAtMs = 0.0
@@ -107,24 +122,39 @@ class MusicPlayer {
         return true
     }
 
+    /**
+     * Current seven-band levels for the A-Bot visualizer, or null when no
+     * music is playing. The analyzer reads the decoded instrumental directly,
+     * so it stays in sync with `SoundChannel.current` through seeks.
+     */
+    fun visualizerLevels(): FloatArray? {
+        val ch = channel ?: return null
+        if (ch.state?.playing != true || volume <= 0.0) return null
+        return analyzer?.levels(ch.current.toMsDouble())
+    }
+
     fun play(startMs: Double = 0.0) {
         val s = sound ?: return
         channel?.stop()
         stoppedAtMs = startMs
         paused = false
-        val ac = AudioChannel()
-        ac.volume = volume
-        ac.pitch = pitch
-        val offset: Duration = startMs.milliseconds
         val times = if (loop) PlaybackTimes.INFINITE else PlaybackTimes.ONE
-        ac.play(s, times, offset, playbackContext)
-        channel = ac
+        val ch = s.play(playbackContext, times, startMs.milliseconds)
+        ch.volume = volume
+        ch.pitch = pitch
+        // `SoundAudioData` ignores the start time passed to `play`, so apply
+        // the offset on the channel directly.
+        if (startMs > 0.0) ch.current = startMs.milliseconds
+        channel = ch
     }
 
+    /** Position stored by the last [pause], for resuming every stem in sync. */
+    val pausedAtMs: Double get() = stoppedAtMs
+
     fun pause() {
-        if (channel == null) return
-        stoppedAtMs = positionMs
-        channel?.stop()
+        val ch = channel ?: return
+        stoppedAtMs = ch.current.toMsDouble()
+        ch.stop()
         channel = null
         paused = true
     }
@@ -150,6 +180,7 @@ class MusicPlayer {
         stop()
         playbackContext.cancel()
         sound = null
+        analyzer = null
         loadedPath = null
         storedLengthMs = 0.0
     }

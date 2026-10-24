@@ -30,6 +30,14 @@ class KnfInput(private val inputKeys: InputKeys) {
 
     val accept: Boolean get() = anyJustPressed(Key.Z, Key.ENTER, Key.SPACE)
     val back: Boolean get() = anyJustPressed(Key.X, Key.ESCAPE, Key.BACKSPACE)
+
+    /** FNF's PAUSE action: [P, ENTER, ESCAPE]. */
+    val pause: Boolean get() = anyJustPressed(Key.P, Key.ENTER, Key.ESCAPE)
+
+    /** FNF's UI_UP / UI_DOWN actions. */
+    val uiUp: Boolean get() = anyJustPressed(Key.W, Key.UP)
+    val uiDown: Boolean get() = anyJustPressed(Key.S, Key.DOWN)
+
     val restart: Boolean get() = inputKeys.justPressed(Key.R)
 
     /** Freeplay song-variation cycling. */

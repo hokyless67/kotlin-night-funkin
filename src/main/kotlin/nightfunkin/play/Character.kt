@@ -212,6 +212,39 @@ class Character(val id: String) : Container() {
     val localWidth: Double get() = bounds.width
     val localHeight: Double get() = bounds.height
 
+    /**
+     * Bounds of the pose FNF measures when it resets a character.
+     *
+     * `Stage.addCharacter` calls `resetCharacter(true)`, which plays `dance(true)`
+     * and then `updateHitbox()`. For animate-atlas characters that hitbox comes
+     * from the first idle pose, not from the union of every pose in the sheet.
+     * KNF keeps [bounds] as that union so a character's drawing origin stays
+     * stable, which makes the two values differ by a few pixels.
+     */
+    private val restPoseBounds: Bounds? by lazy {
+        val atlas = animateAtlas ?: return@lazy null
+        val playback = if (anims.containsKey("danceLeft") && anims.containsKey("danceRight")) {
+            anims["danceLeft"]
+        } else {
+            anims["idle"]
+        }
+        val index = playback?.frames?.firstOrNull() ?: return@lazy null
+        atlas.boundsOf(index).takeUnless { it.empty }
+    }
+
+    val restPoseHeight: Double get() = restPoseBounds?.height ?: localHeight
+
+    /**
+     * How far the all-pose box is from the idle box that FNF anchors on stage.
+     *
+     * The speaker scripts position A-Bot from `this.x`/`this.y`, which FNF has
+     * already aligned to the idle pose. Vertically, applying the same delta to
+     * the support keeps it under the character after KNF's stable-origin
+     * conversion. Horizontally both engines anchor the full timeline box, so no
+     * X delta is needed.
+     */
+    val stageInsetY: Double get() = (localHeight - restPoseHeight).coerceAtLeast(0.0)
+
     val displayName: String get() = data.name.ifEmpty { id }
 
     /** FNF's `_data.isPixel`; pixel sheets render with nearest-neighbour sampling. */

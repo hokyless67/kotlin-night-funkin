@@ -117,7 +117,7 @@ class FunkinAtlasText(
 
         private val boldAtlas by lazy { TextureAtlas.load("preload/images/fonts/bold.xml") }
 
-        /** `bold.xml`, the font used by TitleState's credits. */
+        /** `bold.xml`, the font used by TitleState's credits and the pause menu. */
         fun bold(initialText: String = ""): FunkinAtlasText =
             FunkinAtlasText(boldAtlas, initialText)
 
