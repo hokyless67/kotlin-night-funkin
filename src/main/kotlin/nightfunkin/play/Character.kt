@@ -677,13 +677,20 @@ class Character(val id: String) : Container() {
      * ```
      *
      * where `width`/`height` are the timeline bounds times the scale.
+     *
+     * [applyOffsets] is false for the one scripted exception: GF's `onAdd`
+     * repositions herself at the stage's `gf` point when she is the opponent,
+     * and does so from `stagePos - characterOrigin` without adding her data
+     * offsets (see `assets/preload/scripts/characters/gf.hxc`).
      */
-    fun placeFeet(feetX: Double, feetY: Double, scale: Double) {
+    fun placeFeet(feetX: Double, feetY: Double, scale: Double, applyOffsets: Boolean = true) {
         val s = scale
         this.scaleX = s
         this.scaleY = s
-        val x = feetX - localWidth * s / 2.0 + data.offsets.getOrElse(0) { 0.0 }
-        val y = feetY - localHeight * s + data.offsets.getOrElse(1) { 0.0 }
+        val offsetX = if (applyOffsets) data.offsets.getOrElse(0) { 0.0 } else 0.0
+        val offsetY = if (applyOffsets) data.offsets.getOrElse(1) { 0.0 } else 0.0
+        val x = feetX - localWidth * s / 2.0 + offsetX
+        val y = feetY - localHeight * s + offsetY
         // A mirrored sheet is drawn around its own right edge, so the origin
         // moves to `x + width` and `scaleX` goes negative - same shape as
         // Flixel's `matrix.scale(-1, 1); matrix.translate(bounds.width, 0)`.
@@ -713,16 +720,12 @@ class Character(val id: String) : Container() {
         // has to follow the sign - otherwise the focus lands a whole width to
         // the wrong side and the camera flies off after a FocusCamera event.
         //
-        // `_data.offsets` are *position* offsets and are deliberately not part
-        // of the focus: FNF computes it from `originalPosition + width/2`, which
-        // is the stage-space feet point before `setScale` adds those offsets.
-        // The current x already contains them, so remove them here. Otherwise
-        // every character's camera sits a few pixels low/right (dad by 13,3).
-        val positionOffsetX = data.offsets.getOrElse(0) { 0.0 }
-        val positionOffsetY = data.offsets.getOrElse(1) { 0.0 }
-        val cx = x + localWidth * scaleX / 2.0 - positionOffsetX +
+        // `Stage.addCharacter` stores `originalPosition` *after* `setScale`,
+        // so the per-character `_data.offsets` are already part of that point
+        // and are part of the focus too.
+        val cx = x + localWidth * scaleX / 2.0 +
             data.cameraOffsets.getOrElse(0) { 0.0 }
-        val cy = y + localHeight * scaleY / 2.0 - positionOffsetY +
+        val cy = y + localHeight * scaleY / 2.0 +
             data.cameraOffsets.getOrElse(1) { 0.0 }
         return (cx + stageCameraOffsets.getOrElse(0) { 0.0 }) to
             (cy + stageCameraOffsets.getOrElse(1) { 0.0 })

@@ -170,6 +170,10 @@ class Stage(id: String) : Container() {
     private val placedProps = ArrayList<PlacedProp>()
     private val placedByName = HashMap<String, PlacedProp>()
 
+    /** Last Flixel camera scroll, so scripted position changes apply immediately. */
+    private var lastScrollX = 0.0
+    private var lastScrollY = 0.0
+
     /** Stage-scripted rotation origins, keyed by prop name. */
     private val propPivots = HashMap<String, Pair<Double, Double>>()
 
@@ -250,6 +254,15 @@ class Stage(id: String) : Container() {
         childZIndices.add(index, zIndex)
     }
 
+    /** FNF's `getNamedProp(name).setPosition(x, y)` for stage-script overrides. */
+    fun setNamedPropPosition(name: String, x: Double, y: Double) {
+        val prop = placedByName[name] ?: return
+        prop.baseX = x
+        prop.baseY = y
+        prop.container.x = x + (1.0 - prop.scrollX) * lastScrollX
+        prop.container.y = y + (1.0 - prop.scrollY) * lastScrollY
+    }
+
     /**
      * Advances every animated prop and applies Flixel's per-prop `scrollFactor`.
      *
@@ -261,6 +274,8 @@ class Stage(id: String) : Container() {
      * transform.
      */
     fun update(dt: Double, scrollLeft: Double = 0.0, scrollTop: Double = 0.0) {
+        lastScrollX = scrollLeft
+        lastScrollY = scrollTop
         for (prop in animatedProps) prop.update(dt)
         if (stageId == "tankmanBattlefield") moveTank(dt)
         for (prop in placedProps) {

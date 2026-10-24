@@ -183,12 +183,23 @@ class PlayScene : Scene() {
      */
     private fun placeCharacter(character: Character, slot: String): StageCharacterData {
         val data = stageFile.characterFor(slot)
-        val feetX = data?.position?.getOrElse(0) { 0.0 } ?: 0.0
-        val feetY = data?.position?.getOrElse(1) { 0.0 } ?: 0.0
+        var feetX = data?.position?.getOrElse(0) { 0.0 } ?: 0.0
+        var feetY = data?.position?.getOrElse(1) { 0.0 } ?: 0.0
+        var applyOffsets = true
+        // Scripted `gf` characters override `onAdd`: when Girlfriend is the
+        // opponent, `gf.hxc` moves her to the stage's girlfriend point while
+        // keeping the dad slot's zIndex, scale and camera offsets.
+        if (slot == "dad" && character.id == "gf") {
+            stageFile.characterFor("gf")?.position?.let {
+                feetX = it.getOrElse(0) { 0.0 }
+                feetY = it.getOrElse(1) { 0.0 }
+                applyOffsets = false
+            }
+        }
         val scale = character.baseScale * (data?.scale ?: 1.0)
         // `Stage.addCharacter` inverts the file's `flipX` for the player slot only.
         character.flip = Character.flipForSlot(slot, character.dataFlipX)
-        character.placeFeet(feetX, feetY, scale)
+        character.placeFeet(feetX, feetY, scale, applyOffsets)
         character.alpha = data?.alpha ?: 1.0
         character.rotation = (data?.angle ?: 0.0).degrees
         return data ?: StageCharacterData()
@@ -260,6 +271,12 @@ class PlayScene : Scene() {
         val opponentSlot = placeCharacter(opponent, "dad")
         girlfriend?.let { placeCharacter(it, "gf") }
         placeCharacter(player, "bf")
+
+        // tankmanBattlefieldErect.hxc moves the bricks when the girlfriend is
+        // added. All of its charts have one, so this runs at stage start.
+        if (girlfriend != null && stageFile.id == "tankmanBattlefieldErect") {
+            stageProps?.setNamedPropPosition("tankBricks", 445.0, 774.0)
+        }
 
         // `Stage.refresh()` sorts every prop *and* character by zIndex ascending;
         // tankmanBattlefield relies on foreground props (audience, bricks) having
