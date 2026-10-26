@@ -53,8 +53,15 @@ suspend fun main() = Korge(
         System.getenv("KNF_DIFFICULTY")?.takeIf { it.isNotBlank() }?.let { PlayRequest.difficulty = it }
         System.getenv("KNF_VARIATION")?.takeIf { it.isNotBlank() }?.let { PlayRequest.variation = it }
         PlayRequest.autoplay = System.getenv("KNF_AUTOPLAY") == "1"
+        // Direct song boots behave like Story Mode by default, which makes the
+        // story-gated video cutscenes reachable without a campaign port.
+        // `KNF_STORY=0` opts back into Freeplay behaviour.
+        PlayRequest.storyMode = System.getenv("KNF_STORY")?.let { it == "1" } ?: true
         LoadingSceneTarget.toSong = true
-        println("KNF: requested boot song '$songId' (autoplay=${PlayRequest.autoplay})")
+        println(
+            "KNF: requested boot song '$songId' " +
+                "(autoplay=${PlayRequest.autoplay}, story=${PlayRequest.storyMode})"
+        )
     }
 
     scenes.changeTo<LoadingScene>()

@@ -285,6 +285,9 @@ class SongSelectScene : Scene() {
         PlayRequest.songId = song.id
         PlayRequest.difficulty = diffs[difficultyIndex]
         PlayRequest.variation = vars[variationIndex]
+        // Freeplay normally skips the story-mode videos. `KNF_STORY=1` is a
+        // test hook that lets those sequences run from the normal song list.
+        PlayRequest.storyMode = System.getenv("KNF_STORY") == "1"
         stopPreview()
         sceneContainer.changeTo<PlayScene>()
     }

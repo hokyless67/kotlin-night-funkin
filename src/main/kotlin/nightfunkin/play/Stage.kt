@@ -3,6 +3,7 @@ package nightfunkin.play
 import korlibs.image.bitmap.Bitmap
 import korlibs.korge.view.Container
 import korlibs.korge.view.Image
+import korlibs.korge.view.View
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -261,6 +262,29 @@ class Stage(id: String) : Container() {
         prop.baseY = y
         prop.container.x = x + (1.0 - prop.scrollX) * lastScrollX
         prop.container.y = y + (1.0 - prop.scrollY) * lastScrollY
+    }
+
+    /**
+     * Adds a stage-script sprite at Flixel's global `zIndex`, exactly like
+     * `Stage.add()` + `refresh()`. Cutscene-only children are not part of the
+     * stage JSON, so they need this separate insertion path.
+     */
+    fun addCutsceneView(view: View, zIndex: Int) {
+        var index = 0
+        while (index < childZIndices.size && childZIndices[index] <= zIndex) index++
+        addChildAt(view, index)
+        childZIndices.add(index, zIndex)
+    }
+
+    /** Removes a child added by [addCutsceneView], keeping z-order bookkeeping valid. */
+    fun removeCutsceneView(view: View) {
+        for (index in 0 until numChildren) {
+            if (getChildAt(index) !== view) continue
+            childZIndices.removeAt(index)
+            removeChildAt(index)
+            return
+        }
+        view.removeFromParent()
     }
 
     /**

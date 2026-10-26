@@ -250,6 +250,15 @@ class Character(val id: String) : Container() {
     /** FNF's `_data.isPixel`; pixel sheets render with nearest-neighbour sampling. */
     val isPixel: Boolean get() = data.isPixel
 
+    /** FNF's `FlxAnimation.finished`; used by the `2hot` ending choreography. */
+    val animationFinished: Boolean get() = animFinished
+
+    /**
+     * FNF's `danceEvery = 0`: the character stops re-posing on beats. The
+     * `2hot` ending uses this for BF and Dad while their special animations run.
+     */
+    var dancesOnBeat: Boolean = true
+
     /**
      * Which face to put on the health bar.
      *

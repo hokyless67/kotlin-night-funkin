@@ -82,6 +82,9 @@ class SparrowSprite(
     /** Number of frames in the current animation. */
     val frameCount: Int get() = frames.size
 
+    /** Logical width of the current animation's first frame. */
+    val logicalWidth: Int get() = frames.firstOrNull()?.logicalWidth ?: 0
+
     /** True once a non-looping animation has reached its last frame. */
     val finished: Boolean get() = !playing && frameIndex >= frames.size - 1
 

@@ -9,6 +9,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.withContext
 import nightfunkin.core.KnfFiles
+import java.io.File
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.DurationUnit
@@ -89,6 +90,32 @@ class MusicPlayer {
     /** Loads [path] (an asset key relative to the FNF asset root). */
     suspend fun load(path: String, volume: Double = 1.0): Boolean {
         if (loadedPath == path && sound != null) return true
+        return loadInternal(path, path, volume, analyze = true) { KnfFiles.bytesOrNull(path) }
+    }
+
+    /**
+     * Loads an audio file from the real filesystem.
+     *
+     * Video cutscenes use this for the WAV that ffmpeg extracts from the movie
+     * container. The extracted file is temporary and is deleted immediately
+     * after [loadFile] returns, because KorGE decodes the whole sound into
+     * memory here.
+     */
+    suspend fun loadFile(file: File, volume: Double = 1.0, analyze: Boolean = false): Boolean {
+        val key = "file:" + file.absolutePath
+        if (loadedPath == key && sound != null) return true
+        return loadInternal(key, key, volume, analyze) {
+            if (file.isFile) file.readBytes() else null
+        }
+    }
+
+    private suspend fun loadInternal(
+        key: String,
+        missingName: String,
+        volume: Double,
+        analyze: Boolean,
+        readBytes: () -> ByteArray?,
+    ): Boolean {
         stop()
 
         // Reading and decoding a full instrumental is CPU/file-bound and can
@@ -96,18 +123,18 @@ class MusicPlayer {
         // drains scene callbacks per frame, so doing this there stalls the game
         // and logs "Too many callbacks to handle in this frame".
         val loaded = withContext(Dispatchers.Default) {
-            val bytes = KnfFiles.bytesOrNull(path) ?: return@withContext null
+            val bytes = readBytes() ?: return@withContext null
             val loadedSound = bytes.readSound()
             // Sound.length is zero for KorGE's non-streaming SoundAudioData, but
             // its decoded AudioData still knows the real duration. Freeplay
             // needs this before playback starts to compute the preview window.
             // The same samples also feed A-Bot's spectrum display.
-            val audio = runCatching { loadedSound.decode() }.getOrNull()
+            val audio = if (analyze) runCatching { loadedSound.decode() }.getOrNull() else null
             val lengthMs = audio?.totalTime?.toMsDouble() ?: 0.0
             Triple(loadedSound, lengthMs, audio)
         }
         if (loaded == null) {
-            println("KNF: audio missing: $path")
+            println("KNF: audio missing: $missingName")
             return false
         }
 
@@ -116,7 +143,7 @@ class MusicPlayer {
         sound = s
         analyzer = audio?.let { runCatching { SpectrumAnalyzer(it) }.getOrNull() }
         this.volume = volume
-        loadedPath = path
+        loadedPath = key
         stoppedAtMs = 0.0
         storedLengthMs = lengthMs
         return true
@@ -207,17 +234,23 @@ class SfxPlayer(private val maxVoices: Int = 12) {
         return s
     }
 
-    fun play(path: String, volume: Double = this.volume, pitch: Double = 1.0) {
-        val s = cache[path] ?: return
+    /**
+     * Plays [path] and returns its channel so callers that need to wait for the
+     * sound to finish (the intro cutscenes) can poll it. Existing fire-and-forget
+     * callers can keep ignoring the result.
+     */
+    fun play(path: String, volume: Double = this.volume, pitch: Double = 1.0): AudioChannel? {
+        val s = cache[path] ?: return null
         prune()
-        if (active.size >= maxVoices) return
-        runCatching {
+        if (active.size >= maxVoices) return null
+        return runCatching {
             val ac = AudioChannel()
             ac.volume = volume
             ac.pitch = pitch
             ac.play(s)
             active += ac
-        }
+            ac
+        }.getOrNull()
     }
 
     private fun prune() {

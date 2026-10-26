@@ -1,11 +1,13 @@
 package nightfunkin.play
 
+import korlibs.audio.sound.AudioChannel
 import korlibs.image.color.Colors
 import korlibs.image.bitmap.sliceWithSize
 import korlibs.korge.scene.Scene
 import korlibs.korge.view.Container
 import korlibs.korge.view.SContainer
 import korlibs.korge.view.SolidRect
+import korlibs.korge.view.View
 import korlibs.korge.view.addUpdater
 import korlibs.korge.view.image
 import korlibs.korge.view.solidRect
@@ -43,6 +45,14 @@ object PlayRequest {
     var difficulty: String = Constants.DEFAULT_DIFFICULTY
     var variation: String = Constants.DEFAULT_VARIATION
     var autoplay: Boolean = false
+
+    /**
+     * FNF's `PlayStatePlaylist.isStoryMode`. KNF has no campaign yet; the
+     * Freeplay song list sets this to false, while `KNF_SONG` boots as Story
+     * Mode so the story-only video cutscenes can be tested. `KNF_STORY=1`
+     * forces Story Mode for normal Freeplay runs too.
+     */
+    var storyMode: Boolean = false
 }
 
 /**
@@ -101,6 +111,15 @@ class PlayScene : Scene() {
     private var pauseMusicGeneration = 0
     private var scrollSound = ""
 
+    /** Non-null while a scripted intro cutscene has replaced the countdown. */
+    private var cutscene: SongCutscene? = null
+    private var cutsceneSound: AudioChannel? = null
+    private var blackScreen: SolidRect? = null
+
+    /** HUD fade-in started by a cutscene; negative when no fade is running. */
+    private var hudFadeElapsed = -1.0
+    private var hudFadeDuration = 0.0
+
     /** FNF's `isSongEnd`: the results transition is running. */
     private var ending = false
     private var endingTimer = 0.0
@@ -117,6 +136,9 @@ class PlayScene : Scene() {
     private var clockSampleTimer = 0.0
 
     private var nextEventIndex = 0
+
+    /** Test hook: `KNF_END_AT_MS=6000` treats the song as finished at 6 s. */
+    private val forcedSongEndMs = System.getenv("KNF_END_AT_MS")?.toDoubleOrNull()
 
     private var totalNotes = 0
 
@@ -223,6 +245,9 @@ class PlayScene : Scene() {
     // ---------------------------------------------------------------------
 
     override suspend fun SContainer.sceneInit() {
+        // Available here as well as in sceneMain: cutscenes need to mount their
+        // black screen while sceneInit is still running.
+        sceneRoot = this
         song = SongRegistry.get(PlayRequest.songId)
             ?: error("KNF: unknown song '${PlayRequest.songId}'")
         chart = song.difficulty(PlayRequest.difficulty, PlayRequest.variation)
@@ -413,6 +438,7 @@ class PlayScene : Scene() {
 
         nextEventIndex = 0
         resetForSongStart()
+        startIntroCutscene()
         println("KNF: playing '${chart.songName}' [${chart.difficulty}] notes=${chart.notes.size} inst=$instPath")
         println(
             "KNF: layout scene=" + sceneContainer.size + " hud=" + hudContainer.size +
@@ -455,6 +481,10 @@ class PlayScene : Scene() {
     }
 
     override suspend fun sceneDestroy() {
+        cutscene?.destroy()
+        cutscene = null
+        blackScreen?.removeFromParent()
+        blackScreen = null
         music.stop()
         vocals.stop()
         opponentVocals.stop()
@@ -538,7 +568,15 @@ class PlayScene : Scene() {
         paused = false
         countdownStep = -1
         countdownTimer = 0.0
+        hudContainer.visible = true
         hudContainer.alpha = 1.0
+        hudFadeElapsed = -1.0
+        hudFadeDuration = 0.0
+        cutscene?.destroy()
+        cutscene = null
+        cutsceneSound = null
+        blackScreen?.removeFromParent()
+        blackScreen = null
         music.volume = 1.0
         vocals.volume = 1.0
         opponentVocals.volume = 1.0
@@ -555,6 +593,215 @@ class PlayScene : Scene() {
         chart.events.forEach { it.activated = false }
         nextEventIndex = 0
         conductor.update(prePosition, false)
+    }
+
+    // ======================================================================
+    // intro cutscenes
+    // ======================================================================
+
+    /**
+     * `Song.onCountdownStart` in FNF: songs (and stage scripts) can cancel the
+     * countdown and take over until they call `PlayState.startCountdown()`.
+     */
+    private suspend fun startIntroCutscene() {
+        val intro = SongCutscenes.createIntro(
+            song.id,
+            chart.stage,
+            chart.variation,
+            PlayRequest.storyMode,
+            CutsceneHostImpl(),
+        ) ?: return
+        cutscene = intro
+        println("KNF: playing intro cutscene for '${song.id}'")
+        intro.start()
+    }
+
+    /**
+     * `PlayState.startCountdown`: the cutscene is over, so the HUD comes back
+     * and the normal pre-song countdown starts from the beginning.
+     *
+     * FNF keeps updating `camera.zoom` from the stage's `cameraZoom` every
+     * frame, which silently undoes the cutscene's direct `zoom = 2.5`. KNF
+     * applies that reset explicitly here, just before the countdown.
+     */
+    private fun beginCountdown() {
+        camera.setZoomImmediate(stageFile.cameraZoom)
+        countdownStep = -1
+        countdownTimer = 0.0
+        // Restart note streaming from the top of the chart. A cutscene must
+        // not leave partially spawned notes or an advanced `nextNoteIndex`
+        // behind for the real countdown.
+        playerStrumline.setNoteData(chart.notes.filter { it.isPlayerNote })
+        opponentStrumline.setNoteData(chart.notes.filter { !it.isPlayerNote })
+        conductor.update(prePosition, false)
+    }
+
+    /** FNF's `FlxTween.tween(camHUD, {alpha: 1.0}, ..., FlxEase.quadInOut)`. */
+    private fun updateHudFade(dt: Double) {
+        if (hudFadeElapsed < 0.0) return
+        hudFadeElapsed += dt
+        val duration = hudFadeDuration.coerceAtLeast(0.0001)
+        val t = (hudFadeElapsed / duration).coerceIn(0.0, 1.0)
+        hudContainer.alpha = quadInOut(t)
+        if (t >= 1.0) hudFadeElapsed = -1.0
+    }
+
+    /** `FlxEase.quadInOut`. */
+    private fun quadInOut(t: Double): Double =
+        if (t < 0.5) 2.0 * t * t else 1.0 - (-2.0 * t + 2.0) * (-2.0 * t + 2.0) / 2.0
+
+    /**
+     * `Paths.sound`: the current stage library wins, then `shared`, then
+     * `preload`. Winter Horrorland lives in `week5`, hence the stage directory
+     * is what makes `Lights_Turn_On` resolve to `week5/sounds/...`.
+     */
+    private fun resolveStageSound(stem: String): String? {
+        val candidates = buildList {
+            if (stageFile.directory.isNotEmpty()) add("${stageFile.directory}/$stem")
+            add("shared/$stem")
+            add("preload/$stem")
+            add(stem)
+        }
+        for (candidate in candidates) KnfFiles.resolveSound(candidate)?.let { return it }
+        return null
+    }
+
+    private inner class CutsceneHostImpl : CutsceneHost {
+        override fun setHudVisible(visible: Boolean) {
+            hudContainer.visible = visible
+        }
+
+        override fun fadeHudIn(durationSeconds: Double) {
+            hudContainer.visible = true
+            hudContainer.alpha = 0.0
+            hudFadeElapsed = 0.0
+            hudFadeDuration = durationSeconds
+        }
+
+        override fun showBlackScreen() {
+            hideBlackScreen()
+            // `new FlxSprite(-200, -200).makeGraphic(width * 2, height * 2, BLACK)`
+            // with `scrollFactor(0)` and zIndex 1,000,000.
+            blackScreen = sceneRoot.solidRect(
+                Constants.GAME_WIDTH * 2.0,
+                Constants.GAME_HEIGHT * 2.0,
+                Colors.BLACK,
+            )
+        }
+
+        override fun hideBlackScreen() {
+            blackScreen?.removeFromParent()
+            blackScreen = null
+        }
+
+        override fun setBlackScreenAlpha(alpha: Double) {
+            blackScreen?.alpha = alpha
+        }
+
+        override fun addCutsceneView(view: View) {
+            // Added after the black screen, so it is the topmost layer.
+            sceneRoot.addChild(view)
+        }
+
+        override fun removeCutsceneView(view: View) {
+            view.removeFromParent()
+        }
+
+        override fun focusCamera(x: Double, y: Double, zoom: Double) {
+            camera.setFocusImmediate(x, y)
+            camera.setZoomImmediate(zoom)
+        }
+
+        override fun setCameraZoom(zoom: Double) {
+            camera.setZoomImmediate(zoom)
+        }
+
+        override fun addStageView(view: View, zIndex: Int) {
+            val stage = stageProps
+            if (stage != null) stage.addCutsceneView(view, zIndex) else stageLayer.addChild(view)
+        }
+
+        override fun removeStageView(view: View) {
+            val stage = stageProps
+            if (stage != null) stage.removeCutsceneView(view) else view.removeFromParent()
+        }
+
+        override fun setCharacterVisible(slot: String, visible: Boolean) {
+            characterForSlot(slot)?.visible = visible
+        }
+
+        override fun characterPosition(slot: String): Pair<Double, Double>? {
+            val character = characterForSlot(slot) ?: return null
+            // Flixel's sprite `x` is always the visual left edge. `Character`
+            // stores the container origin, which sits at the right edge for
+            // mirrored sheets, so undo that here for cutscene scripts.
+            val left = if (character.scaleX < 0.0) {
+                character.x + character.localWidth * character.scaleX
+            } else {
+                character.x
+            }
+            return left to character.y
+        }
+
+        override fun characterZIndex(slot: String): Int =
+            stageFile.characterFor(slot)?.zIndex ?: 0
+
+        override fun characterCameraFocus(slot: String): Pair<Double, Double>? {
+            val character = characterForSlot(slot) ?: return null
+            return character.cameraFocusPoint(stageFile.characterFor(slot)?.cameraOffsets.orEmpty())
+        }
+
+        override fun setOpponentVocalsVolume(volume: Double) {
+            opponentVocals.volume = volume
+        }
+
+        override val cameraZoom: Double get() = camera.zoom
+        override val cameraFocusX: Double get() = camera.focusX
+        override val cameraFocusY: Double get() = camera.focusY
+        override val stageZoom: Double get() = stageFile.cameraZoom
+
+        override fun playCharacterAnimation(slot: String, animation: String, forceRestart: Boolean) {
+            characterForSlot(slot)?.play(animation, forceRestart)
+        }
+
+        override fun danceCharacter(slot: String, forceRestart: Boolean) {
+            characterForSlot(slot)?.dance(forceRestart)
+        }
+
+        override fun isCharacterAnimationFinished(slot: String): Boolean =
+            characterForSlot(slot)?.animationFinished == true
+
+        override fun setCharacterDancesOnBeat(slot: String, enabled: Boolean) {
+            characterForSlot(slot)?.dancesOnBeat = enabled
+        }
+
+        private fun characterForSlot(slot: String): Character? = when (slot) {
+            "bf" -> player
+            "dad" -> opponent
+            "gf" -> girlfriend
+            else -> null
+        }
+
+        override suspend fun preloadSound(stem: String): String? = runCatching {
+            val path = resolveStageSound(stem) ?: return@runCatching null
+            path.takeIf { sfx.preload(it) != null }
+        }.getOrNull()
+
+        override suspend fun preloadMusic(stem: String): String? = runCatching {
+            resolveStageSound(stem)
+        }.getOrNull()
+
+        override val advancePressed: Boolean get() = gameInput.accept
+
+        override fun playSound(path: String, volume: Double) {
+            cutsceneSound = sfx.play(path, volume)
+        }
+
+        override fun playSfx(path: String, volume: Double) {
+            sfx.play(path, volume)
+        }
+
+        override fun isSoundPlaying(): Boolean = cutsceneSound?.playing == true
     }
 
     // ======================================================================
@@ -601,8 +848,32 @@ class PlayScene : Scene() {
         for (support in speakerSupports) support.update(dt)
 
         if (!ending) {
-            updateClock(dt)
-            if (startingSong) {
+            // SONG_END freezes gameplay. Ending videos still tick their own
+            // clock, but the just-finished instrumental must not drag the
+            // Conductor backwards when its channel is released.
+            if (!songEnded) updateClock(dt)
+            // FNF's song scripts cancel `onCountdownStart` and call
+            // `PlayState.startCountdown()` when their cutscene is done. Until
+            // then gameplay notes and the countdown are held back (the
+            // original sets `isInCutscene`).
+            val activeCutscene = cutscene
+            if (activeCutscene != null) {
+                if (activeCutscene.update(dt)) {
+                    cutscene = null
+                    val kind = activeCutscene.kind
+                    activeCutscene.destroy()
+                    when (kind) {
+                        CutsceneKind.STARTING -> {
+                            println("KNF: intro cutscene finished, starting countdown")
+                            beginCountdown()
+                        }
+                        CutsceneKind.ENDING -> {
+                            println("KNF: ending cutscene finished, ending the song")
+                            endSong()
+                        }
+                    }
+                }
+            } else if (startingSong) {
                 updateCountdown(dt)
             } else if (!songEnded) {
                 processSongEvents()
@@ -614,6 +885,7 @@ class PlayScene : Scene() {
             updateEnding(dt)
         }
 
+        updateHudFade(dt)
         camera.update(dt)
         for (layer in characterLayers) {
             layer.container.x = (1.0 - layer.scrollX) * camera.scrollX
@@ -621,8 +893,14 @@ class PlayScene : Scene() {
         }
         hud.popUps.beatLengthMs = conductor.beatLengthMs.toDouble()
         hud.update(dt)
-        playerStrumline.update(conductor, startTimestampMs.toFloat(), dt)
-        opponentStrumline.update(conductor, startTimestampMs.toFloat(), dt)
+        // `isInCutscene`: no gameplay notes may spawn or scroll while a
+        // scripted cutscene owns the screen. Otherwise a ten-second video
+        // consumes the first notes of the chart and the player sees them fly
+        // past as soon as the song starts.
+        if (cutscene == null) {
+            playerStrumline.update(conductor, startTimestampMs.toFloat(), dt)
+            opponentStrumline.update(conductor, startTimestampMs.toFloat(), dt)
+        }
 
         stageProps?.update(dt, camera.scrollX, camera.scrollY)
 
@@ -766,8 +1044,14 @@ class PlayScene : Scene() {
      */
     private fun updateClock(dt: Double) {
         if (startingSong) {
-            conductor.accumulateDelta(dt.toFloat())
-            conductor.update(conductor.songPosition + (dt * 1000.0).toFloat(), false)
+            // FNF only advances the conductor while `isInCountdown` is true;
+            // during a scripted intro it stays parked at `prePosition` until
+            // `startCountdown()` resets it. Advancing the clock behind a movie
+            // would consume chart notes before the song even starts.
+            if (cutscene == null) {
+                conductor.accumulateDelta(dt.toFloat())
+                conductor.update(conductor.songPosition + (dt * 1000.0).toFloat(), false)
+            }
             return
         }
 
@@ -814,8 +1098,34 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
 
     private fun checkSongEnd() {
         val length = music.totalMs
-        if (length > 0 && music.positionMs >= length - 120) {
+        val reachedEnd = (length > 0 && music.positionMs >= length - 120) ||
+            (forcedSongEndMs != null && music.positionMs >= forcedSongEndMs)
+        if (reachedEnd) {
+            if (forcedSongEndMs != null && length > 0 && music.positionMs < length - 120) {
+                println("KNF: forced song end at ${music.positionMs.toInt()}ms (KNF_END_AT_MS)")
+            }
             songEnded = true
+
+            // FNF dispatches SONG_END before saving the score. Scripts can
+            // cancel it, play an ENDING video, and call `endSong(true)` later.
+            val endingCutscene = SongCutscenes.createEnding(
+                song.id,
+                chart.stage,
+                chart.variation,
+                PlayRequest.storyMode,
+                CutsceneHostImpl(),
+            )
+            if (endingCutscene != null) {
+                music.volume = 0.0
+                vocals.volume = 0.0
+                opponentVocals.volume = 0.0
+                gameInput.reset()
+                cutscene = endingCutscene
+                println("KNF: playing ending cutscene for '${song.id}'")
+                launch { endingCutscene.start() }
+                return
+            }
+
             endSong()
         }
     }
@@ -1004,9 +1314,9 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
      * her own: her `sing` animations belong to scripted events only.
      */
     private fun onBeat() {
-        player.dance()
-        opponent.dance()
-        girlfriend?.dance()
+        if (player.dancesOnBeat) player.dance()
+        if (opponent.dancesOnBeat) opponent.dance()
+        girlfriend?.let { if (it.dancesOnBeat) it.dance() }
         for (support in speakerSupports) support.onBeat()
     }
 

@@ -19,6 +19,9 @@ object Constants {
     const val GAME_WIDTH = 1280
     const val GAME_HEIGHT = 720
 
+    /** FNF's `Constants.PIXEL_ART_SCALE`. */
+    const val PIXEL_ART_SCALE = 6.0
+
     // ---- time -----------------------------------------------------------
     const val MS_PER_SEC = 1000f
     const val SECS_PER_MIN = 60f
