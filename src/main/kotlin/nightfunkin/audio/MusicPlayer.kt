@@ -186,6 +186,19 @@ class MusicPlayer {
         paused = true
     }
 
+    /**
+     * Pause only when a channel exists. The channel state can briefly report
+     * not-playing right after [play], so callers that need to know whether the
+     * track should resume use this instead of [playing].
+     *
+     * @return true when a channel was stopped and [resume] is needed.
+     */
+    fun pauseIfPlaying(): Boolean {
+        if (channel == null) return false
+        pause()
+        return true
+    }
+
     fun resume() = play(stoppedAtMs)
 
     fun stop() {

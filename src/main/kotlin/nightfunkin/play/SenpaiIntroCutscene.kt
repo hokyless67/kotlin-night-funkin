@@ -63,6 +63,25 @@ class SenpaiIntroCutscene(
         return false
     }
 
+    override val pauseMode: CutscenePauseMode
+        get() = if (dialogueShown) dialogue.pauseMode else CutscenePauseMode.NONE
+
+    override fun pause() {
+        if (dialogueShown) dialogue.pause()
+    }
+
+    override fun resume() {
+        if (dialogueShown) dialogue.resume()
+    }
+
+    override fun skip() {
+        if (dialogueShown) dialogue.skip()
+    }
+
+    override fun restart() {
+        if (dialogueShown) dialogue.restart()
+    }
+
     override fun destroy() {
         done = true
         dialogue.destroy()

@@ -13,8 +13,16 @@ import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfInput
 import kotlin.math.min
 
+/** Port of FNF 0.8.6's `PauseSubState.PauseMode`. */
+enum class PauseMenuMode {
+    STANDARD,
+    DIFFICULTY,
+    CUTSCENE,
+    CONVERSATION,
+}
+
 /**
- * Port of FNF 0.8.6's `PauseSubState` (standard and difficulty modes).
+ * Port of FNF 0.8.6's `PauseSubState`.
  *
  * The menu is an overlay, not a separate scene, so the stage keeps rendering
  * underneath it while `PlayScene` freezes its update loop, exactly like a
@@ -22,8 +30,8 @@ import kotlin.math.min
  * 1.8 s staggered metadata fade) and input order come from `PauseSubState.hx`.
  *
  * Entries omitted from the original list are the ones KNF has no backing
- * feature for: practice mode, chart-editor/conversation/cutscene modes, and
- * story/freeplay-specific exit paths.
+ * feature for: practice mode, chart-editor mode, and story/freeplay-specific
+ * exit paths.
  */
 class PauseMenu(
     songName: String,
@@ -36,9 +44,10 @@ class PauseMenu(
     private val onRestartSong: () -> Unit,
     private val onChangeDifficulty: (String) -> Unit,
     private val onExitToMenu: () -> Unit,
+    initialMode: PauseMenuMode = PauseMenuMode.STANDARD,
+    private val onSkip: () -> Unit = {},
+    private val onRestart: () -> Unit = {},
 ) : Container() {
-
-    private enum class Mode { STANDARD, DIFFICULTY }
 
     /** One menu entry plus the state of its `changeSelection` slide. */
     private class Entry(
@@ -64,7 +73,7 @@ class PauseMenu(
     private val entriesLayer = Container()
     private val metadata = ArrayList<Meta>()
     private var entries: List<Entry> = emptyList()
-    private var mode = Mode.STANDARD
+    private var mode = PauseMenuMode.STANDARD
     private var selected = 0
     private var time = 0.0
     private var justOpened = true
@@ -81,7 +90,15 @@ class PauseMenu(
         delay += 0.1
         meta("Difficulty: ${titleCase(difficulty)}", 79.0, delay)
         delay += 0.1
-        meta("0 Blue Balls", 111.0, delay)
+        meta(
+            when (initialMode) {
+                PauseMenuMode.CUTSCENE -> "Video Paused"
+                PauseMenuMode.CONVERSATION -> "Dialogue Paused"
+                else -> "0 Blue Balls"
+            },
+            111.0,
+            delay,
+        )
         delay += 0.1
         // FNF also tweens its (invisible) practice-mode line, which consumes a
         // slot before the offset text.
@@ -96,7 +113,7 @@ class PauseMenu(
         val offsetY = Constants.GAME_HEIGHT - (offset.height * 2.0 + 40.0)
         metadata += Meta(offset, offsetY, delay)
 
-        rebuild(Mode.STANDARD)
+        rebuild(initialMode)
     }
 
     /** Creates a metadata line parked at its final position but fully transparent. */
@@ -114,22 +131,36 @@ class PauseMenu(
      * entries for [newMode]. The new entries start off-screen-left, then slide
      * into their `changeSelection` positions.
      */
-    private fun rebuild(newMode: Mode) {
+    private fun rebuild(newMode: PauseMenuMode) {
         mode = newMode
         entriesLayer.removeChildren()
         entries = when (mode) {
-            Mode.STANDARD -> listOf(
+            PauseMenuMode.STANDARD -> listOf(
                 "Resume" to onResume,
                 "Restart Song" to onRestartSong,
                 "Change Difficulty" to {
-                    rebuild(Mode.DIFFICULTY)
+                    rebuild(PauseMenuMode.DIFFICULTY)
                 },
                 "Exit to Menu" to onExitToMenu,
             )
 
-            Mode.DIFFICULTY -> difficulties.map { difficultyId ->
+            PauseMenuMode.DIFFICULTY -> difficulties.map { difficultyId ->
                 titleCase(difficultyId) to { onChangeDifficulty(difficultyId) }
-            } + ("Back" to { rebuild(Mode.STANDARD) })
+            } + ("Back" to { rebuild(PauseMenuMode.STANDARD) })
+
+            PauseMenuMode.CUTSCENE -> listOf(
+                "Resume" to onResume,
+                "Skip Cutscene" to onSkip,
+                "Restart Cutscene" to onRestart,
+                "Exit to Menu" to onExitToMenu,
+            )
+
+            PauseMenuMode.CONVERSATION -> listOf(
+                "Resume" to onResume,
+                "Skip Dialogue" to onSkip,
+                "Restart Dialogue" to onRestart,
+                "Exit to Menu" to onExitToMenu,
+            )
         }.mapIndexed { index, (label, action) ->
             // `PauseSubState`'s `letter.width *= 2` only resizes the
             // FlxSprite hitbox; it does not scale the graphic, so the

@@ -95,6 +95,37 @@ class VideoSongCutscene(
         )
     }
 
+    override val pauseMode: CutscenePauseMode
+        get() = if (prepared && !done && !fading) CutscenePauseMode.VIDEO else CutscenePauseMode.NONE
+
+    /** `VideoCutscene.pauseVideo()`. */
+    override fun pause() {
+        player.pauseAudio()
+    }
+
+    /** `VideoCutscene.resumeVideo()`. */
+    override fun resume() {
+        player.resumeAudio()
+    }
+
+    /** `VideoCutscene.finishVideo()`: remove the video and start the 0.5 s fade. */
+    override fun skip() {
+        beginFade()
+    }
+
+    /** `VideoCutscene.restartVideo()`: seek back to the first frame. */
+    override fun restart() {
+        if (!prepared || done) return
+        fading = false
+        fadeElapsed = 0.0
+        maxElapsedMs = 0.0
+        lastDebugMs = -1.0
+        host.setHudVisible(false)
+        player.restart()
+        started = true
+        println("KNF: video cutscene restarted ($videoPath)")
+    }
+
     override fun update(dt: Double): Boolean {
         if (done) return true
         if (!prepared) return false
@@ -219,6 +250,14 @@ class TwoHotEndingCutscene(private val host: CutsceneHost) : SongCutscene {
         host.setCharacterDancesOnBeat("dad", false)
         host.danceCharacter("gf", forceRestart = true)
     }
+
+    override val pauseMode: CutscenePauseMode get() = video.pauseMode
+    override fun pause() = video.pause()
+    override fun resume() = video.resume()
+    override fun skip() = video.skip()
+
+    /** `2hot.hxc` reuses `VideoCutscene.restartVideo`, which only rewinds the movie. */
+    override fun restart() = video.restart()
 
     override fun update(dt: Double): Boolean {
         if (failed) return true
@@ -345,19 +384,32 @@ private class FfmpegVideoPlayer(private val videoPath: String) {
     private var readerThread: Thread? = null
     private var stderrThread: Thread? = null
 
-    private val queue = ArrayBlockingQueue<VideoFrame>(QUEUE_CAPACITY)
+    /**
+     * Replaced on every decoder restart. A reader thread keeps its own queue
+     * reference, so a late frame from the previous ffmpeg process can never
+     * land in front of the new take's first frame.
+     */
+    @Volatile
+    private var queue = ArrayBlockingQueue<VideoFrame>(QUEUE_CAPACITY)
     private val freeBuffers = ArrayBlockingQueue<IntArray>(QUEUE_CAPACITY + 3)
     private val firstFrame = CountDownLatch(1)
 
     @Volatile
-    private var closed = false
-    @Volatile
     private var eof = false
+    @Volatile
+    private var decoderGeneration = 0
 
     private var pendingFrame: VideoFrame? = null
     private var currentFrameIndex = -1
 
+    private var videoFile: File? = null
+    private var outputWidth = 0
+    private var outputHeight = 0
+
     private var audioStarted = false
+    private var paused = false
+    private var audioPausedByMenu = false
+    private var pauseStartedNanos = 0L
     private var wallStartNanos = 0L
     private var lastAudioMs = 0.0
     private var lastAudioWallNanos = 0L
@@ -389,6 +441,9 @@ private class FfmpegVideoPlayer(private val videoPath: String) {
             )
             val outWidth = even((width * scale).roundToInt().coerceAtLeast(2))
             val outHeight = even((height * scale).roundToInt().coerceAtLeast(2))
+            videoFile = file
+            outputWidth = outWidth
+            outputHeight = outHeight
 
             val bmp = Bitmap32(outWidth, outHeight)
             bmp.premultiplied = true
@@ -428,13 +483,67 @@ private class FfmpegVideoPlayer(private val videoPath: String) {
 
     fun playAudio() {
         audioStarted = true
+        paused = false
+        audioPausedByMenu = false
         wallStartNanos = System.nanoTime()
         lastAudioWallNanos = wallStartNanos
         if (audioPlayer.exists) audioPlayer.play(0.0)
     }
 
+    /** `VideoCutscene.pauseVideo()`: stop the movie clock until [resumeAudio]. */
+    fun pauseAudio() {
+        if (!audioStarted || paused) return
+        paused = true
+        pauseStartedNanos = System.nanoTime()
+        audioPausedByMenu = audioPlayer.exists && audioPlayer.pauseIfPlaying()
+    }
+
+    /** `VideoCutscene.resumeVideo()`: continue from the paused audio sample. */
+    fun resumeAudio() {
+        if (!paused) return
+        paused = false
+        val now = System.nanoTime()
+        if (audioPausedByMenu && audioPlayer.exists) {
+            val at = audioPlayer.pausedAtMs
+            audioPlayer.play(at)
+            lastAudioMs = at
+            lastAudioWallNanos = now
+            if (at > maxElapsedMs) maxElapsedMs = at
+        } else {
+            // Silent movie, or the audio ended just before the menu opened:
+            // keep the wall clock from counting the menu time.
+            val pausedNanos = now - pauseStartedNanos
+            wallStartNanos += pausedNanos
+            lastAudioWallNanos += pausedNanos
+        }
+        audioPausedByMenu = false
+    }
+
+    /**
+     * `VideoCutscene.restartVideo()`: rewind the decoder and start the extracted
+     * audio from zero. The pause menu closes immediately afterwards.
+     */
+    fun restart() {
+        val file = videoFile ?: return
+        audioPlayer.stop()
+        shutdownDecoder()
+        pendingFrame = null
+        currentFrameIndex = -1
+        audioStarted = false
+        paused = false
+        audioPausedByMenu = false
+        error = null
+        maxElapsedMs = 0.0
+        lastAudioMs = 0.0
+        lastAudioWallNanos = 0L
+        wallStartNanos = 0L
+        startDecoder(file, outputWidth, outputHeight)
+        playAudio()
+    }
+
     fun elapsedMs(): Double {
         if (!audioStarted) return 0.0
+        if (paused) return maxElapsedMs
         val now = System.nanoTime()
 
         val raw = if (audioPlayer.exists) {
@@ -463,7 +572,7 @@ private class FfmpegVideoPlayer(private val videoPath: String) {
     }
 
     fun debugState(): String =
-        "audio=${audioPlayer.exists} playing=${audioPlayer.playing} " +
+        "audio=${audioPlayer.exists} playing=${audioPlayer.playing} paused=$paused " +
             "pos=${"%.0f".format(audioPlayer.positionMs)} frame=$currentFrameIndex " +
             "queue=${queue.size} pending=${pendingFrame != null} eof=$eof error=$error"
 
@@ -517,6 +626,10 @@ private class FfmpegVideoPlayer(private val videoPath: String) {
     }
 
     private fun startDecoder(file: File, outWidth: Int, outHeight: Int) {
+        val generation = ++decoderGeneration
+        eof = false
+        val frameQueue = ArrayBlockingQueue<VideoFrame>(QUEUE_CAPACITY)
+        queue = frameQueue
         val ffmpeg = FfmpegTool.ffmpeg
         if (ffmpeg == null) {
             error = "ffmpeg was not found (set KNF_FFMPEG or -Dknf.ffmpeg=...)"
@@ -562,7 +675,7 @@ private class FfmpegVideoPlayer(private val videoPath: String) {
             val bytes = ByteArray(frameBytes)
             var index = 0
             try {
-                while (!closed) {
+                while (generation == decoderGeneration) {
                     if (!readFrame(input, bytes)) break
                     val pixels = freeBuffers.poll() ?: IntArray(pixelCount)
                     var b = 0
@@ -576,25 +689,29 @@ private class FfmpegVideoPlayer(private val videoPath: String) {
                         b += 4
                     }
                     val frame = VideoFrame(index++, pixels)
-                    if (!offer(frame)) {
+                    if (!offer(frameQueue, frame, generation)) {
                         freeBuffers.offer(pixels)
                         break
                     }
                     if (index == 1) firstFrame.countDown()
                 }
             } catch (t: Throwable) {
-                if (!closed) error = "frame reader failed: ${t.message}"
+                if (generation == decoderGeneration) error = "frame reader failed: ${t.message}"
             } finally {
-                eof = true
+                if (generation == decoderGeneration) eof = true
                 firstFrame.countDown()
                 runCatching { p.destroy() }
             }
         }
     }
 
-    private fun offer(frame: VideoFrame): Boolean {
-        while (!closed) {
-            if (queue.offer(frame, 50, TimeUnit.MILLISECONDS)) return true
+    private fun offer(
+        frameQueue: ArrayBlockingQueue<VideoFrame>,
+        frame: VideoFrame,
+        generation: Int,
+    ): Boolean {
+        while (generation == decoderGeneration) {
+            if (frameQueue.offer(frame, 50, TimeUnit.MILLISECONDS)) return true
         }
         return false
     }
@@ -611,7 +728,7 @@ private class FfmpegVideoPlayer(private val videoPath: String) {
     }
 
     private fun shutdownDecoder() {
-        closed = true
+        decoderGeneration++
         process?.destroyForcibly()
         process = null
         readerThread?.interrupt()

@@ -825,9 +825,26 @@ class PlayScene : Scene() {
             return
         }
 
+        // `PlayState.handleCutsceneKeys`: conversations handle CUTSCENE_ADVANCE
+        // before PAUSE, so ENTER advances a line instead of opening the menu.
+        // Videos consume the full PAUSE action, including ENTER.
+        val activeCutscene = cutscene
+        if (activeCutscene != null) {
+            val pauseMode = activeCutscene.pauseMode
+            val pausePressed = when (pauseMode) {
+                CutscenePauseMode.VIDEO -> gameInput.pause
+                CutscenePauseMode.CONVERSATION -> gameInput.pauseOnly
+                CutscenePauseMode.NONE -> false
+            }
+            if (pausePressed) {
+                openCutscenePause(activeCutscene, pauseMode)
+                return
+            }
+        }
+
         // `PlayState.pause`: no pausing during the countdown, after the song
         // ended, or while the results transition runs.
-        if (!startingSong && !songEnded && !ending && gameInput.pause) {
+        if (cutscene == null && !startingSong && !songEnded && !ending && gameInput.pause) {
             openPause()
             return
         }
@@ -856,12 +873,12 @@ class PlayScene : Scene() {
             // `PlayState.startCountdown()` when their cutscene is done. Until
             // then gameplay notes and the countdown are held back (the
             // original sets `isInCutscene`).
-            val activeCutscene = cutscene
-            if (activeCutscene != null) {
-                if (activeCutscene.update(dt)) {
+            val cutsceneToUpdate = cutscene
+            if (cutsceneToUpdate != null) {
+                if (cutsceneToUpdate.update(dt)) {
                     cutscene = null
-                    val kind = activeCutscene.kind
-                    activeCutscene.destroy()
+                    val kind = cutsceneToUpdate.kind
+                    cutsceneToUpdate.destroy()
                     when (kind) {
                         CutsceneKind.STARTING -> {
                             println("KNF: intro cutscene finished, starting countdown")
@@ -979,6 +996,60 @@ class PlayScene : Scene() {
         vocals.pause()
         opponentVocals.pause()
 
+        startPauseMusic()
+    }
+
+    /**
+     * `PauseSubState` in `Cutscene`/`Conversation` mode. Song stems are not
+     * touched because an intro cutscene runs before the countdown and an ending
+     * cutscene has already muted them; only the cutscene's own audio pauses.
+     */
+    private fun openCutscenePause(active: SongCutscene, pauseMode: CutscenePauseMode) {
+        if (pauseMenu != null) return
+        val menuMode = when (pauseMode) {
+            CutscenePauseMode.VIDEO -> PauseMenuMode.CUTSCENE
+            CutscenePauseMode.CONVERSATION -> PauseMenuMode.CONVERSATION
+            CutscenePauseMode.NONE -> return
+        }
+        paused = true
+
+        val menu = PauseMenu(
+            songName = chart.songName,
+            artistName = chart.artist,
+            difficulty = chart.difficulty,
+            difficulties = song.difficultiesFor(chart.variation),
+            offsetMs = conductor.globalOffset,
+            onScroll = { sfx.play(scrollSound, 0.4) },
+            onResume = {
+                active.resume()
+                closeCutscenePause()
+            },
+            onRestartSong = { restartSong() },
+            onChangeDifficulty = { difficulty -> restartSong(difficulty) },
+            onExitToMenu = { exitToSongSelect() },
+            initialMode = menuMode,
+            onSkip = {
+                active.skip()
+                // `closeSubState` resumes a conversation after skipping so the
+                // outro's music fade plays. Video audio was already stopped by
+                // `finishVideo`.
+                if (pauseMode == CutscenePauseMode.CONVERSATION) active.resume()
+                closeCutscenePause()
+            },
+            onRestart = {
+                active.restart()
+                closeCutscenePause()
+            },
+        )
+        pauseMenu = menu
+        sceneRoot.addChild(menu)
+
+        active.pause()
+        startPauseMusic()
+        println("KNF: cutscene pause menu ($pauseMode)")
+    }
+
+    private fun startPauseMusic() {
         pauseMusic.loop = true
         pauseMusicGeneration++
         val generation = pauseMusicGeneration
@@ -991,6 +1062,17 @@ class PlayScene : Scene() {
             val half = (pauseMusic.totalMs / 2.0).toInt().coerceAtLeast(0)
             pauseMusic.play(Random.nextInt(0, half + 1).toDouble())
         }
+    }
+
+    /** Close a cutscene pause menu without resuming the song stems. */
+    private fun closeCutscenePause() {
+        if (pauseMenu == null) return
+        pauseMusicGeneration++
+        pauseMenu?.removeFromParent()
+        pauseMenu = null
+        paused = false
+        pauseMusic.stop()
+        println("KNF: cutscene pause closed")
     }
 
     /** `PauseSubState.resume`: close the overlay and unpause the song. */

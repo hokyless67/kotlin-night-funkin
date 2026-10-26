@@ -140,6 +140,25 @@ class ThornsIntroCutscene(private val host: CutsceneHost) : SongCutscene {
         return false
     }
 
+    override val pauseMode: CutscenePauseMode
+        get() = if (state == State.DIALOGUE) dialogue.pauseMode else CutscenePauseMode.NONE
+
+    override fun pause() {
+        if (state == State.DIALOGUE) dialogue.pause()
+    }
+
+    override fun resume() {
+        if (state == State.DIALOGUE) dialogue.resume()
+    }
+
+    override fun skip() {
+        if (state == State.DIALOGUE) dialogue.skip()
+    }
+
+    override fun restart() {
+        if (state == State.DIALOGUE) dialogue.restart()
+    }
+
     override fun destroy() {
         state = State.DONE
         dialogue.destroy()

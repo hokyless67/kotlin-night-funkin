@@ -34,6 +34,13 @@ class KnfInput(private val inputKeys: InputKeys) {
     /** FNF's PAUSE action: [P, ENTER, ESCAPE]. */
     val pause: Boolean get() = anyJustPressed(Key.P, Key.ENTER, Key.ESCAPE)
 
+    /**
+     * PAUSE without CONFIRM. Conversations check CUTSCENE_ADVANCE (Z/ENTER)
+     * before PAUSE, so ENTER must advance the line instead of opening the
+     * pause menu there.
+     */
+    val pauseOnly: Boolean get() = anyJustPressed(Key.P, Key.ESCAPE)
+
     /** FNF's UI_UP / UI_DOWN actions. */
     val uiUp: Boolean get() = anyJustPressed(Key.W, Key.UP)
     val uiDown: Boolean get() = anyJustPressed(Key.S, Key.DOWN)

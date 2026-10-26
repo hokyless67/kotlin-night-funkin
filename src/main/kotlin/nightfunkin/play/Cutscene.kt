@@ -1,6 +1,7 @@
 package nightfunkin.play
 
 import korlibs.korge.view.View
+import nightfunkin.core.Constants
 
 /** What the PlayScene should do once the cutscene's update returns `true`. */
 enum class CutsceneKind {
@@ -9,6 +10,19 @@ enum class CutsceneKind {
 
     /** FNF's `CutsceneType.ENDING`: call `endSong(true)`. */
     ENDING,
+}
+
+/**
+ * Which `PauseSubState` menu a cutscene shows when the player presses PAUSE.
+ *
+ * FNF only installs these modes for video cutscenes and conversations;
+ * scripted stage sequences (Philly, Winter Horrorland's intro, ...) keep
+ * playing and have no pause menu.
+ */
+enum class CutscenePauseMode {
+    NONE,
+    VIDEO,
+    CONVERSATION,
 }
 
 /**
@@ -27,11 +41,29 @@ enum class CutsceneKind {
 interface SongCutscene {
     val kind: CutsceneKind get() = CutsceneKind.STARTING
 
+    /**
+     * `PauseSubState` mode for this cutscene, or [CutscenePauseMode.NONE] when
+     * ESC/P should not open a menu.
+     */
+    val pauseMode: CutscenePauseMode get() = CutscenePauseMode.NONE
+
     /** Loads assets and puts the initial frame on screen. Runs inside `sceneInit`. */
     suspend fun start()
 
     /** Advances the cutscene. @return true when it is over. */
     fun update(dt: Double): Boolean
+
+    /** Freezes cutscene-owned audio while the pause menu is open. */
+    fun pause() {}
+
+    /** Resumes cutscene-owned audio after the pause menu closes. */
+    fun resume() {}
+
+    /** `PauseSubState`'s "Skip Cutscene" / "Skip Dialogue". */
+    fun skip() {}
+
+    /** `PauseSubState`'s "Restart Cutscene" / "Restart Dialogue". */
+    fun restart() {}
 
     /** Releases anything the cutscene added to the scene. */
     fun destroy() {}
@@ -146,13 +178,19 @@ object SongCutscenes {
         storyMode: Boolean,
         host: CutsceneHost,
     ): SongCutscene? {
+        // Story Mode always plays the default variation. A story-only cutscene
+        // therefore makes no sense for an alternate variation: `guns`, `ugh`,
+        // `darnell` and others only have the BF/default movie, so showing it
+        // over a Pico Mix would put the wrong character on screen.
+        val storyVariation = variation == Constants.DEFAULT_VARIATION
+
         // Song scripts win over stage scripts, matching FNF's dispatch order.
         when (songId) {
             "winter-horrorland" -> return WinterHorrorlandCutscene(host)
-            "guns" -> if (storyMode) {
+            "guns" -> if (storyMode && storyVariation) {
                 return VideoSongCutscene(host, "videos/videos/gunsCutscene.mkv")
             }
-            "ugh" -> if (storyMode) {
+            "ugh" -> if (storyMode && storyVariation) {
                 return VideoSongCutscene(host, "videos/videos/ughCutscene.mkv")
             }
             "stress" -> {
@@ -161,11 +199,11 @@ object SongCutscenes {
                 if (variation == "pico") {
                     return VideoSongCutscene(host, "videos/videos/stressPicoCutscene.mkv")
                 }
-                if (storyMode) {
+                if (storyMode && storyVariation) {
                     return VideoSongCutscene(host, "videos/videos/stressCutscene.mkv")
                 }
             }
-            "darnell" -> if (storyMode) {
+            "darnell" -> if (storyMode && storyVariation) {
                 // `darnell.hxc` plays the movie before the countdown. (Its
                 // optional in-game can-kicking prelude is a separate script.)
                 return VideoSongCutscene(
@@ -185,7 +223,7 @@ object SongCutscenes {
                         beforeSoundStem = "sounds/ANGRY_TEXT_BOX",
                     )
                 }
-                if (storyMode) {
+                if (storyMode && storyVariation) {
                     return DialogueCutscene(
                         host,
                         "roses",
@@ -202,9 +240,9 @@ object SongCutscenes {
                         musicRestartSpeakers = setOf("senpai"),
                     )
                 }
-                if (storyMode) return SenpaiIntroCutscene(host, "senpai")
+                if (storyMode && storyVariation) return SenpaiIntroCutscene(host, "senpai")
             }
-            "thorns" -> if (storyMode) return ThornsIntroCutscene(host)
+            "thorns" -> if (storyMode && storyVariation) return ThornsIntroCutscene(host)
         }
         // Stage-script cutscenes. `phillyTrainErect.hxc` runs whenever the
         // player character is `pico-playable`; every chart on this stage is a

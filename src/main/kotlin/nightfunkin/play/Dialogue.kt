@@ -313,6 +313,7 @@ class DialogueCutscene(
     private var backdropFadeTime = 0.0
 
     private var music: MusicPlayer? = null
+    private var musicPausedByMenu = false
     private var musicFadeElapsed = 0.0
     private var musicFadeTime = 0.0
     private var musicActive = false
@@ -417,8 +418,78 @@ class DialogueCutscene(
         return done
     }
 
+    override val pauseMode: CutscenePauseMode
+        get() = if (shown && !done) CutscenePauseMode.CONVERSATION else CutscenePauseMode.NONE
+
+    /** `Conversation.pause`: stop the conversation track, not the whole song. */
+    override fun pause() {
+        if (musicPausedByMenu) return
+        val player = music ?: return
+        musicPausedByMenu = player.pauseIfPlaying()
+    }
+
+    /** `Conversation.resume`; runs when the pause substate closes. */
+    override fun resume() {
+        if (!musicPausedByMenu) return
+        music?.resume()
+        musicPausedByMenu = false
+    }
+
+    /** `Conversation.skipConversation`: jump to the outro. */
+    override fun skip() {
+        if (shown && !done) startOutro()
+    }
+
+    /**
+     * `Conversation.resetConversation`: clear the speaker, box and backdrop,
+     * stop the track, rewind to the first line, and rebuild the view. The
+     * trace is kept loaded so restarting does not repeat the initial load.
+     */
+    override fun restart() {
+        if (!shown) return
+
+        root?.let { host.removeCutsceneView(it) }
+        root = null
+        backdrop = null
+        speakerLayer = null
+        boxLayer = null
+        boxGroup = null
+        box = null
+        speaker = null
+        mainText = null
+        shadowText = null
+
+        music?.stop()
+        musicPausedByMenu = false
+        musicActive = false
+        musicStoppedForSpeaker = false
+        musicFadeElapsed = 0.0
+        musicOutroStartVolume = 0.0
+
+        backdropElapsed = 0.0
+        backdropFadeTime = 0.0
+        outroElapsed = 0.0
+        outroDuration = 0.0
+        state = State.START
+        entryIndex = 0
+        lineIndex = 0
+        boxId = ""
+        currentSpeakerId = ""
+        combinedText = ""
+        wrappedText = ""
+        shownChars = 0
+        typing = false
+        typeAccumulator = 0.0
+
+        shown = false
+        done = false
+        show()
+        println("KNF: dialogue '$conversationId' restarted")
+    }
+
     override fun destroy() {
         done = true
+        musicPausedByMenu = false
         music?.dispose()
         music = null
         root?.let { host.removeCutsceneView(it) }
