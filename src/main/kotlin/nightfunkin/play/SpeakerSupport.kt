@@ -56,21 +56,22 @@ class SpeakerSupport private constructor(
     }
 
     /**
-     * `BaseCharacter.x` already includes `_data.offsets` unscaled. FNF's scripts
-     * then add the same offset a second time, scaled:
+     * FNF's scripts anchor A-Bot from the character's `x`/`y` and add the
+     * scaled `globalOffsets` term:
      *
      * ```haxe
      * abot.x = this.x - 95 - (-globalOffsets[0] * scale.x);
      * ```
+     *
+     * The character itself is drawn through `Bopper.getScreenPosition`, which
+     * adds that same term to its rendered position. Relative to the character
+     * the two cancel, leaving just the body offset. [Character.x]/[Character.y]
+     * are already KNF's rendered top-left, so apply the offset to those rather
+     * than adding the global offsets (or the idle-pose inset) a second time.
      */
     private fun syncPosition() {
-        val offsets = owner.data.offsets
-        // FNF anchors the rig to the same horizontal box KNF positions the
-        // character in. Vertically the all-pose box is taller than the idle
-        // pose FNF measures, so only that axis needs the stage delta.
-        val insetY = owner.stageInsetY * owner.scaleY
-        x = owner.x + bodyOffsetX + offsets.getOrElse(0) { 0.0 } * owner.scaleX
-        y = owner.y + insetY + bodyOffsetY + offsets.getOrElse(1) { 0.0 } * owner.scaleY
+        x = owner.x + bodyOffsetX
+        y = owner.y + bodyOffsetY
     }
 
     fun update(dt: Double) {
@@ -347,8 +348,10 @@ class SpeakerSupport private constructor(
         private val originOffsetY: Double
 
         init {
-            scaleX = scale
-            scaleY = scale
+            // Like [SparrowView], scale the image itself. Scaling this
+            // container would scale the centred-origin compensation twice.
+            image.scaleX = scale
+            image.scaleY = scale
             // `ABotVis` assigns the whole atlas before scaling, so every bar
             // shares the first frame's centred origin - not its own frame's.
             val first = atlas.firstFrame()
@@ -364,8 +367,8 @@ class SpeakerSupport private constructor(
         fun setFrame(index: Int) {
             val frame = frames[index.coerceIn(0, frames.lastIndex)]
             image.bitmap = atlas.slice(frame)
-            image.x = -frame.frameX + originOffsetX
-            image.y = -frame.frameY + originOffsetY
+            image.x = -frame.frameX * scale + originOffsetX
+            image.y = -frame.frameY * scale + originOffsetY
         }
     }
 
@@ -436,14 +439,16 @@ class SpeakerSupport private constructor(
         private var finished = true
 
         init {
-            scaleX = pieceScale
-            scaleY = pieceScale
             val first = atlas?.firstFrame()
             val halfWidth = (first?.logicalWidth ?: 0) * 0.5
             val halfHeight = (first?.logicalHeight ?: 0) * 0.5
             // `FunkinSprite.createSparrow()` centres the origin on the first
-            // frame. Flixel scales around that point, so unlike the support
-            // container the image itself shifts by `(scale - 1) * origin`.
+            // frame. Flixel scales around that point, so the image shifts by
+            // `(scale - 1) * origin`.
+            //
+            // Scale the image itself rather than this container: a scaled
+            // container would scale the origin compensation a second time and
+            // throw every piece hundreds of pixels up/left.
             val originX = if (roundOrigin) halfWidth.roundToInt().toDouble() else halfWidth
             val originY = if (roundOrigin) halfHeight.roundToInt().toDouble() else halfHeight
             originOffsetX = -originX * (pieceScale - 1.0)
@@ -451,11 +456,16 @@ class SpeakerSupport private constructor(
 
             image = if (first != null) {
                 Image(atlas!!.slice(first)).also {
-                    it.x = -first.frameX + originOffsetX
-                    it.y = -first.frameY + originOffsetY
+                    it.scaleX = pieceScale
+                    it.scaleY = pieceScale
+                    it.x = -first.frameX * pieceScale + originOffsetX
+                    it.y = -first.frameY * pieceScale + originOffsetY
                 }
             } else {
-                Image(EMPTY_BITMAP)
+                Image(EMPTY_BITMAP).also {
+                    it.scaleX = pieceScale
+                    it.scaleY = pieceScale
+                }
             }
             image.setPixelArt(true)
             addChild(image)
@@ -495,8 +505,8 @@ class SpeakerSupport private constructor(
             val atlas = atlas ?: return
             val frame = frames.getOrNull(frameIndex) ?: return
             image.bitmap = atlas.slice(frame)
-            image.x = -frame.frameX + originOffsetX
-            image.y = -frame.frameY + originOffsetY
+            image.x = -frame.frameX * pieceScale + originOffsetX
+            image.y = -frame.frameY * pieceScale + originOffsetY
         }
     }
 
