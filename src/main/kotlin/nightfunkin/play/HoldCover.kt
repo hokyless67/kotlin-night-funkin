@@ -54,12 +54,21 @@ class HoldCover(
 
     /** Lane-local x of this direction's receptor. */
     var laneX: Double = 0.0
+        private set
 
     /** Lane-local y of the receptor line. */
     var strumlineY: Double = 0.0
+        private set
 
     init {
         playStart()
+    }
+
+    /** Position the cover immediately, before its first rendered frame. */
+    fun setPosition(laneX: Double, strumlineY: Double) {
+        this.laneX = laneX
+        this.strumlineY = strumlineY
+        redraw()
     }
 
     fun playStart() {
@@ -79,6 +88,8 @@ class HoldCover(
             return
         }
         phase = Phase.Hold
+        // FNF marks the middle hold animation as `looped = true`; the start
+        // and end poses play once.
         setFrames(asset.hold)
     }
 
@@ -121,6 +132,15 @@ class HoldCover(
         if (finished) {
             when (phase) {
                 Phase.Start -> playHold()
+                Phase.Hold -> {
+                    // `animData[1].looped = true` in NoteStyle.buildHoldCoverAnimations.
+                    if (frames.size > 1) {
+                        frameIndex = 0
+                        timer = 0.0
+                        finished = false
+                        redraw()
+                    }
+                }
                 Phase.End -> {
                     phase = Phase.Done
                     visible = false

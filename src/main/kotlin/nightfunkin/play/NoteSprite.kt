@@ -1,9 +1,13 @@
 package nightfunkin.play
 
+import korlibs.image.bitmap.slice
 import korlibs.korge.view.Container
 import korlibs.math.geom.Anchor2D
 import korlibs.korge.view.Image
 import korlibs.korge.view.image
+import korlibs.memory.Float32Buffer
+import korlibs.memory.Uint16Buffer
+import korlibs.memory.UShortArrayInt
 import nightfunkin.core.AtlasSlice
 import nightfunkin.core.Constants
 import nightfunkin.core.NoteDirection
@@ -15,12 +19,15 @@ import kotlin.math.abs
 /**
  * The sustain "tail" of a hold note.
  *
- * FNF draws this with a custom mesh over the hold-note sheet; KNF stretches
- * the body column and pins the end cap, which reads identically at gameplay
- * speed and costs nothing.
+ * Ported from `play/notes/SustainTrail.hx`. FNF does not draw the tail as two
+ * stacked images: it builds eight vertices (four for the body, four for the
+ * end cap) and samples the hold-note strip through them. That distinction is
+ * visible on short tails, where the cap has to be clipped through its UVs
+ * instead of simply being hidden, so KNF uses the same mesh.
  *
- * Geometry follows `play/notes/SustainTrail.hx` plus the y rules in
- * `Strumline.updateNotes`.
+ * The body samples the top row of its column (FNF's negative V coordinate is
+ * clamped to it), while the cap is drawn at its native sheet scale. Geometry
+ * and the y rules from `Strumline.updateNotes` are kept verbatim below.
  */
 class SustainTrail(
     parent: Container,
@@ -43,9 +50,6 @@ class SustainTrail(
     /** Set when a held note is released early, so the tail stays where it was. */
     var yOffset: Float = 0f
 
-    private var body: Image? = null
-    private var cap: Image? = null
-
     /**
      * FNF's `SustainTrail.setupHoldNoteGraphic`:
      *
@@ -58,17 +62,17 @@ class SustainTrail(
      * `pixel`), which is *not* the note scale - that is why the pixel hold note
      * is a 72x6 sheet stretched to a fat bar.
      */
-    private val widthPx: Double =
-        ((noteStyle.holdNoteSheetWidth() ?: Constants.STRUMLINE_SIZE) / 8.0) *
-            noteStyle.holdNoteScale.toDouble()
+    private val sheet = noteStyle.holdNoteSheet()
+    private val sheetHeight: Double = sheet?.height?.toDouble() ?: 0.0
+    private val zoom: Double = noteStyle.holdNoteScale.toDouble()
+    private val widthPx: Double = ((sheet?.width ?: Constants.STRUMLINE_SIZE) / 8.0) * zoom
 
     /** `endOffset` / `bottomClip` from `setupHoldNoteGraphic`. */
     private val endOffset: Double = if (noteStyle.isHoldNotePixel) 1.0 else 0.5
     private val bottomClip: Double = if (noteStyle.isHoldNotePixel) 1.0 else 0.9
 
     /** `graphic.height * zoom * endOffset` - the part of the sheet the cap eats. */
-    private val bottomHeightPx: Double =
-        (noteStyle.holdNoteSheetHeight() ?: 0) * noteStyle.holdNoteScale.toDouble() * endOffset
+    private val bottomHeightPx: Double = sheetHeight * zoom * endOffset
 
     /**
      * `SustainTrail.updateHitbox` stores the skin offsets in `offset`, and the
@@ -78,29 +82,42 @@ class SustainTrail(
     private val offsetX: Double = noteStyle.holdNoteOffsets.getOrElse(0) { 0.0 }
     private val offsetY: Double = noteStyle.holdNoteOffsets.getOrElse(1) { 0.0 }
 
+    private val vertices = Float32Buffer(16)
+    private val uvs = Float32Buffer(16)
+
+    /**
+     * One mesh for the body and cap. The texture is the entire eight-column
+     * strip, so the direction is selected with UVs exactly like FNF instead of
+     * cropping each column into a separate bitmap.
+     */
+    private val mesh: SustainMesh? = sheet?.let { sheet ->
+        SustainMesh(
+            texture = sheet.slice(),
+            vertices = vertices,
+            uvs = uvs,
+            indices = Uint16Buffer(
+                UShortArrayInt(
+                    shortArrayOf(
+                        0, 1, 2,
+                        1, 2, 3,
+                        4, 5, 6,
+                        5, 6, 7,
+                    ),
+                ),
+            ),
+            smoothing = !noteStyle.isHoldNotePixel,
+        ).also {
+            it.x = -offsetX
+            it.y = -offsetY
+            addChild(it)
+        }
+    }
+
     init {
         // FNF: `holdNoteSprite.x = this.x + getXPos(dir) + STRUMLINE_SIZE / 2 - holdNote.width / 2;`
-        // The tail's artwork is centred on the lane, exactly like the note head.
-        x = laneX.toDouble() + Constants.STRUMLINE_SIZE / 2.0
-
-        val pair = noteStyle.sustainSlices(directionIndex)
-        if (pair != null) {
-            val (bodySlice, capSlice) = pair
-            // FNF's vertices start at the top of the sheet and grow downwards, so
-            // the body hangs from its first row rather than being centred on it.
-            body = image(bodySlice).also { it.anchor = Anchor2D.TOP_LEFT }
-            // FNF samples the cap's UVs from 0 to `bottomClip` (0.9 for the
-            // normal skins, 1.0 for pixel), i.e. the column is drawn at its own
-            // uniform zoom, not squashed into `endOffset`. Crop the column to
-            // that fraction so KorGE reproduces the same height.
-            val capRows = (capSlice.height * bottomClip).toInt().coerceAtLeast(1)
-            val capVisible =
-                if (capRows < capSlice.height) capSlice.sliceWithSize(0, 0, capSlice.width, capRows)
-                else capSlice
-            cap = image(capVisible).also { it.anchor = Anchor2D.TOP_LEFT }
-            body?.setPixelArt(noteStyle.isHoldNotePixel)
-            cap?.setPixelArt(noteStyle.isHoldNotePixel)
-        }
+        // The mesh itself starts at x = 0, so the lane offset belongs to this
+        // container. `-offsetX` stays on the mesh, where FNF's draw subtracts it.
+        x = laneX.toDouble() + Constants.STRUMLINE_SIZE / 2.0 - widthPx / 2.0
         parent.addChild(this)
     }
 
@@ -113,91 +130,120 @@ class SustainTrail(
             (if (downscroll) 1.0 else -1.0)
 
     /**
-     * Ported from the three branches of `Strumline.updateNotes`.
+     * FNF calls `updateClipping()` from `triggerRedraw()` with its default
+     * `songTime = 0`, so the mesh is always unclipped at the top during normal
+     * play. Keeping the calculation here documents the source and leaves the
+     * same behaviour if a future caller passes an explicit time.
+     */
+    private fun clipHeight(): Double {
+        val unclipped = sustainHeightPx(sustainLength + strumTime)
+        return unclipped.coerceIn(0.0, sustainHeightPx(sustainLength))
+    }
+
+    /**
+     * Ported from `SustainTrail.updateClipping` plus the y rules in
+     * `Strumline.updateNotes`.
      *
-     * FNF's trail is a mesh whose first row sits at the sprite's position and
-     * grows *downwards* (upscroll) or *upwards* (downscroll, `flipY`):
-     *
-     * ```haxe
-     * // upscroll, not held
-     * holdNote.y = this.y - INITIAL_OFFSET + getNoteY(...) + STRUMLINE_SIZE / 2 + yOffset;
-     * // upscroll, held
-     * holdNote.y = this.y - INITIAL_OFFSET + STRUMLINE_SIZE / 2;
-     * // downscroll, not held
-     * holdNote.y = this.y - INITIAL_OFFSET + getNoteY(...) - holdNote.height + STRUMLINE_SIZE / 2 + yOffset;
-     * // downscroll, held
-     * holdNote.y = this.y - INITIAL_OFFSET - holdNote.height + STRUMLINE_SIZE / 2;
-     * ```
-     *
-     * The `- holdNote.height` term cancels the mesh's own height, so the edge
-     * that meets the arrow is `y + graphicHeight` - the head's *centre* in both
-     * scroll directions. That is the point computed below as [attachY]; getting
-     * it wrong is what leaves the tail hanging below the arrow instead of being
-     * clipped in its middle.
+     * The four body vertices are the top edge of the visible tail and the
+     * bottom of the solid part. The four cap vertices then stretch the cap's
+     * texture from that bottom edge to its rounded end. For tails shorter than
+     * `bottomHeight`, `partHeight` becomes negative and the cap's top UV moves
+     * down instead of the whole sprite disappearing - that is the clipping
+     * behaviour that the old body/cap image pair could not reproduce.
      */
     fun updateGeometry(conductor: Conductor) {
-        val b = body ?: return
-        val c = cap ?: return
+        val mesh = mesh ?: return
 
         // FNF shortens the tail while the note is held
         // (`holdNote.sustainLength = (strumTime + fullSustainLength) - songPosition`),
-        // which makes it shrink at exactly the scroll rate - the far end of the
-        // tail therefore stays put in the world while the top is pinned to the
-        // receptor.
+        // which makes it shrink at exactly the scroll rate. Use the
+        // sub-frame-interpolated clock here: the audio clock itself is only
+        // refreshed in coarse chunks, and using it directly makes the tail's
+        // end jump by many pixels once per audio update.
         if (clipping) {
-            sustainLength = (strumTime + fullSustainLength) - conductor.songPosition
+            sustainLength = (strumTime + fullSustainLength) - conductor.timeWithDelta
         }
         if (sustainLength <= 10f) {
             visible = false
-            b.visible = false
-            c.visible = false
             return
         }
         visible = true
 
-        val half = Constants.STRUMLINE_SIZE / 2.0
         val graphicHeight = sustainHeightPx(sustainLength)
-        val bodyHeight = graphicHeight - bottomHeightPx
-        if (bodyHeight <= 1.0) {
-            b.visible = false
-            c.visible = false
+        if (graphicHeight <= 0.1) {
+            visible = false
             return
         }
-        b.visible = true
-        c.visible = true
 
-        // The point the tail hangs from is always the head's centre: the
-        // receptor centre once it is held, and the (moving) head centre while it
-        // is being approached. FNF computes a different `holdNote.y` for each
-        // scroll direction (`y`, and `y - height`), but the mesh's leading edge
-        // is `y` upscroll and `y + graphicHeight` downscroll, so the on-screen
-        // attachment is identical either way.
-        val attachY = if (clipping) {
-            strumlineY - Constants.INITIAL_OFFSET + half
+        val clipHeight = clipHeight()
+        val partHeight = clipHeight - bottomHeightPx
+        val topY = if (downscroll) clipHeight else graphicHeight - clipHeight
+        val bodyBottomY = if (partHeight > 0.0) {
+            if (downscroll) bottomHeightPx else topY + partHeight
         } else {
-            strumlineY - Constants.INITIAL_OFFSET + noteOffsetY(conductor) + half + yOffset
+            topY
         }
-        // The container only carries the lane's X; the Y is absolute, so the
-        // container must not offset it a second time.
-        y = 0.0
+        val capBottomY = if (downscroll) {
+            sheetHeight * (-bottomClip + endOffset) * zoom
+        } else {
+            graphicHeight + sheetHeight * (bottomClip - endOffset) * zoom
+        }
 
-        // The body hangs from the attachment, in the direction the note came
-        // from; the cap then closes the far end (`flipY` mirrors both in FNF).
-        val bodyTop = if (downscroll) attachY - bodyHeight else attachY
-        b.x = -widthPx / 2.0 - offsetX
-        b.y = bodyTop - offsetY
-        b.scaleX = widthPx / b.bitmap.width.toDouble().coerceAtLeast(1.0)
-        b.scaleY = bodyHeight / b.bitmap.height.toDouble().coerceAtLeast(1.0)
+        // Vertices: body top-left/right, body bottom-left/right, then the same
+        // four points for the cap. `flipY` in FNF is represented by the actual
+        // vertex order above, not by a negative view scale.
+        fun vertex(index: Int, x: Double, y: Double) {
+            vertices[index * 2] = x.toFloat()
+            vertices[index * 2 + 1] = y.toFloat()
+        }
+        vertex(0, 0.0, topY)
+        vertex(1, widthPx, topY)
+        vertex(2, 0.0, bodyBottomY)
+        vertex(3, widthPx, bodyBottomY)
+        vertex(4, 0.0, bodyBottomY)
+        vertex(5, widthPx, bodyBottomY)
+        vertex(6, 0.0, capBottomY)
+        vertex(7, widthPx, capBottomY)
 
-        // FNF draws the cap at its own uniform `zoom` over the top `bottomClip`
-        // of the column, so its height is `graphic.height * zoom * bottomClip`
-        // and the rounded end reaches
-        // `graphic.height * zoom * (bottomClip - endOffset)` past the body.
-        val capScreenHeight = c.bitmap.height.toDouble() * noteStyle.holdNoteScale.toDouble()
-        c.scaleX = noteStyle.holdNoteScale.toDouble()
-        c.scaleY = noteStyle.holdNoteScale.toDouble()
-        c.x = -widthPx / 2.0 - offsetX
-        c.y = (if (downscroll) bodyTop - capScreenHeight else bodyTop + bodyHeight) - offsetY
+        // UVs select body column `direction * 2` and cap column `direction * 2 + 1`
+        // from the eight-column sheet. The body's FNF V coordinate is negative
+        // for a full-length tail; clamping to the top row is what FNF gets from
+        // the texture sampler, and sampling row 0 directly avoids relying on the
+        // backend's wrap mode.
+        val u0 = (directionIndex % 4) / 4.0
+        val uBodyRight = u0 + 1.0 / 8.0
+        val uCapRight = uBodyRight + 1.0 / 8.0
+        val vCapTop = if (partHeight > 0.0) {
+            0.0
+        } else {
+            (bottomHeightPx - clipHeight) / zoom / sheetHeight
+        }
+
+        fun uv(index: Int, u: Double, v: Double) {
+            uvs[index * 2] = u.toFloat()
+            uvs[index * 2 + 1] = v.toFloat()
+        }
+        uv(0, u0, 0.0)
+        uv(1, uBodyRight, 0.0)
+        uv(2, u0, 0.0)
+        uv(3, uBodyRight, 0.0)
+        uv(4, uBodyRight, vCapTop)
+        uv(5, uCapRight, vCapTop)
+        uv(6, uBodyRight, bottomClip)
+        uv(7, uCapRight, bottomClip)
+
+        // The point the tail hangs from is always the head's centre. FNF's
+        // downscroll branch subtracts `holdNote.height`, so the same mesh is
+        // shifted up by its full length there.
+        val attachY = if (clipping) {
+            strumlineY - Constants.INITIAL_OFFSET + Constants.STRUMLINE_SIZE / 2.0
+        } else {
+            strumlineY - Constants.INITIAL_OFFSET + noteOffsetY(conductor) +
+                Constants.STRUMLINE_SIZE / 2.0 + yOffset
+        }
+        y = attachY - if (downscroll) graphicHeight else 0.0
+
+        mesh.updatedVertices()
     }
 
     fun kill() = removeFromParent()
@@ -357,11 +403,16 @@ class NoteSprite(
     fun releaseClip(conductor: Conductor? = null) {
         holdTrail?.let { trail ->
             if (trail.clipping && conductor != null) {
-                // FNF keeps a dropped hold visually where it had got to:
-                // `yOffset = (fullSustainLength - sustainLength) * PIXELS_PER_MS`.
-                val consumed = (trail.strumTime + trail.fullSustainLength) - conductor.songPosition
-                trail.yOffset =
+                // FNF keeps a dropped hold visually where it had got to. The
+                // upscroll branch shifts the sprite by the played part of the
+                // tail; downscroll does not, because the mesh's cap is on the
+                // other end (`Strumline.updateNotes` lines 693-711).
+                val consumed = (trail.strumTime + trail.fullSustainLength) - conductor.timeWithDelta
+                trail.yOffset = if (trail.downscroll) {
+                    0f
+                } else {
                     (trail.fullSustainLength - consumed.coerceAtLeast(0f)) * Constants.PIXELS_PER_MS
+                }
                 // The tail is cut back to what was actually played.
                 trail.sustainLength = consumed.coerceAtLeast(0f)
             }

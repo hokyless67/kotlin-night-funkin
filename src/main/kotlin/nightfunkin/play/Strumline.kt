@@ -85,7 +85,7 @@ class Strumline(
         val offsetX = offsets.getOrElse(0) { 0.0 }
         val offsetY = offsets.getOrElse(1) { 0.0 }
         for (i in 0 until Constants.KEY_COUNT) {
-            receptors[i] = Receptor(container, i, noteStyle).also {
+            receptors[i] = Receptor(container, i, noteStyle, isPlayer).also {
                 // Receptor, note head and tail all sit on the same lane centre.
                 // FNF spreads them by a few pixels (`INITIAL_OFFSET` on the
                 // receptor, `STRUMLINE_SIZE / 2` on the tail), which leaves the
@@ -249,8 +249,25 @@ class Strumline(
             // apart - the head is in the `notes` group and the tail in
             // `holdNotes` - while KNF hangs the tail off the head.
             if (note.isHoldNote && note.isHolding) {
+                // FNF's updateNotes calls holdConfirm for every active hold,
+                // on both strumlines. The player side additionally runs
+                // PlayScene.handleHolds for input/health, but the opponent has
+                // no other caller.
+                if (!isPlayer) holdConfirm(note.directionIndex)
                 val remaining = (note.strumTime + note.fullSustainLength) - now
-                if (remaining <= 0f) note.releaseClip(conductor)
+                if (remaining <= 0f) {
+                    note.releaseClip(conductor)
+                    // FNF only plays the cover's end animation on the player
+                    // strumline; opponent covers are hidden as soon as the hold
+                    // finishes.
+                    if (!isPlayer) {
+                        holdCovers[note.directionIndex]?.kill()
+                        holdCovers[note.directionIndex] = null
+                        // FNF's completed-hold branch: no key is held on the
+                        // opponent, so the receptor returns to its static pose.
+                        playStatic(note.directionIndex)
+                    }
+                }
             }
 
             // FNF recycles anything resolved (hit or missed) once it scrolls off.
@@ -307,11 +324,11 @@ class Strumline(
     fun isKeyHeld(direction: Int): Boolean = heldKeys[direction]
 
     /**
-     * FNF's `Strumline.hitNote`: the confirm animation plus the note splash.
+     * FNF's `Strumline.hitNote`: the confirm animation. Note splashes are
+     * separate and only play on a Sick hit (`HitNoteScriptEvent.doesNotesplash`).
      */
     fun hitNote(direction: Int) {
         receptors[direction]?.confirm()
-        playSplash(direction)
         // FNF forgives ghost taps for a moment after a hit.
         ghostTapTimer = Constants.GHOST_TAP_DELAY
     }
@@ -323,9 +340,11 @@ class Strumline(
     fun playNoteHoldCover(direction: Int) {
         val asset = noteStyle.holdCover(direction) ?: return
         // FNF: `this.noteHoldCovers.zIndex = 40;`
-        val cover = HoldCover(container, direction, asset, noteStyle).also { it.zIndex = 40.0 }
-        cover.laneX = xPos(direction)
-        cover.strumlineY = strumlineY.toDouble()
+        val cover = HoldCover(container, direction, asset, noteStyle).also {
+            container.addChild(it)
+            it.zIndex = 40.0
+        }
+        cover.setPosition(xPos(direction), strumlineY.toDouble())
         holdCovers[direction]?.kill()
         holdCovers[direction] = cover
     }
@@ -367,9 +386,9 @@ class Strumline(
      *
      * FNF plays a short 24 fps animation and kills the sprite when it ends, so
      * the splash is a brief flare at the receptor rather than something that
-     * drifts across the lane.
+     * drifts across the lane. PlayState only calls this for a Sick hit.
      */
-    private fun playSplash(direction: Int) {
+    fun playNoteSplash(direction: Int) {
         if (!noteStyle.splashEnabled) return
         val variants = noteStyle.splashVariants(direction)
         if (variants.isEmpty()) return
@@ -457,6 +476,12 @@ class Strumline(
         notes.clear()
         freeNotes.forEach { it.kill() }
         freeNotes.clear()
+        // FNF's `Strumline.clean()` also kills the hold covers and returns the
+        // receptors to their static pose.
+        holdCovers.forEach { it?.kill() }
+        holdCovers.fill(null)
+        heldKeys.fill(false)
+        receptors.forEach { it?.release() }
         nextNoteIndex = 0
     }
 
@@ -490,6 +515,7 @@ private class Receptor(
     private val host: Container,
     private val direction: Int,
     private val noteStyle: NoteStyle,
+    private val isPlayer: Boolean,
 ) {
     val container: Container = Container().also { host.addChild(it) }
 
@@ -507,8 +533,15 @@ private class Receptor(
     /**
      * FNF's `StrumlineNote.confirmHoldTimer`: how long the confirm pose is kept
      * after the confirm animation finished.
+     *
+     * For the player, FNF starts this timer when the animation finishes; for
+     * the opponent it starts when `playConfirm` is called. An active hold
+     * cancels it when `holdConfirm` switches to `confirm-hold`.
      */
     private var confirmTimer = -1.0
+
+    /** True while the player's confirm animation still has to finish. */
+    private var confirmWaitFinish = false
 
     private val image: Image = Container().let { _ ->
         // The image is a plain child of the lane container; each animation frame
@@ -600,9 +633,13 @@ private class Receptor(
 
     fun confirm() {
         setState("Confirm")
-        // FNF's `StrumlineNote.onAnimationFinished` starts a timer, and
-        // `update` falls back to the static pose once it runs out.
-        confirmTimer = 0.0
+        // FNF's `playConfirm`: on the opponent the timer starts immediately, on
+        // the player it starts when the confirm animation finishes
+        // (`onAnimationFinished`). Starting it immediately on the player makes
+        // a held note pulse twice: the timer expires while the hold is active,
+        // then `holdConfirm` restarts the confirm animation.
+        confirmWaitFinish = isPlayer && !finished
+        confirmTimer = if (isPlayer) -1.0 else 0.0
     }
 
     /** True while the receptor shows its idle pose. */
@@ -613,11 +650,29 @@ private class Receptor(
      * for as long as the hold note is being held.
      */
     fun holdConfirm() {
-        if (state == "Confirm" && finished) setState("ConfirmHold")
-        else if (state != "Confirm") setState("Confirm")
+        if (state == "ConfirmHold") return
+        if (state == "Confirm") {
+            if (finished) {
+                // Cancels the player's post-confirm timer so it does not drop
+                // back to static in the middle of a hold.
+                confirmWaitFinish = false
+                confirmTimer = -1.0
+                setState("ConfirmHold")
+            }
+        } else {
+            setState("Confirm")
+            // FNF's `holdConfirm` calls `playAnimation('confirm')` without
+            // setting the timer; the player's finish callback arms it.
+            if (isPlayer) {
+                confirmWaitFinish = !finished
+                confirmTimer = -1.0
+            }
+        }
     }
 
     fun release() {
+        confirmWaitFinish = false
+        confirmTimer = -1.0
         setState("Static")
     }
 
@@ -637,6 +692,10 @@ private class Receptor(
             }
             redraw()
         }
+        if (confirmWaitFinish && finished) {
+            confirmWaitFinish = false
+            confirmTimer = 0.0
+        }
         if (confirmTimer >= 0.0) {
             confirmTimer += dt
             // FNF's `CONFIRM_HOLD_TIME`: after the confirm glow, the receptor
@@ -644,6 +703,7 @@ private class Receptor(
             // puts it back on the pressed one if the key is still down.
             if (confirmTimer >= CONFIRM_HOLD_TIME) {
                 confirmTimer = -1.0
+                confirmWaitFinish = false
                 setState("Static")
             }
         }

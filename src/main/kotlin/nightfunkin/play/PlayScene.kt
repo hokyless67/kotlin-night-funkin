@@ -1446,6 +1446,11 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         // FNF's BF behaviour: strike the matching `singDIR` pose on every hit.
         if (note.isPlayerNote) player.sing(note.directionIndex, conductor.stepLengthMs.toDouble())
 
+        // FNF's `HitNoteScriptEvent.doesNotesplash` defaults to `daRating == 'sick'`,
+        // and PlayState only calls `playerStrumline.playNoteSplash` when that
+        // event flag is set. The opponent never gets a splash.
+        if (judgement == Judgement.SICK) playerStrumline.playNoteSplash(note.directionIndex)
+
         if (note.isHoldNote) {
             note.startClip()
             // FNF's `PlayState.processNoteHit`:
@@ -1514,7 +1519,12 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
                 opponentStrumline.hitNote(note.directionIndex)
                 // FNF's DAD behaviour: the CPU poses on every note it lands.
                 opponent.sing(note.directionIndex, conductor.stepLengthMs.toDouble())
-                if (note.isHoldNote) note.startClip()
+                if (note.isHoldNote) {
+                    note.startClip()
+                    // FNF's opponent branch mirrors the player strumline:
+                    // `opponentStrumline.playNoteHoldCover(note.holdNoteSprite);`
+                    opponentStrumline.playNoteHoldCover(note.directionIndex)
+                }
             }
         }
     }
