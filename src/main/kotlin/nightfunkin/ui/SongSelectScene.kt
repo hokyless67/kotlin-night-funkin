@@ -1,5 +1,6 @@
 package nightfunkin.ui
 
+import korlibs.image.bitmap.Bitmap
 import korlibs.image.bitmap.sliceWithSize
 import korlibs.image.color.Colors
 import korlibs.image.color.RGBA
@@ -105,6 +106,24 @@ class SongSelectScene : Scene() {
 
     private var headerBg: SolidRect? = null
     private var headerText: korlibs.korge.view.Text? = null
+    private var charHint: korlibs.korge.view.Text? = null
+
+    private var highscoreSprite: SparrowSprite? = null
+    private var scoreDigits: List<ScoreDigit> = emptyList()
+    private var clearBox: Image? = null
+    private var completionBitmap: Bitmap? = null
+    private val completionRects = HashMap<Int, IntArray>()
+    private var completionDigits: List<Image> = emptyList()
+    private var difficultyDots: List<Image> = emptyList()
+    private var albumStarsView: AnimateSpriteView? = null
+    private var starsAtlas: AnimateAtlas? = null
+
+    private var displayedScore = 0.0
+    private var targetScore = 0
+    private var displayedCompletion = 0.0
+    private var targetCompletion = 0.0
+    private var hintTimer = 0.0
+
     private lateinit var statusLine: korlibs.korge.view.Text
 
     private var statusTimer = 0.0
@@ -270,10 +289,12 @@ class SongSelectScene : Scene() {
         val bitmap = difficultyBitmap(currentDifficulty)
         difficultyView = bitmap?.let {
             Image(it).also { image ->
-                // `grpDifficulties` starts at x=-300 and tweens to x=90; the
-                // child sprite itself also tweens to x=90, so the final world
-                // position is 180. The source only changes the sprite's
-                // hitbox height (2.5x), not its graphic scale.
+                // `grpDifficulties` starts at x=-300 and tweens to x=90. The
+                // children are moved by the group setter, then each child is
+                // tweened to the same world x. FlxTypedSpriteGroup.x is only
+                // an offset holder, so the final rendered x is 90 (not 180).
+                // The source only changes the sprite's hitbox height (2.5x),
+                // not its graphic scale.
                 image.x = -300.0
                 image.y = 80.0
                 image.smoothing = false
@@ -357,6 +378,25 @@ class SongSelectScene : Scene() {
         ost.x = Constants.GAME_WIDTH - 8.0 - ost.width
         ost.y = 8.0
 
+        // FreeplayState's `charSelectHint`. KNF cycles variations rather than
+        // characters for now, so the wording describes the key that exists.
+        charHint = uiLayer.text(
+            "Press [ Q / E ] to change variations",
+            textSize = 32.0,
+            color = RGBA(0x5F, 0x5F, 0x5F),
+        ).also {
+            fiveBySeven?.let { font -> it.font = Resourceable.Fixed(font) }
+            it.x = 0.0
+            it.y = 18.0
+            it.alpha = 0.6
+        }
+
+        buildLetterSort()
+        buildHighscore()
+        buildScore()
+        buildClearBox()
+        buildDifficultyDots()
+
         // KNF-only status line for missing charts/assets; FNF has no HUD text
         // here, but keeping it invisible until something fails does not alter
         // the normal Freeplay layout.
@@ -366,8 +406,259 @@ class SongSelectScene : Scene() {
         statusLine.y = 700.0
     }
 
+    private fun buildLetterSort() {
+        val atlas = TextureAtlas.tryLoad("preload/images/freeplay/letterStuff.xml")
+        for (i in 0 until 5) {
+            val dark = when (i) {
+                0, 4 -> 0xAA
+                1, 3 -> 0x80
+                else -> 0xFF
+            }
+            val frame = when (i) {
+                0 -> atlas?.frame("# instance 10000")
+                1 -> atlas?.frame("fav instance 10000")
+                2 -> atlas?.frame("ALL instance 10000")
+                else -> null
+            }
+            if (frame != null && atlas != null) {
+                Image(atlas.slice(frame)).also {
+                    it.smoothing = false
+                    it.x = 400.0 + i * 80.0
+                    it.y = 65.0
+                    it.tint = RGBA(dark, dark, dark)
+                    uiLayer.addChild(it)
+                }
+            } else {
+                val label = when (i) {
+                    0 -> "#"
+                    1 -> "fav"
+                    2 -> "ALL"
+                    3 -> "A-B"
+                    else -> "C-D"
+                }
+                uiLayer.text(label, textSize = 36.0, color = RGBA(dark, dark, dark)).also {
+                    fiveBySeven?.let { font -> it.font = Resourceable.Fixed(font) }
+                    it.x = 400.0 + i * 80.0
+                    it.y = 65.0
+                }
+            }
+        }
+
+        // Separators and the two mini arrows are part of the letter strip in
+        // `LetterSort.hx`. They sit between the five slots.
+        val separator = KnfFiles.bitmapOrNull("preload/images/freeplay/seperator.png")
+        if (separator != null) {
+            for (i in 0 until 4) {
+                Image(separator).also {
+                    it.smoothing = false
+                    it.x = 460.0 + i * 80.0
+                    it.y = 95.0
+                    val shade = if (i == 1 || i == 2) 0x80 else 0xAA
+                    it.tint = RGBA(shade, shade, shade)
+                    uiLayer.addChild(it)
+                }
+            }
+        }
+        val arrow = KnfFiles.bitmapOrNull("preload/images/freeplay/miniArrow.png")
+        if (arrow != null) {
+            Image(arrow).also {
+                it.smoothing = false
+                it.x = 380.0
+                it.y = 90.0
+                it.scaleX = -1.0
+                it.alpha = 0.8
+                uiLayer.addChild(it)
+            }
+            Image(arrow).also {
+                it.smoothing = false
+                it.x = 780.0
+                it.y = 90.0
+                it.alpha = 0.8
+                uiLayer.addChild(it)
+            }
+        }
+    }
+
+    private fun buildHighscore() {
+        val atlas = TextureAtlas.tryLoad("preload/images/freeplay/highscore.xml") ?: return
+        val frames = atlas.framesByPrefix("highscore small instance 1")
+        if (frames.isEmpty()) return
+        highscoreSprite = SparrowSprite(atlas, frames, fps = 24.0, loop = false).also {
+            it.x = 860.0
+            it.y = 70.0
+            it.visible = false
+            uiLayer.addChild(it)
+        }
+    }
+
+    private fun buildScore() {
+        val atlas = TextureAtlas.tryLoad("preload/images/digital_numbers.xml") ?: return
+        val frames = numberFrames(atlas, "DIGITAL")
+        if (frames.isEmpty()) return
+        scoreDigits = (0 until 7).map { i ->
+            val frame = frames[0] ?: frames.values.first()
+            val image = Image(atlas.slice(frame)).also {
+                it.x = 927.0 + 45.0 * i
+                it.y = 60.0
+                it.scaleX = 0.4
+                it.scaleY = 0.4
+                it.visible = false
+                uiLayer.addChild(it)
+            }
+            ScoreDigit(image, atlas, frames)
+        }
+    }
+
+    private fun buildClearBox() {
+        clearBox = KnfFiles.bitmapOrNull("preload/images/freeplay/clearBox.png")?.let {
+            Image(it).also { image ->
+                image.x = 1165.0
+                image.y = 65.0
+                image.visible = false
+                uiLayer.addChild(image)
+            }
+        }
+
+        // `freeplay-clear.xml` points at the original Animate sheet name, but
+        // the shipped font PNG is split out as `freeplay-clear.png`. Parse the
+        // tiny digit sheet directly instead of relying on imagePath.
+        val bitmap = KnfFiles.bitmapOrNull("preload/images/fonts/freeplay-clear.png") ?: return
+        completionBitmap = bitmap
+        val rects = listOf(
+            intArrayOf(4, 4, 25, 24),
+            intArrayOf(33, 3, 10, 24),
+            intArrayOf(47, 3, 24, 24),
+            intArrayOf(75, 3, 24, 24),
+            intArrayOf(3, 32, 24, 24),
+            intArrayOf(32, 31, 24, 24),
+            intArrayOf(61, 31, 24, 24),
+            intArrayOf(90, 31, 24, 24),
+            intArrayOf(4, 59, 24, 24),
+            intArrayOf(32, 59, 24, 24),
+        )
+        for ((digit, rect) in rects.withIndex()) completionRects[digit] = rect
+        completionDigits = (0 until 3).map { i ->
+            Image(bitmap.sliceWithSize(4, 4, 25, 24)).also {
+                it.x = 1185.0 + 24.0 * i
+                it.y = 87.0
+                it.visible = false
+                uiLayer.addChild(it)
+            }
+        }
+    }
+
+    private fun buildDifficultyDots() {
+        val dot = KnfFiles.bitmapOrNull("preload/images/freeplay/seperator.png") ?: return
+        difficultyDots = (0 until 5).map { i ->
+            Image(dot).also {
+                it.smoothing = false
+                it.x = 260.0 - 14.7 * 4.0 + 30.0 * i - 75.0
+                it.y = 170.0
+                it.visible = false
+                uiLayer.addChild(it)
+            }
+        }
+    }
+
     private fun updateTopUi() {
         updateDifficultyVisual()
+        updateSelectionStats()
+        updateDifficultyDots()
+    }
+
+    private fun updateSelectionStats() {
+        val entry = selectedEntry()
+        if (entry == null) {
+            targetScore = 0
+            targetCompletion = 0.0
+            updateScoreVisual()
+            updateCompletionVisual()
+            updateAlbumStars()
+            return
+        }
+
+        val variation = resolvedVariation(entry)
+        val key = "${entry.song.id}:${currentDifficulty}:$variation"
+        targetScore = Save.highscore(key)
+        targetCompletion = Save.completion(key).coerceIn(0f, 1f).toDouble()
+        updateScoreVisual()
+        updateCompletionVisual()
+        updateAlbumStars()
+    }
+
+    private fun updateScoreVisual() {
+        var value = displayedScore.coerceIn(0.0, 9_999_999.0).toInt()
+        for (i in scoreDigits.indices.reversed()) {
+            scoreDigits[i].set(value % 10)
+            value /= 10
+        }
+    }
+
+    private fun updateCompletionVisual() {
+        val percent = kotlin.math.floor(displayedCompletion * 100.0).toInt().coerceIn(0, 100)
+        val text = percent.toString()
+        // AtlasText's right-alignment offsets from FreeplayState.update.
+        val offset = when (text.length) {
+            3 -> 10.0
+            1 -> -24.0
+            else -> 0.0
+        }
+        val baseX = 1185.0 - offset
+        for (i in completionDigits.indices) {
+            val image = completionDigits[i]
+            val digit = text.getOrNull(i)
+            image.visible = digit != null
+            image.x = baseX + 24.0 * i
+            if (digit != null) {
+                val rect = completionRects[digit - '0']
+                val bitmap = completionBitmap
+                if (rect != null && bitmap != null) {
+                    image.bitmap = bitmap.sliceWithSize(rect[0], rect[1], rect[2], rect[3])
+                }
+            }
+        }
+    }
+
+    private fun updateDifficultyDots() {
+        if (difficultyDots.isEmpty()) return
+        val full = listOf("easy", "normal", "hard", "erect", "nightmare")
+        val selectedIndex = full.indexOf(currentDifficulty)
+        val selectable = if (currentVariation == "erect") {
+            setOf("erect", "nightmare")
+        } else {
+            setOf("easy", "normal", "hard")
+        }
+        for ((i, dot) in difficultyDots.withIndex()) {
+            val available = full[i] in selectable
+            dot.visible = true
+            dot.alpha = if (available) 1.0 else 0.33
+            val shade = when {
+                i == selectedIndex -> 0xFA
+                available -> 0x48
+                else -> 0x12
+            }
+            dot.tint = RGBA(shade, shade, shade)
+        }
+    }
+
+    private fun numberFrames(
+        atlas: TextureAtlas,
+        suffix: String,
+    ): Map<Int, TextureAtlas.AtlasFrame> =
+        listOf("ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE")
+            .mapIndexedNotNull { index, name ->
+                atlas.framesByPrefix("$name $suffix").firstOrNull()?.let { index to it }
+            }.toMap()
+
+    private class ScoreDigit(
+        val image: Image,
+        private val atlas: TextureAtlas,
+        private val frames: Map<Int, TextureAtlas.AtlasFrame>,
+    ) {
+        fun set(value: Int) {
+            val frame = frames[value] ?: return
+            image.bitmap = atlas.slice(frame)
+        }
     }
 
     private fun updateDifficultyVisual() {
@@ -397,6 +688,7 @@ class SongSelectScene : Scene() {
             albumLayer.removeChildren()
             albumArt = null
             albumTitle = null
+            clearAlbumStars()
             return
         }
         val albumId = entry.song.metadataFor(resolvedVariation(entry)).playData.album ?: run {
@@ -404,14 +696,19 @@ class SongSelectScene : Scene() {
             albumLayer.removeChildren()
             albumArt = null
             albumTitle = null
+            clearAlbumStars()
             return
         }
-        if (shownAlbumId == albumId) return
+        if (shownAlbumId == albumId) {
+            updateAlbumStars()
+            return
+        }
 
         shownAlbumId = albumId
         albumLayer.removeChildren()
         albumArt = null
         albumTitle = null
+        clearAlbumStars()
 
         val info = FreeplayCatalog.albums[albumId] ?: return
         val art = KnfFiles.bitmapOrNull("preload/images/${info.artAsset}.png")
@@ -445,6 +742,40 @@ class SongSelectScene : Scene() {
                 }
             }
         }
+        updateAlbumStars()
+    }
+
+    private fun clearAlbumStars() {
+        albumStarsView?.let { albumLayer.removeChild(it) }
+        albumStarsView = null
+    }
+
+    /**
+     * `AlbumRoll.setDifficultyStars` / `DifficultyStars.hx`.
+     *
+     * The star sheet is a 1501-pose Animate timeline: rating 1 starts at pose
+     * 0, rating 15 at pose 1400, and rating 0 parks on the final pose, which is
+     * ten small white "empty rating" dots. Rendering the real pose also keeps
+     * the arc, scale and dot positions identical to the source.
+     */
+    private fun updateAlbumStars() {
+        clearAlbumStars()
+        val entry = selectedEntry() ?: return
+        val rating = (entry.song.metadataFor(resolvedVariation(entry))
+            .playData.ratings[currentDifficulty] ?: 0).coerceIn(0, 15)
+
+        val atlas = starsAtlas ?: runCatching {
+            AnimateAtlas("preload/images/freeplay/freeplayStars")
+        }.getOrNull()?.also { starsAtlas = it } ?: return
+
+        val pose = if (rating == 0) 1500 else (rating - 1) * 100
+        val view = AnimateSpriteView(atlas).also {
+            it.x = 950.0
+            it.y = 209.0
+            it.playFrames("difficulty-$rating", listOf(pose.coerceIn(0, atlas.poses.lastIndex)), false)
+            albumLayer.addChild(it)
+        }
+        albumStarsView = view
     }
 
     // ======================================================================
@@ -557,6 +888,7 @@ class SongSelectScene : Scene() {
         selected = ((selected + delta) % viewCapsules.size + viewCapsules.size) % viewCapsules.size
         updateSelectionPositions()
         updateAlbum()
+        updateSelectionStats()
         rememberSelection()
         scrollSound?.let { sfx.play(it, 0.4) }
         requestPreview()
@@ -780,7 +1112,25 @@ class SongSelectScene : Scene() {
             for (capsule in viewCapsules) capsule.update(d)
             for (selector in selectors) selector.update(d)
             albumTitle?.update(d)
+            highscoreSprite?.update(d)
             preview.update()
+
+            displayedScore += (targetScore - displayedScore) * 0.2
+            if (abs(targetScore - displayedScore) < 1.0) displayedScore = targetScore.toDouble()
+            displayedCompletion += (targetCompletion - displayedCompletion) * 0.5
+            if (abs(targetCompletion - displayedCompletion) < 0.005) {
+                displayedCompletion = targetCompletion
+            }
+            updateScoreVisual()
+            updateCompletionVisual()
+
+            charHint?.let { hint ->
+                hintTimer += d * 2.0
+                hint.alpha = 0.3 + 0.6 * ((sin(hintTimer) + 1.0) / 2.0)
+                if (hint.width > 0.0) {
+                    hint.x = (Constants.GAME_WIDTH - hint.width) / 2.0
+                }
+            }
 
             if (statusTimer > 0.0) {
                 statusTimer -= d
@@ -839,9 +1189,9 @@ class SongSelectScene : Scene() {
             difficultySlideElapsed += dt
             val t = (difficultySlideElapsed / 0.6).coerceIn(0.0, 1.0)
             val eased = 1.0 - (1.0 - t).pow(4.0)
-            difficultyView?.x = -300.0 + 480.0 * eased
+            difficultyView?.x = -300.0 + 390.0 * eased
             if (t >= 1.0) {
-                difficultyView?.x = 180.0
+                difficultyView?.x = 90.0
                 difficultySlideActive = false
             }
         }
@@ -881,6 +1231,14 @@ class SongSelectScene : Scene() {
 
         albumLayer.visible = true
         uiLayer.visible = true
+        highscoreSprite?.let {
+            it.visible = true
+            it.restart()
+        }
+        scoreDigits.forEach { it.image.visible = true }
+        clearBox?.visible = true
+        completionDigits.forEach { it.visible = true }
+        difficultyDots.forEach { it.visible = true }
         updateTopUi()
         updateAlbum()
         requestPreview()

@@ -14,6 +14,8 @@ data class SaveData(
     val volumes: Map<String, Float> = emptyMap(),
     val songRatings: Map<String, String> = emptyMap(),
     val highscores: Map<String, Int> = emptyMap(),
+    /** `Scoring.tallyCompletion` for the best/current clear, 0..1. */
+    val completions: Map<String, Float> = emptyMap(),
 )
 
 /**
@@ -95,4 +97,11 @@ object Save {
     }
 
     fun highscore(key: String): Int = data.highscores[key] ?: 0
+
+    fun setCompletion(key: String, value: Float) {
+        data = data.copy(completions = data.completions + (key to value.coerceIn(0f, 1f)))
+        save()
+    }
+
+    fun completion(key: String): Float = data.completions[key] ?: 0f
 }

@@ -1236,6 +1236,7 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         val previousBest = Save.highscore(scoreKey)
         val isNewHighscore = Save.submitHighscore(scoreKey, score)
         Save.setSongRating(scoreKey, rank.key)
+        Save.setCompletion(scoreKey, tallies.completion)
 
         if (avsyncDebug && avcount > 0) {
             val avg = avsum / avcount

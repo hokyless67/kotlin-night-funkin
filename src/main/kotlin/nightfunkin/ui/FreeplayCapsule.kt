@@ -3,6 +3,7 @@ package nightfunkin.ui
 import korlibs.image.color.Colors
 import korlibs.image.color.RGBA
 import korlibs.image.font.TtfFont
+import korlibs.image.paint.Stroke
 import korlibs.io.resources.Resourceable
 import korlibs.korge.view.Container
 import korlibs.korge.view.Image
@@ -57,6 +58,10 @@ internal class FreeplayCapsule(
         color = Colors.WHITE,
     ).also {
         fiveBySeven?.let { font -> it.font = Resourceable.Fixed(font) }
+        // CapsuleText gives the white text a cyan GlowFilter. KorGE's text
+        // stroke is the closest equivalent (and, unlike a second text view,
+        // it never changes the glyph metrics).
+        it.stroke = Stroke(CAPSULE_GLOW, 2.0)
         it.x = 159.12
         it.y = 45.0
     }
@@ -126,6 +131,10 @@ internal class FreeplayCapsule(
     private var appliedSelected: Boolean? = null
     private var appliedRankKey: String? = null
 
+    private var pixelIcon: Container? = null
+    private var pixelIconSprite: SparrowSprite? = null
+    private var pixelIconChar: String? = null
+
     var targetX = 0.0
         private set
     var targetY = 0.0
@@ -176,11 +185,13 @@ internal class FreeplayCapsule(
             weekText.visible = false
             rankSprite?.visible = false
             appliedRankKey = null
+            setPixelIcon(null)
             return
         }
 
         val metadata = song.metadataFor(variation)
         songText.text = metadata.songName
+        setPixelIcon(metadata.playData.characters.opponent)
 
         val bpm = metadata.timeChanges.firstOrNull()?.bpm?.toInt() ?: 100
         setBpm(bpm)
@@ -201,6 +212,7 @@ internal class FreeplayCapsule(
     fun update(dt: Double) {
         capsuleSprite?.update(dt)
         rankSprite?.update(dt)
+        pixelIconSprite?.update(dt)
         // Text bounds are only known after the first render.
         layoutWeekText()
 
@@ -288,6 +300,94 @@ internal class FreeplayCapsule(
     private fun setRatingVisible(value: Boolean) {
         difficultyLabel?.visible = value
         ratingDigits.forEach { it.image.visible = value }
+    }
+
+    /**
+     * `SongMenuItem`'s `PixelatedIcon`: a 50x50 (or 100x42) Sparrow frame,
+     * drawn at scale 2 with custom horizontal origins. The icon is not part of
+     * the 0.8-scaled capsule; it is a sibling child and keeps its fixed place
+     * while different capsule animation frames shift the backing graphic.
+     */
+    private fun setPixelIcon(character: String?) {
+        val old = pixelIcon
+        if (character == null) {
+            old?.visible = false
+            return
+        }
+        if (pixelIconChar == character && old != null) {
+            old.visible = true
+            return
+        }
+
+        val base = resolvePixelIconName(character)
+        if (base == null) {
+            old?.visible = false
+            pixelIconChar = character
+            return
+        }
+
+        if (old != null) {
+            removeChild(old)
+        }
+        pixelIcon = null
+        pixelIconSprite = null
+        pixelIconChar = character
+
+        val xmlPath = "$PIXEL_ICON_DIR/${base}pixel.xml"
+        val pngPath = "$PIXEL_ICON_DIR/${base}pixel.png"
+        val originX = when (character) {
+            "parents-christmas" -> 140.0
+            "sserafim-kazuha" -> 195.0
+            else -> 100.0
+        }
+
+        val wrapper = Container().also { addChild(it) }
+        val atlas = if (KnfFiles.exists(xmlPath)) TextureAtlas.tryLoad(xmlPath) else null
+        val idleFrames = atlas?.framesByPrefix("idle0").orEmpty()
+        if (atlas != null && idleFrames.isNotEmpty()) {
+            val frame = idleFrames.first()
+            val sprite = SparrowSprite(atlas, idleFrames, fps = 10.0, loop = true).also {
+                it.setPixelArt(true)
+                it.x = 0.0
+                it.y = 0.0
+                wrapper.addChild(it)
+            }
+            pixelIconSprite = sprite
+            wrapper.x = 160.0 - originX
+            wrapper.y = 35.0 - frame.logicalHeight / 2.0
+        } else {
+            val bitmap = KnfFiles.bitmapOrNull(pngPath)
+            if (bitmap == null) {
+                removeChild(wrapper)
+                return
+            }
+            Image(bitmap).also {
+                it.smoothing = false
+                it.x = 0.0
+                it.y = 0.0
+                wrapper.addChild(it)
+            }
+            wrapper.x = 160.0 - originX
+            wrapper.y = 35.0 - bitmap.height / 2.0
+        }
+        wrapper.scaleX = 2.0
+        wrapper.scaleY = 2.0
+        pixelIcon = wrapper
+    }
+
+    /** `PixelatedIcon.setCharacter`: progressively strip hyphenated suffixes. */
+    private fun resolvePixelIconName(character: String): String? {
+        val parts = character.split('-')
+        var name = ""
+        var lastValid: String? = null
+        for ((index, part) in parts.withIndex()) {
+            name += part
+            if (KnfFiles.exists("$PIXEL_ICON_DIR/${name}pixel.png")) {
+                lastValid = name
+            }
+            if (index < parts.lastIndex) name += '-'
+        }
+        return lastValid
     }
 
     private fun updateRank(difficulty: String, variation: String) {
@@ -396,6 +496,11 @@ internal class FreeplayCapsule(
 
         const val WEEK_TEXT_X = 291.0
         const val WEEK_TEXT_Y = 88.0
+
+        const val PIXEL_ICON_DIR = "preload/images/freeplay/icons"
+
+        /** bf.json `capsuleTextColors` / `CapsuleText`'s glow filter. */
+        val CAPSULE_GLOW = RGBA(0x00, 0xCC, 0xFF)
 
         val capsuleAtlas: TextureAtlas? by lazy {
             TextureAtlas.tryLoad(
