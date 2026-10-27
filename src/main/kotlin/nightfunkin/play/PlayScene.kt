@@ -201,7 +201,7 @@ class PlayScene : Scene() {
     /**
      * Puts a character on its stage slot using FNF's own arithmetic:
      * feet at `position`, minus half the timeline width and its full height,
-     * plus the per-character `offsets`, all scaled by `baseScale * stageScale`.
+     * with the per-character `offsets` applied by `Character.placeFeet`.
      */
     private fun placeCharacter(character: Character, slot: String): StageCharacterData {
         val data = stageFile.characterFor(slot)
@@ -732,15 +732,10 @@ class PlayScene : Scene() {
 
         override fun characterPosition(slot: String): Pair<Double, Double>? {
             val character = characterForSlot(slot) ?: return null
-            // Flixel's sprite `x` is always the visual left edge. `Character`
-            // stores the container origin, which sits at the right edge for
-            // mirrored sheets, so undo that here for cutscene scripts.
-            val left = if (character.scaleX < 0.0) {
-                character.x + character.localWidth * character.scaleX
-            } else {
-                character.x
-            }
-            return left to character.y
+            // FNF's `BaseCharacter.x`/`.y` is `originalPosition`, before the
+            // scaled global-offset nudge that `Bopper.getScreenPosition` adds
+            // only while drawing. Stage scripts read that x/y directly.
+            return character.stageX to character.stageY
         }
 
         override fun characterZIndex(slot: String): Int =

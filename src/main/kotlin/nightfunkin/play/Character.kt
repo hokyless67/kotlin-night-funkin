@@ -35,6 +35,13 @@ data class CharacterAnimationDef(
     val frameRate: Int? = null,
     val flipX: Boolean = false,
     val flipY: Boolean = false,
+    /**
+     * FNF's `Bopper.setAnimationOffsets`: source-pixel nudge applied while this
+     * animation is playing. Packer sheets (spirit) tile frames of different
+     * sizes at their own top-left, so a 256x256 `singDOWN` frame sits 64px
+     * right/down of a 128x128 idle frame unless this is subtracted.
+     */
+    val offsets: List<Double>? = null,
 )
 
 /**
@@ -175,6 +182,23 @@ class Character(val id: String) : Container() {
     private val anims: Map<String, Playback> = runCatching { loadAnimations() }.getOrElse { emptyMap() }
 
     /**
+     * Per-animation offsets from the character JSON, in source pixels.
+     *
+     * `Bopper.applyAnimationOffsets` swaps these when an animation starts and
+     * `Bopper.getScreenPosition` subtracts them after scaling. They are not
+     * part of the frame trim: spirit's `singDOWN` frames are 256x256 while its
+     * idle frames are 128x128, and the [65, 64] offset is what keeps the
+     * spirit's face anchored between the two.
+     */
+    private val animationOffsets: Map<String, Pair<Double, Double>> = data.animations
+        .mapNotNull { def ->
+            val offsets = def.offsets ?: return@mapNotNull null
+            if (offsets.size < 2) return@mapNotNull null
+            def.name to (offsets[0] to offsets[1])
+        }
+        .toMap()
+
+    /**
      * Legacy sheets have no timeline, so the bounds come from a single frame
      * instead: `SparrowCharacter` and `PackerCharacter` are plain `FlxSprite`s
      * carrying a frame collection, which makes `width`/`height` follow whatever
@@ -288,6 +312,20 @@ class Character(val id: String) : Container() {
      * every other slot honours its own flag. See [flipForSlot].
      */
     var flip: Boolean = data.flipX
+
+    /**
+     * FNF's `Bopper.originalPosition` - the sprite's `x`/`y` before the extra
+     * scaled global-offset term that `getScreenPosition` applies.
+     *
+     * Stage scripts read `character.x`/`.y`, which is this point, not the
+     * rendered top-left. Philly's Pico placement depends on that distinction.
+     */
+    private var originalX: Double = 0.0
+    private var originalY: Double = 0.0
+
+    /** Stage-script view of `character.x` / `getBoyfriend().x`. */
+    val stageX: Double get() = originalX
+    val stageY: Double get() = originalY
 
     /** FNF's `getBaseScale()`; `characters/<id>.json` defaults to 1. */
     val baseScale: Double get() = data.scale ?: 1.0
@@ -619,6 +657,14 @@ class Character(val id: String) : Container() {
         if (frames.isEmpty()) return
         val pose = poses.getOrNull(frames[frameIndex % frames.size]) ?: return
 
+        val (animOffsetX, animOffsetY) = currentAnim
+            ?.let { animationOffsets[it] }
+            ?: (0.0 to 0.0)
+        // `Bopper.getScreenPosition` subtracts the offset in screen space, even
+        // when the sheet is flipped. A mirrored container already reverses any
+        // local X shift, so flip its sign here to keep the screen-space result.
+        val localOffsetX = if (flip) animOffsetX else -animOffsetX
+
         while (images.size < pose.parts.size) {
             val img = Image(EMPTY_BITMAP, Anchor2D.CENTER)
             images += img
@@ -644,8 +690,8 @@ class Character(val id: String) : Container() {
             // origin to the sprite's own top-left. Without it every character is
             // drawn shifted by its bounding-box corner.
             val (cx, cy) = part.matrix.xform(def.width / 2.0, def.height / 2.0)
-            img.x = cx - originX
-            img.y = cy - originY
+            img.x = cx - originX + localOffsetX
+            img.y = cy - originY - animOffsetY
 
             // KGE builds `translation * rotation * scale`, i.e. `R * S`, whose
             // first column is `sx * (cos, sin)` and second is
@@ -681,36 +727,50 @@ class Character(val id: String) : Container() {
      * `Stage.addCharacter`:
      *
      * ```
-     * x = feetX - width/2 + offsets[0]
-     * y = feetY - height + offsets[1]
+     * originalPosition = feet - half the scaled sprite + offsets
+     * rendered position = originalPosition + offsets * scale
      * ```
      *
-     * where `width`/`height` are the timeline bounds times the scale.
+     * The second line is FNF's `Bopper.getScreenPosition`, which subtracts
+     * `(animOffsets - globalOffsets) * scale` from the sprite position. In
+     * other words [data.offsets] is added once unscaled when `setScale`
+     * repositions the character and once scaled while drawing.
      *
      * [applyOffsets] is false for the one scripted exception: GF's `onAdd`
      * repositions herself at the stage's `gf` point when she is the opponent,
      * and does so from `stagePos - characterOrigin` without adding her data
-     * offsets (see `assets/preload/scripts/characters/gf.hxc`).
+     * offsets (see `assets/preload/scripts/characters/gf.hxc`). The scaled
+     * `getScreenPosition` term still applies to her.
      */
     fun placeFeet(feetX: Double, feetY: Double, scale: Double, applyOffsets: Boolean = true) {
         val s = scale
         this.scaleX = s
         this.scaleY = s
-        val offsetX = if (applyOffsets) data.offsets.getOrElse(0) { 0.0 } else 0.0
-        val offsetY = if (applyOffsets) data.offsets.getOrElse(1) { 0.0 } else 0.0
-        val x = feetX - localWidth * s / 2.0 + offsetX
-        val y = feetY - localHeight * s + offsetY
+        val globalX = if (applyOffsets) data.offsets.getOrElse(0) { 0.0 } else 0.0
+        val globalY = if (applyOffsets) data.offsets.getOrElse(1) { 0.0 } else 0.0
+        val baseX = feetX - localWidth * s / 2.0
+        val baseY = feetY - localHeight * s
+
+        // FNF's `BaseCharacter.setScale` stores this in `originalPosition`.
+        originalX = baseX + globalX
+        originalY = baseY + globalY
+
+        // Draw at `originalPosition + globalOffsets * scale` because
+        // `Bopper.getScreenPosition` adds the scaled term on top.
+        val visualX = originalX + globalX * s
+        val visualY = originalY + globalY * s
+
         // A mirrored sheet is drawn around its own right edge, so the origin
-        // moves to `x + width` and `scaleX` goes negative - same shape as
+        // moves to `visualX + width` and `scaleX` goes negative - same shape as
         // Flixel's `matrix.scale(-1, 1); matrix.translate(bounds.width, 0)`.
         // See [flip] for why the player is usually *not* mirrored.
         if (flip) {
-            this.x = x + localWidth * s
+            this.x = visualX + localWidth * s
             this.scaleX = -s
         } else {
-            this.x = x
+            this.x = visualX
         }
-        this.y = y
+        this.y = visualY
     }
 
     /**
@@ -719,22 +779,21 @@ class Character(val id: String) : Container() {
      * Note it is the character's **middle**, not its feet, and both the
      * character's own `cameraOffsets` and the stage's are added on top:
      *
+     * ```haxe
+     * charCenterX = originalPosition.x + width / 2;
+     * charCenterY = originalPosition.y + height / 2;
+     * x = charCenterX + data.cameraOffsets[0] + stage.cameraOffsets[0];
      * ```
-     * x = originalPosition.x + width/2  + data.cameraOffsets[0] + stage.cameraOffsets[0]
-     * y = originalPosition.y + height/2 + data.cameraOffsets[1] + stage.cameraOffsets[1]
-     * ```
+     *
+     * `originalPosition` is [originalX]/[originalY], so it contains the
+     * unscaled global offset but not the extra scaled term that only affects
+     * drawing. The hitbox width/height are always positive, regardless of
+     * `flip`.
      */
     fun cameraFocusPoint(stageCameraOffsets: List<Double>): Pair<Double, Double> {
-        // `scaleX` is negative when the sheet is flipped (bf is), so the centre
-        // has to follow the sign - otherwise the focus lands a whole width to
-        // the wrong side and the camera flies off after a FocusCamera event.
-        //
-        // `Stage.addCharacter` stores `originalPosition` *after* `setScale`,
-        // so the per-character `_data.offsets` are already part of that point
-        // and are part of the focus too.
-        val cx = x + localWidth * scaleX / 2.0 +
+        val cx = originalX + localWidth * kotlin.math.abs(scaleX) / 2.0 +
             data.cameraOffsets.getOrElse(0) { 0.0 }
-        val cy = y + localHeight * scaleY / 2.0 +
+        val cy = originalY + localHeight * kotlin.math.abs(scaleY) / 2.0 +
             data.cameraOffsets.getOrElse(1) { 0.0 }
         return (cx + stageCameraOffsets.getOrElse(0) { 0.0 }) to
             (cy + stageCameraOffsets.getOrElse(1) { 0.0 })

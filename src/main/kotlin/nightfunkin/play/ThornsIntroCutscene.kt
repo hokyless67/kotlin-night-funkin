@@ -71,6 +71,8 @@ class ThornsIntroCutscene(private val host: CutsceneHost) : SongCutscene {
         if (atlas != null && senpaiFrames.isNotEmpty()) {
             val sprite = SparrowSprite(atlas, senpaiFrames, fps = 24.0, loop = false)
             sprite.playing = false
+            // `senpaiCrazy.antialiasing = false; pixelPerfectRender = true;`
+            sprite.setPixelArt(true)
             sprite.scaleX = Constants.PIXEL_ART_SCALE
             sprite.scaleY = Constants.PIXEL_ART_SCALE
             val frame = senpaiFrames.first()
@@ -182,6 +184,9 @@ class ThornsIntroCutscene(private val host: CutsceneHost) : SongCutscene {
     }
 
     private fun updateAnimation(dt: Double) {
+        // `senpaiCrazy.animation.play('idle')`: advance the 24 fps silhouette.
+        senpai?.update(dt)
+
         // Fade to white 3.2 s after the animation/sound start.
         if (!whiteStarted && !whiteDone && time - animationStart >= WHITE_DELAY) {
             whiteStarted = true

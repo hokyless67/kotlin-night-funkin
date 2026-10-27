@@ -79,6 +79,14 @@ class SparrowSprite(
         applyFrame(frameIndex)
     }
 
+    /**
+     * Applies nearest-neighbour sampling to the atlas image, matching Flixel's
+     * `antialiasing = false` / `pixelPerfectRender` on a Sparrow sprite.
+     */
+    fun setPixelArt(enabled: Boolean) {
+        image.setPixelArt(enabled)
+    }
+
     /** Number of frames in the current animation. */
     val frameCount: Int get() = frames.size
 

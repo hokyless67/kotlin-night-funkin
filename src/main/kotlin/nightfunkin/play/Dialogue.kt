@@ -311,6 +311,8 @@ class DialogueCutscene(
 
     private var backdropElapsed = 0.0
     private var backdropFadeTime = 0.0
+    /** Alpha encoded in the backdrop color; Korge's `View.alpha` overwrites `color.a`. */
+    private var backdropAlpha = 1.0
 
     private var music: MusicPlayer? = null
     private var musicPausedByMenu = false
@@ -512,6 +514,10 @@ class DialogueCutscene(
     private fun setupBackdrop(parent: Container, data: BackdropData?) {
         if (data == null || data.type != "solid") return
         val color = parseColor(data.color)
+        // `View.alpha` and `SolidRect.color` share the same Korge color
+        // transform: assigning `rect.alpha` would overwrite the alpha byte in
+        // `color`. Keep the color alpha separately and fold it into the fade.
+        backdropAlpha = color.a / 255.0
         val rect = parent.solidRect(
             Constants.GAME_WIDTH.toDouble(),
             Constants.GAME_HEIGHT.toDouble(),
@@ -519,19 +525,19 @@ class DialogueCutscene(
         )
         backdropFadeTime = data.fadeTime.coerceAtLeast(0.0)
         backdropElapsed = 0.0
-        rect.alpha = if (backdropFadeTime <= 0.0) 1.0 else 0.0
+        rect.alpha = if (backdropFadeTime <= 0.0) backdropAlpha else 0.0
         backdrop = rect
     }
 
     private fun updateBackdrop(dt: Double) {
         val rect = backdrop ?: return
         if (backdropFadeTime <= 0.0) {
-            rect.alpha = 1.0
+            rect.alpha = backdropAlpha
             return
         }
         backdropElapsed += dt
         val t = (backdropElapsed / backdropFadeTime).coerceIn(0.0, 1.0)
-        rect.alpha = floor(t * 10.0) / 10.0
+        rect.alpha = floor(t * 10.0) / 10.0 * backdropAlpha
     }
 
     private fun ensureBox(id: String) {
