@@ -64,5 +64,11 @@ suspend fun main() = Korge(
         )
     }
 
-    scenes.changeTo<LoadingScene>()
+    // Test hook for the menu itself (the normal route is Title -> Main -> Freeplay).
+    if (System.getenv("KNF_FREEPLAY") == "1") {
+        println("KNF: booting directly into Freeplay")
+        scenes.changeTo<SongSelectScene>()
+    } else {
+        scenes.changeTo<LoadingScene>()
+    }
 }

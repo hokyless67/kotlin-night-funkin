@@ -66,6 +66,9 @@ class TitleScene : Scene() {
     private var transitioning = false
     private var transitionElapsed = 0.0
     private var movedToMenu = false
+    private var leaving = false
+    private var leaveElapsed = 0.0
+    private var fadeOutRect: SolidRect? = null
 
     private var newgrounds: Image? = null
     private var newgroundsBitmap: Bitmap? = null
@@ -104,6 +107,15 @@ class TitleScene : Scene() {
         ).also {
             it.visible = false
             it.alpha = 1.0
+        }
+
+        // `FlxTransitionableState.defaultTransOut`: 0.7 s fade to black.
+        fadeOutRect = solidRect(
+            Constants.GAME_WIDTH.toDouble(),
+            Constants.GAME_HEIGHT.toDouble(),
+            Colors.BLACK,
+        ).also {
+            it.alpha = 0.0
         }
     }
 
@@ -259,12 +271,21 @@ class TitleScene : Scene() {
                 }
             }
 
-            if (transitioning) {
+            if (leaving) {
+                leaveElapsed += s
+                fadeOutRect?.alpha = (leaveElapsed / LEAVE_FADE).coerceIn(0.0, 1.0)
+                if (leaveElapsed >= LEAVE_FADE && !movedToMenu) {
+                    movedToMenu = true
+                    launch { sceneContainer.changeTo<MainMenuScene>() }
+                }
+            }
+
+            if (transitioning && !leaving) {
                 transitionElapsed += s
                 if (transitionElapsed >= CONFIRM_DELAY) moveToMenu()
             }
 
-            if (knfInput.accept) {
+            if (!leaving && knfInput.accept) {
                 if (playIntro && !introDone) {
                     // Before startIntro() FNF has not set `initialized` yet, so
                     // an early press cannot skip the credits.
@@ -317,9 +338,12 @@ class TitleScene : Scene() {
     }
 
     private fun moveToMenu() {
-        if (movedToMenu) return
-        movedToMenu = true
-        launch { sceneContainer.changeTo<MainMenuScene>() }
+        if (movedToMenu || leaving) return
+        // Start the default FNF transition: fade the title out to black, then
+        // MainMenuState fades in from black over one second.
+        leaving = true
+        leaveElapsed = 0.0
+        fadeOutRect?.alpha = 0.0
     }
 
     private fun updateIntro(elapsed: Double) {
@@ -431,6 +455,9 @@ class TitleScene : Scene() {
 
         /** `new FlxTimer().start(2, ...)` after the confirm press. */
         private const val CONFIRM_DELAY = 2.0
+
+        /** `FlxTransitionableState.defaultTransOut` duration. */
+        private const val LEAVE_FADE = 0.7
     }
 }
 

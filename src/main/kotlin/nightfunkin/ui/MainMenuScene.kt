@@ -1,9 +1,12 @@
 package nightfunkin.ui
 
+import korlibs.image.color.Colors
 import korlibs.korge.scene.Scene
 import korlibs.korge.view.Image
 import korlibs.korge.view.SContainer
+import korlibs.korge.view.SolidRect
 import korlibs.korge.view.addUpdater
+import korlibs.korge.view.solidRect
 import kotlinx.coroutines.launch
 import nightfunkin.audio.MenuMusic
 import nightfunkin.audio.SfxPlayer
@@ -58,6 +61,10 @@ class MainMenuScene : Scene() {
     /** `freeplay.goBack` restarts freakyMenu from the top with a 4 s fade-in. */
     private var musicFadeInElapsed = -1.0
 
+    /** `FlxTransitionableState.defaultTransIn`: 1 s fade from black. */
+    private var fadeInRect: SolidRect? = null
+    private var fadeInElapsed = 0.0
+
     override suspend fun SContainer.sceneInit() {
         buildBackground()
         buildMenuItems()
@@ -78,6 +85,12 @@ class MainMenuScene : Scene() {
 
         loadSounds()
         loadAndStartMusic()
+
+        fadeInRect = solidRect(
+            Constants.GAME_WIDTH.toDouble(),
+            Constants.GAME_HEIGHT.toDouble(),
+            Colors.BLACK,
+        ).also { it.alpha = 1.0 }
     }
 
     private fun SContainer.buildBackground() {
@@ -336,7 +349,15 @@ class MainMenuScene : Scene() {
                 music.volume = min(1.0, music.volume + 0.5 * d)
             }
 
-            handleInputs(knfInput)
+            if (fadeInElapsed < TRANSITION_FADE_IN) {
+                fadeInElapsed += d
+                fadeInRect?.alpha = (1.0 - fadeInElapsed / TRANSITION_FADE_IN)
+                    .coerceIn(0.0, 1.0)
+            }
+
+            if (fadeInElapsed >= TRANSITION_FADE_IN) {
+                handleInputs(knfInput)
+            }
         }
     }
 
@@ -371,5 +392,6 @@ class MainMenuScene : Scene() {
         const val ITEM_FLICKER_INTERVAL = 0.06
         const val MAGENTA_FLICKER_INTERVAL = 0.15
         const val MUSIC_FADE_IN_SECONDS = 4.0
+        const val TRANSITION_FADE_IN = 1.0
     }
 }
