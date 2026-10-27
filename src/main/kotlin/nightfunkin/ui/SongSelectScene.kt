@@ -103,12 +103,10 @@ class SongSelectScene : Scene() {
     private var albumTitle: SparrowSprite? = null
     private var shownAlbumId: String? = null
 
-    private lateinit var difficultyLine: korlibs.korge.view.Text
-    private lateinit var variationLine: korlibs.korge.view.Text
+    private var headerBg: SolidRect? = null
+    private var headerText: korlibs.korge.view.Text? = null
     private lateinit var statusLine: korlibs.korge.view.Text
-    private lateinit var hintLine: korlibs.korge.view.Text
 
-    private var time = 0.0
     private var statusTimer = 0.0
 
     private var upHold = 0.0
@@ -274,11 +272,10 @@ class SongSelectScene : Scene() {
             Image(it).also { image ->
                 // `grpDifficulties` starts at x=-300 and tweens to x=90; the
                 // child sprite itself also tweens to x=90, so the final world
-                // position is 180. See FreeplayState.onDJIntroDone.
+                // position is 180. The source only changes the sprite's
+                // hitbox height (2.5x), not its graphic scale.
                 image.x = -300.0
                 image.y = 80.0
-                image.scaleX = 2.5
-                image.scaleY = 2.5
                 image.smoothing = false
                 parent.addChild(image)
             }
@@ -342,64 +339,35 @@ class SongSelectScene : Scene() {
     // ======================================================================
 
     private fun buildTopUi() {
-        // `freeplayTxtBg`: the black plate behind the top-left heading.
-        uiLayer.solidRect(248.0, 64.0, Colors.BLACK).also {
+        // `freeplayTxtBg`: the black plate behind the top-left heading. FNF
+        // sizes it from the rendered FlxText, so use the Korge text bounds.
+        headerBg = uiLayer.solidRect(250.0, 72.0, Colors.BLACK).also {
             it.x = 0.0
             it.y = 0.0
         }
 
-        val headerShadow = uiLayer.text("FREEPLAY", textSize = 48.0, color = Colors.BLACK)
-        vcr?.let { headerShadow.font = Resourceable.Fixed(it) }
-        headerShadow.x = 10.0
-        headerShadow.y = 10.0
-
-        val header = uiLayer.text("FREEPLAY", textSize = 48.0, color = Colors.WHITE)
-        vcr?.let { header.font = Resourceable.Fixed(it) }
-        header.x = 8.0
-        header.y = 8.0
-
-        val ostShadow = uiLayer.text("OFFICIAL OST", textSize = 48.0, color = Colors.BLACK)
-        vcr?.let { ostShadow.font = Resourceable.Fixed(it) }
-        ostShadow.x = Constants.GAME_WIDTH - 10.0 - ostShadow.width
-        ostShadow.y = 10.0
+        headerText = uiLayer.text("FREEPLAY", textSize = 48.0, color = Colors.WHITE).also {
+            vcr?.let { font -> it.font = Resourceable.Fixed(font) }
+            it.x = 8.0
+            it.y = 8.0
+        }
 
         val ost = uiLayer.text("OFFICIAL OST", textSize = 48.0, color = Colors.WHITE)
         vcr?.let { ost.font = Resourceable.Fixed(it) }
         ost.x = Constants.GAME_WIDTH - 8.0 - ost.width
         ost.y = 8.0
 
-        difficultyLine = uiLayer.text("", textSize = 18.0, color = Colors["#C8C8D8"])
-        fiveBySeven?.let { difficultyLine.font = Resourceable.Fixed(it) }
-        difficultyLine.x = 8.0
-        difficultyLine.y = 64.0
-
-        variationLine = uiLayer.text("", textSize = 18.0, color = Colors["#9A9AB0"])
-        fiveBySeven?.let { variationLine.font = Resourceable.Fixed(it) }
-        variationLine.x = 8.0
-        variationLine.y = 88.0
-
+        // KNF-only status line for missing charts/assets; FNF has no HUD text
+        // here, but keeping it invisible until something fails does not alter
+        // the normal Freeplay layout.
         statusLine = uiLayer.text("", textSize = 20.0, color = Colors["#66FF66"])
         fiveBySeven?.let { statusLine.font = Resourceable.Fixed(it) }
         statusLine.x = 56.0
         statusLine.y = 700.0
-
-        hintLine = uiLayer.text("", textSize = 18.0, color = Colors["#7A7A90"])
-        fiveBySeven?.let { hintLine.font = Resourceable.Fixed(it) }
-        hintLine.x = 0.0
-        hintLine.y = 676.0
-        updateHint()
     }
 
     private fun updateTopUi() {
-        difficultyLine.text = "DIFFICULTY: ${currentDifficulty.uppercase()}"
-        variationLine.text = "VARIATION: ${currentVariation.uppercase()}   [Q/E]"
-        updateHint()
         updateDifficultyVisual()
-    }
-
-    private fun updateHint() {
-        hintLine.text = "UP/DOWN SONG    A/D DIFFICULTY    Q/E VARIATION    ENTER PLAY    ESC BACK"
-        hintLine.x = (Constants.GAME_WIDTH - hintLine.width) / 2.0
     }
 
     private fun updateDifficultyVisual() {
@@ -407,8 +375,6 @@ class SongSelectScene : Scene() {
         shownDifficulty = currentDifficulty
         val bitmap = difficultyBitmap(currentDifficulty) ?: return
         difficultyView?.bitmap = bitmap.sliceWithSize(0, 0, bitmap.width, bitmap.height)
-        difficultyView?.scaleX = 2.5
-        difficultyView?.scaleY = 2.5
         difficultyView?.visible = true
     }
 
@@ -451,10 +417,10 @@ class SongSelectScene : Scene() {
         val art = KnfFiles.bitmapOrNull("preload/images/${info.artAsset}.png")
         if (art != null) {
             albumArt = Image(art).also {
+                // AlbumRoll replaces the 262x262 `freeplayAlbum` symbol with
+                // the album graphic; it is not scaled.
                 it.x = 920.0
                 it.y = 220.0
-                it.scaleX = 1.37
-                it.scaleY = 1.37
                 albumLayer.addChild(it)
             }
         }
@@ -471,10 +437,10 @@ class SongSelectScene : Scene() {
                     fps = 24.0,
                     loop = true,
                 ).also {
+                    // AlbumRoll: FunkinSprite.createSparrow(width - 355, 500)
+                    // plus the album's title offsets. No scale.
                     it.x = 925.0 + offsetX
                     it.y = 500.0 + offsetY
-                    it.scaleX = 0.9
-                    it.scaleY = 0.9
                     albumLayer.addChild(it)
                 }
             }
@@ -552,7 +518,10 @@ class SongSelectScene : Scene() {
 
         if (initial) {
             viewCapsules.forEachIndexed { index, capsule ->
+                // SongMenuItem.initPosition(width, 0) + intendedY before the
+                // jump-in; only the horizontal position animates in.
                 capsule.x = Constants.GAME_WIDTH.toDouble()
+                capsule.y = capsule.targetY
                 capsule.startIntro(0.12 + index * 0.035)
             }
         }
@@ -792,11 +761,22 @@ class SongSelectScene : Scene() {
         val knfInput = KnfInput(keys)
         addUpdater { dt ->
             val d = dt.secondsDouble()
-            time += d
             knfInput.update()
 
             updateCard(d)
             updateDj(d)
+            // Korge computes Text bounds during the first render, so the
+            // FlxText-derived plate behind FREEPLAY is sized here.
+            headerBg?.let { bg ->
+                headerText?.let { txt ->
+                    if (txt.width > 0.0 && txt.height > 0.0) {
+                        bg.unscaledSize = korlibs.math.geom.Size(
+                            txt.width + 16.0,
+                            txt.height + 16.0,
+                        )
+                    }
+                }
+            }
             for (capsule in viewCapsules) capsule.update(d)
             for (selector in selectors) selector.update(d)
             albumTitle?.update(d)
@@ -806,8 +786,6 @@ class SongSelectScene : Scene() {
                 statusTimer -= d
                 if (statusTimer <= 0.0) statusLine.text = ""
             }
-
-            hintLine.alpha = (0.3 + 0.6 * ((sin(time * 2.0) + 1.0) / 2.0)).coerceIn(0.0, 0.9)
 
             if (leaving) {
                 leaveElapsed += d

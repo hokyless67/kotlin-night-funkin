@@ -37,6 +37,12 @@ internal class FreeplayCapsule(
     private val capsuleSprite: SparrowSprite? =
         if (atlas != null && selectedFrames.isNotEmpty()) {
             SparrowSprite(atlas, selectedFrames, fps = 24.0, loop = true).also {
+                // FlxSprite scales/rotates around its frame origin, which is
+                // centred by loadGraphic(). Compensate for the 0.8 scale here
+                // so the capsule visual lines up with the labels at the
+                // logical 612x132 frame coordinates.
+                it.x = CAPSULE_OFFSET_X
+                it.y = CAPSULE_OFFSET_Y
                 it.scaleX = REAL_SCALED
                 it.scaleY = REAL_SCALED
                 addChild(it)
@@ -51,7 +57,7 @@ internal class FreeplayCapsule(
         color = Colors.WHITE,
     ).also {
         fiveBySeven?.let { font -> it.font = Resourceable.Fixed(font) }
-        it.x = 159.0
+        it.x = 159.12
         it.y = 45.0
     }
 
@@ -65,15 +71,19 @@ internal class FreeplayCapsule(
         color = RGBA(0x21, 0x24, 0x2E),
     ).also {
         youreGone?.let { font -> it.font = Resourceable.Fixed(font) }
-        it.x = 291.0
-        it.y = 88.0
+        // FunkinSprite.setGraphicSize/scale scales around the centre. The
+        // position is adjusted in layoutWeekText() once the text size is known.
+        it.scaleX = 0.9
+        it.scaleY = 0.9
+        it.x = WEEK_TEXT_X
+        it.y = WEEK_TEXT_Y
         it.visible = false
     }
 
     private val bpmDigits: List<DigitView> = digitRow(
         smallNumbersAtlas,
         smallNumberFrames,
-        191.0,
+        185.0,
         88.5,
         count = 3,
         step = 11.0,
@@ -181,6 +191,7 @@ internal class FreeplayCapsule(
         val week = entry?.weekLabel
         weekText.text = week.orEmpty()
         weekText.visible = !week.isNullOrBlank()
+        layoutWeekText()
 
         updateRank(difficulty, variation)
         updateSelected()
@@ -190,6 +201,8 @@ internal class FreeplayCapsule(
     fun update(dt: Double) {
         capsuleSprite?.update(dt)
         rankSprite?.update(dt)
+        // Text bounds are only known after the first render.
+        layoutWeekText()
 
         if (!introFinished) {
             introClock += dt
@@ -222,7 +235,10 @@ internal class FreeplayCapsule(
         if (frames.isNotEmpty()) {
             capsuleSprite?.play(frames, restart = true)
         }
-        capsuleSprite?.x = if (currentlySelected) 0.0 else -5.0
+        // FlxSprite updates `offset.x = -5`, not `x`, when the capsule
+        // becomes unselected. A negative offset draws the graphic 5 px to the
+        // right, so add it on top of the centred-scale compensation.
+        capsuleSprite?.x = CAPSULE_OFFSET_X + if (currentlySelected) 0.0 else 5.0
         songText.alpha = if (currentlySelected) 1.0 else 0.6
         weekText.alpha = if (currentlySelected) 1.0 else 0.8
         bpmLabel?.alpha = if (currentlySelected) 1.0 else 0.8
@@ -247,8 +263,7 @@ internal class FreeplayCapsule(
         if (digits[2] == 1) tempShift -= 4.0
 
         for (i in bpmDigits.indices) {
-            bpmDigits[i].set(digits[i])
-            bpmDigits[i].image.x = shiftX + i * 11.0 + tempShift
+            bpmDigits[i].set(digits[i], shiftX + i * 11.0 + tempShift)
         }
     }
 
@@ -261,8 +276,7 @@ internal class FreeplayCapsule(
             value % 10,
         )
         for (i in ratingDigits.indices) {
-            ratingDigits[i].set(digits[i])
-            ratingDigits[i].image.x = 466.0 + i * 30.0
+            ratingDigits[i].set(digits[i], 466.0 + i * 30.0)
         }
     }
 
@@ -297,14 +311,30 @@ internal class FreeplayCapsule(
 
     private fun loadLabel(path: String, x: Double, y: Double): Image? {
         val bitmap = KnfFiles.bitmapOrNull("preload/images/$path.png") ?: return null
+        // FlxSprite.setGraphicSize(Std.int(width * 0.9)) with the default
+        // centre origin leaves a (1 - scale) / 2 inset on the left and top.
+        val scale = (bitmap.width * 0.9).toInt().toDouble() / bitmap.width
         return Image(bitmap).also {
             it.smoothing = false
-            it.x = x
-            it.y = y
-            it.scaleX = 0.9
-            it.scaleY = 0.9
+            it.x = x + bitmap.width * (1.0 - scale) / 2.0
+            it.y = y + bitmap.height * (1.0 - scale) / 2.0
+            it.scaleX = scale
+            it.scaleY = scale
             addChild(it)
         }
+    }
+
+    /**
+     * `FunkinSprite(291, 88)` + `scale.set(0.9, 0.9)` + the level's capsule
+     * title offsets. Flixel scales around the frame centre.
+     */
+    private fun layoutWeekText() {
+        if (!weekText.visible) return
+        val offsets = entry?.weekLabelOffsets.orEmpty()
+        val ox = offsets.getOrElse(0) { 0.0 }
+        val oy = offsets.getOrElse(1) { 0.0 }
+        weekText.x = WEEK_TEXT_X - ox + weekText.width * (1.0 - 0.9) / 2.0
+        weekText.y = WEEK_TEXT_Y - oy + weekText.height * (1.0 - 0.9) / 2.0
     }
 
     private fun digitRow(
@@ -319,13 +349,15 @@ internal class FreeplayCapsule(
         val valid = (0..9).mapNotNull { frames[it] }
         if (valid.isEmpty()) return emptyList()
 
+        val zero = frames[0] ?: valid.first()
+        val scale = (zero.logicalWidth * 0.9).toInt().toDouble() / zero.logicalWidth
         return (0 until count).map { index ->
-            val image = Image(atlas.slice(frames[0] ?: valid.first())).also {
+            val image = Image(atlas.slice(zero)).also {
                 it.smoothing = false
                 it.x = x + index * step
                 it.y = y
-                it.scaleX = 0.9
-                it.scaleY = 0.9
+                it.scaleX = scale
+                it.scaleY = scale
                 addChild(it)
             }
             DigitView(image, atlas, (0..9).associateWith { frames[it] })
@@ -337,14 +369,33 @@ internal class FreeplayCapsule(
         private val atlas: TextureAtlas,
         private val frames: Map<Int, TextureAtlas.AtlasFrame?>,
     ) {
-        fun set(value: Int) {
+        fun set(value: Int, left: Double) {
             val frame = frames[value] ?: return
             image.bitmap = atlas.slice(frame)
+            // CapsuleNumber.set_digit: offset.x -= 4 for 1 and -= 1 for 3.
+            image.x = left + when (value) {
+                1 -> 4.0
+                3 -> 1.0
+                else -> 0.0
+            }
         }
     }
 
     private companion object {
         const val REAL_SCALED = 0.8
+
+        /** Logical frame size of every capsule frame (`freeplayCapsule.xml`). */
+        const val CAPSULE_FRAME_WIDTH = 612.0
+        const val CAPSULE_FRAME_HEIGHT = 132.0
+
+        /** `origin = frame centre` shifted by the 0.8 scale. */
+        const val CAPSULE_OFFSET_X =
+            (CAPSULE_FRAME_WIDTH - CAPSULE_FRAME_WIDTH * REAL_SCALED) / 2.0
+        const val CAPSULE_OFFSET_Y =
+            (CAPSULE_FRAME_HEIGHT - CAPSULE_FRAME_HEIGHT * REAL_SCALED) / 2.0
+
+        const val WEEK_TEXT_X = 291.0
+        const val WEEK_TEXT_Y = 88.0
 
         val capsuleAtlas: TextureAtlas? by lazy {
             TextureAtlas.tryLoad(

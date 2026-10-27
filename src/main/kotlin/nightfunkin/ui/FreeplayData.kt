@@ -17,6 +17,7 @@ internal data class FreeplayLevel(
     val id: String,
     val name: String,
     val capsuleName: String?,
+    val capsuleTitleOffsets: List<Double>,
     val songs: List<String>,
 )
 
@@ -28,6 +29,10 @@ internal data class FreeplayEntry(
     /** `SongMenuItem.checkWeek`: explicit capsule title first, then the level id. */
     val weekLabel: String?
         get() = level?.let { it.capsuleName ?: formatLevelId(it.id) }
+
+    /** `Level.getCapsuleTitleOffsets()`, applied to the generated week text. */
+    val weekLabelOffsets: List<Double>
+        get() = level?.capsuleTitleOffsets.orEmpty()
 }
 
 /** Enough of the `data/ui/freeplay/albums` JSON files for the right-hand album roll. */
@@ -40,7 +45,10 @@ internal data class FreeplayAlbum(
 )
 
 @Serializable
-private data class LevelCapsuleJson(val name: String? = null)
+private data class LevelCapsuleJson(
+    val name: String? = null,
+    val offsets: List<Double> = emptyList(),
+)
 
 @Serializable
 private data class LevelJson(
@@ -127,6 +135,7 @@ internal object FreeplayCatalog {
                 id = id,
                 name = raw.name,
                 capsuleName = raw.capsule?.name?.takeIf { it.isNotBlank() },
+                capsuleTitleOffsets = raw.capsule?.offsets.orEmpty(),
                 songs = raw.songs,
             )
         }
