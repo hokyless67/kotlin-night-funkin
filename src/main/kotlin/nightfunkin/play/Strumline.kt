@@ -13,6 +13,7 @@ import nightfunkin.core.NoteStyle
 import nightfunkin.core.setPixelArt
 import nightfunkin.data.SongNoteData
 import nightfunkin.timing.Conductor
+import kotlin.math.sqrt
 
 /**
  * One lane: receptors, incoming notes and splashes.
@@ -62,6 +63,14 @@ class Strumline(
     private var ghostTapTimer = 0.0
 
     /**
+     * Intro fly-in (`Strumline.vwooshInNotes`): notes slide in from below (or
+     * above on downscroll) over half a second. `-1` means inactive.
+     */
+    private var vwooshElapsed = -1.0
+    private val vwooshDuration = 0.5
+    private val vwooshDistance = 200.0
+
+    /**
      * Lane-local y of the receptor line. Notes are children of the same
      * container, so this stays local — adding the lane's screen y on top of it
      * would count the offset twice.
@@ -98,6 +107,9 @@ class Strumline(
                 it.container.y = offsetY
                 // FNF: `this.strumlineNotes.zIndex = 10;`
                 it.container.zIndex = 10.0
+                // FNF's `fadeInArrows`: y -= 10, alpha = 0, then each arrow
+                // tweens back over 1s after a staggered 0.5s delay.
+                it.startIntro(i)
             }
         }
     }
@@ -143,6 +155,7 @@ class Strumline(
 
     fun update(conductor: Conductor, songStart: Float = 0f, dt: Double = 1.0 / 60.0) {
         spawnIncoming(conductor, songStart)
+        updateVwoosh(dt)
         updateNotes(conductor)
         if (ghostTapTimer > 0.0) {
             ghostTapTimer -= dt * 1000.0
@@ -166,6 +179,33 @@ class Strumline(
             if (heldKeys[dir] && receptor.isStatic) receptor.press()
             receptor.update(dt, heldKeys[dir])
             holdCovers[dir]?.update(dt)
+        }
+    }
+
+    /**
+     * FNF's `Strumline.vwooshInNotes`: force the first visible notes into
+     * existence, then slide them in from 200 px away. The countdown starts at
+     * the same time, so the arrows are already moving as the pre-roll begins.
+     */
+    fun vwooshInNotes(conductor: Conductor, songStart: Float = 0f) {
+        vwooshElapsed = 0.0
+        spawnIncoming(conductor, songStart)
+        val start = if (downscroll) -vwooshDistance else vwooshDistance
+        for (note in notes) note.vwooshOffsetY = start
+    }
+
+    private fun updateVwoosh(dt: Double) {
+        if (vwooshElapsed < 0.0) return
+        vwooshElapsed += dt
+        val t = (vwooshElapsed / vwooshDuration).coerceIn(0.0, 1.0)
+        val start = if (downscroll) -vwooshDistance else vwooshDistance
+        // FlxEase.expoOut: 1 - 2^(-10t).
+        val ease = 1.0 - Math.pow(2.0, -10.0 * t)
+        val offset = start * (1.0 - ease)
+        for (note in notes) note.vwooshOffsetY = offset
+        if (t >= 1.0) {
+            vwooshElapsed = -1.0
+            for (note in notes) note.vwooshOffsetY = 0.0
         }
     }
 
@@ -203,6 +243,7 @@ class Strumline(
         note.mayHit = false
         note.lowPriority = false
         note.judgement = null
+        note.vwooshOffsetY = 0.0
         note.visible = true
         note.showHead()
 
@@ -482,6 +523,7 @@ class Strumline(
         holdCovers.fill(null)
         heldKeys.fill(false)
         receptors.forEach { it?.release() }
+        vwooshElapsed = -1.0
         nextNoteIndex = 0
     }
 
@@ -542,6 +584,12 @@ private class Receptor(
 
     /** True while the player's confirm animation still has to finish. */
     private var confirmWaitFinish = false
+
+    /** FNF's `Strumline.fadeInArrow` animation state. */
+    private var introActive = false
+    private var introTime = 0.0
+    private var introDelay = 0.0
+    private var introBaseY = 0.0
 
     private val image: Image = Container().let { _ ->
         // The image is a plain child of the lane container; each animation frame
@@ -627,6 +675,35 @@ private class Receptor(
         image.setPixelArt(noteStyle.isPixel)
     }
 
+    /**
+     * FNF's `Strumline.fadeInArrow`: the receptor starts 10 px above its final
+     * position and invisible, then fades/slides in over one second. Arrows are
+     * staggered by 0.2 s after an initial 0.5 s delay.
+     */
+    fun startIntro(index: Int) {
+        introActive = true
+        introTime = 0.0
+        introDelay = 0.5 + 0.2 * index
+        introBaseY = container.y
+        container.alpha = 0.0
+        container.y = introBaseY - 10.0
+    }
+
+    private fun updateIntro(dt: Double) {
+        if (!introActive) return
+        introTime += dt
+        val t = ((introTime - introDelay) / 1.0).coerceIn(0.0, 1.0)
+        // FlxEase.circOut: sqrt(1 - (t - 1)^2).
+        val eased = sqrt(1.0 - (t - 1.0) * (t - 1.0))
+        container.alpha = eased
+        container.y = introBaseY - 10.0 + 10.0 * eased
+        if (t >= 1.0) {
+            introActive = false
+            container.alpha = 1.0
+            container.y = introBaseY
+        }
+    }
+
     fun press() {
         setState("Press")
     }
@@ -677,6 +754,7 @@ private class Receptor(
     }
 
     fun update(dt: Double, keyHeld: Boolean = false) {
+        updateIntro(dt)
         if (frames.size > 1 && !finished) {
             val step = 1.0 / noteStyle.strumFrameRate
             timer += dt

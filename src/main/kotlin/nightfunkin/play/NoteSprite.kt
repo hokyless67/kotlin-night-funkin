@@ -50,6 +50,9 @@ class SustainTrail(
     /** Set when a held note is released early, so the tail stays where it was. */
     var yOffset: Float = 0f
 
+    /** Intro fly-in offset (`vwooshInNotes`); 0 during normal gameplay. */
+    var vwooshOffsetY: Double = 0.0
+
     /**
      * FNF's `SustainTrail.setupHoldNoteGraphic`:
      *
@@ -239,7 +242,7 @@ class SustainTrail(
             strumlineY - Constants.INITIAL_OFFSET + Constants.STRUMLINE_SIZE / 2.0
         } else {
             strumlineY - Constants.INITIAL_OFFSET + noteOffsetY(conductor) +
-                Constants.STRUMLINE_SIZE / 2.0 + yOffset
+                Constants.STRUMLINE_SIZE / 2.0 + yOffset + vwooshOffsetY
         }
         y = attachY - if (downscroll) graphicHeight else 0.0
 
@@ -287,6 +290,9 @@ class NoteSprite(
     var laneX: Float = 0f
     var scrollSpeed: Float = 1f
     var downscroll: Boolean = false
+
+    /** Intro fly-in offset (`vwooshInNotes`); 0 during normal gameplay. */
+    var vwooshOffsetY: Double = 0.0
 
     var holdTrail: SustainTrail? = null
         private set
@@ -366,11 +372,12 @@ class NoteSprite(
     fun updatePosition(conductor: Conductor) {
         // FNF: `note.y = strumline.y - INITIAL_OFFSET + getNoteY(...)`. The note is
         // a child of the strumline, so only the lane-*local* part belongs here.
-        y = (strumlineY - Constants.INITIAL_OFFSET + noteOffsetY(conductor)).toDouble()
+        y = (strumlineY - Constants.INITIAL_OFFSET + noteOffsetY(conductor) + vwooshOffsetY).toDouble()
         holdTrail?.let {
             it.scrollSpeed = scrollSpeed
             it.downscroll = downscroll
             it.strumlineY = strumlineY
+            it.vwooshOffsetY = vwooshOffsetY
             it.updateGeometry(conductor)
         }
     }

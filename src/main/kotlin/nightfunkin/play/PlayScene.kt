@@ -593,6 +593,8 @@ class PlayScene : Scene() {
         chart.events.forEach { it.activated = false }
         nextEventIndex = 0
         conductor.update(prePosition, false)
+        playerStrumline.vwooshInNotes(conductor, startTimestampMs.toFloat())
+        opponentStrumline.vwooshInNotes(conductor, startTimestampMs.toFloat())
     }
 
     // ======================================================================
@@ -634,6 +636,8 @@ class PlayScene : Scene() {
         playerStrumline.setNoteData(chart.notes.filter { it.isPlayerNote })
         opponentStrumline.setNoteData(chart.notes.filter { !it.isPlayerNote })
         conductor.update(prePosition, false)
+        playerStrumline.vwooshInNotes(conductor, startTimestampMs.toFloat())
+        opponentStrumline.vwooshInNotes(conductor, startTimestampMs.toFloat())
     }
 
     /** FNF's `FlxTween.tween(camHUD, {alpha: 1.0}, ..., FlxEase.quadInOut)`. */
