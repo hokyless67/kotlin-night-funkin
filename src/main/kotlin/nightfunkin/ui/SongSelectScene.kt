@@ -5,6 +5,7 @@ import korlibs.image.bitmap.sliceWithSize
 import korlibs.image.color.Colors
 import korlibs.image.color.RGBA
 import korlibs.image.font.TtfFont
+import korlibs.image.paint.Stroke
 import korlibs.io.resources.Resourceable
 import korlibs.korge.blend.BlendMode
 import korlibs.korge.scene.Scene
@@ -12,9 +13,11 @@ import korlibs.korge.view.Container
 import korlibs.korge.view.Image
 import korlibs.korge.view.SContainer
 import korlibs.korge.view.SolidRect
+import korlibs.korge.view.Text
 import korlibs.korge.view.addUpdater
 import korlibs.korge.view.solidRect
 import korlibs.korge.view.text
+import kotlin.math.ceil
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -43,9 +46,10 @@ import kotlin.math.sin
  * the pink backing card slides in, BF runs his turntable intro, and the song
  * capsules arc down the left side while the album art sits on the right.
  *
- * KNF has no character-select substate yet, so the default `bf` Freeplay style
- * is used. Q/E still cycle song variations (default/erect/pico/bf), preserving
- * the behaviour of the previous song list.
+ * KNF has no character-select substate yet, so Pico stays marked as unseen and
+ * Freeplay uses FNF's `NewCharacterCard`, exactly like a fresh 0.8.6 save. Q/E
+ * still cycle song variations (default/erect/pico/bf), preserving the previous
+ * song-list behaviour.
  */
 class SongSelectScene : Scene() {
 
@@ -82,6 +86,20 @@ class SongSelectScene : Scene() {
     private var backingImage: Image? = null
     private var orangeStrip: SolidRect? = null
     private var orangeStripLeft: SolidRect? = null
+
+    // `NewCharacterCard` (the stock first-run card because Pico is unlocked
+    // but not yet seen in Character Select).
+    private var newCharacterCard = false
+    private var newCardGroup: Container? = null
+    private var newCardLight1: Image? = null
+    private var newCardLight2: Image? = null
+    private var newCardLight3: Image? = null
+    private var newCardMultiply1: Image? = null
+    private var newCardMultiply2: Image? = null
+    private var newCardYellow: Image? = null
+    private var newCardTimer = 0.0
+    private val newCardBands = ArrayList<BackingScrollBand>()
+
     private var cardSlideElapsed = 0.0
     private var cardSlideFinished = false
     private var glowElapsed = 0.0
@@ -138,6 +156,7 @@ class SongSelectScene : Scene() {
 
     override suspend fun SContainer.sceneInit() {
         Save.load()
+        newCharacterCard = Save.hasNewCharacter()
         fiveBySeven = loadFont("fonts/5by7.ttf")
         youreGone = loadFont("fonts/YoureGone-Regular.otf")
         vcr = loadFont("fonts/vcr.ttf")
@@ -225,15 +244,19 @@ class SongSelectScene : Scene() {
         }
 
         val width = pinkBack?.let { it.bitmap.width.toDouble() } ?: 524.0
-        orangeStrip = cardLayer.solidRect(width, 75.0, RGBA(0xFE, 0xDA, 0x00)).also {
-            it.x = 84.0
-            it.y = 440.0
-            it.visible = false
-        }
-        orangeStripLeft = cardLayer.solidRect(100.0, 75.0, RGBA(0xFF, 0xD4, 0x00)).also {
-            it.x = 0.0
-            it.y = 440.0
-            it.visible = false
+        if (newCharacterCard) {
+            buildNewCharacterCard()
+        } else {
+            orangeStrip = cardLayer.solidRect(width, 75.0, RGBA(0xFE, 0xDA, 0x00)).also {
+                it.x = 84.0
+                it.y = 440.0
+                it.visible = false
+            }
+            orangeStripLeft = cardLayer.solidRect(100.0, 75.0, RGBA(0xFF, 0xD4, 0x00)).also {
+                it.x = 0.0
+                it.y = 440.0
+                it.visible = false
+            }
         }
 
         // BackingCard adds the glow last and uses additive blending, so it sits
@@ -248,6 +271,84 @@ class SongSelectScene : Scene() {
                 cardLayer.addChild(it)
             }
         }
+    }
+
+    /**
+     * `NewCharacterCard` from 0.8.6. A stock save has Pico unlocked but not
+     * seen in Character Select, so this is the card the real Freeplay menu
+     * shows on its first visit.
+     */
+    private fun buildNewCharacterCard() {
+        val group = Container().also {
+            it.visible = false
+            cardLayer.addChild(it)
+        }
+        newCardGroup = group
+
+        fun addImage(path: String, x: Double, y: Double, blend: BlendMode? = null): Image? {
+            val bitmap = KnfFiles.bitmapOrNull("preload/images/freeplay/backingCards/newCharacter/$path")
+                ?: return null
+            return Image(bitmap).also {
+                it.x = x
+                it.y = y
+                if (blend != null) it.blendMode = blend
+                group.addChild(it)
+            }
+        }
+
+        addImage("darkback.png", 0.0, 0.0)
+
+        // The six `BGScrollingText` lines, top to bottom.
+        buildBackingBand(group, 0.0, 163.0, "COULD IT BE A NEW FRIEND? OR FOE??", 1280.0, RGBA(0x13, 0x93, 0x76), 43.0, -4.0)
+        buildBackingBand(group, -440.0, 215.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0)
+        buildBackingBand(group, 0.0, 286.0, "SOMEONE'S WAITING!", 640.0, RGBA(0x40, 0xEA, 0x84), 43.0, -2.0)
+        buildBackingBand(group, -220.0, 331.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0)
+        buildBackingBand(group, 0.0, 402.0, "COULD IT BE A NEW FRIEND? OR FOE??", 1280.0, RGBA(0x13, 0x93, 0x76), 43.0, -4.0)
+        buildBackingBand(group, 0.0, 458.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0)
+
+        addImage("multiplyBar.png", -10.0, 440.0, BlendMode.MULTIPLY)
+
+        // The pulsing light/multiply stack that turns the card yellow/red.
+        newCardLight1 = addImage("orange gradient.png", -360.0, 230.0, BlendMode.ADD)
+        newCardMultiply1 = addImage("red.png", -15.0, -125.0, BlendMode.MULTIPLY)
+        newCardMultiply2 = addImage("red.png", -15.0, -125.0, BlendMode.MULTIPLY)
+        newCardLight2 = addImage("orange gradient.png", -360.0, 230.0, BlendMode.ADD)
+        newCardYellow = addImage("yellow bg piece.png", 0.0, 0.0, BlendMode.MULTIPLY)
+        newCardLight3 = addImage("red gradient.png", -360.0, 290.0, BlendMode.ADD)
+    }
+
+    private fun buildBackingBand(
+        parent: Container,
+        x: Double,
+        y: Double,
+        text: String,
+        widthLimit: Double,
+        color: RGBA,
+        textSize: Double,
+        speed: Double,
+    ) {
+        val holder = Container().also {
+            it.x = x
+            it.y = y
+            parent.addChild(it)
+        }
+
+        fun makeCopy(): Text = holder.text(text, textSize = textSize, color = color).also {
+            fiveBySeven?.let { font -> it.font = Resourceable.Fixed(font) }
+            it.stroke = Stroke(color, 1.0)
+            it.y = 0.0
+        }
+
+        val first = makeCopy()
+        first.x = 0.0
+        val textWidth = if (first.width > 0.0) first.width.toDouble() else textSize * text.length * 0.55
+        val needed = max(1, ceil(widthLimit / textWidth).toInt() + 1)
+        val copies = ArrayList<Text>(needed)
+        copies += first
+        for (i in 1 until needed) {
+            copies += makeCopy().also { it.x = i * (textWidth + 20.0) }
+        }
+        newCardBands += BackingScrollBand(holder, copies, textWidth, 20.0, speed)
     }
 
     private fun buildDj(parent: Container) {
@@ -360,6 +461,14 @@ class SongSelectScene : Scene() {
     // ======================================================================
 
     private fun buildTopUi() {
+        // `overhangStuff` is a full-width black strip. It is 164 px tall but
+        // parked at y=-100, so exactly 64 px remain visible above every other
+        // Freeplay layer.
+        uiLayer.solidRect(Constants.GAME_WIDTH.toDouble(), 164.0, Colors.BLACK).also {
+            it.x = 0.0
+            it.y = -100.0
+        }
+
         // `freeplayTxtBg`: the black plate behind the top-left heading. FNF
         // sizes it from the rendered FlxText, so use the Korge text bounds.
         headerBg = uiLayer.solidRect(250.0, 72.0, Colors.BLACK).also {
@@ -378,15 +487,16 @@ class SongSelectScene : Scene() {
         ost.x = Constants.GAME_WIDTH - 8.0 - ost.width
         ost.y = 8.0
 
-        // FreeplayState's `charSelectHint`. KNF cycles variations rather than
-        // characters for now, so the wording describes the key that exists.
+        // FreeplayState's `charSelectHint`. A stock save has both BF and Pico
+        // unlocked, so FNF adds this line (`countUnlockedCharacters() > 1`).
         charHint = uiLayer.text(
-            "Press [ Q / E ] to change variations",
+            "Press [ TAB ] to change characters",
             textSize = 32.0,
             color = RGBA(0x5F, 0x5F, 0x5F),
         ).also {
             fiveBySeven?.let { font -> it.font = Resourceable.Fixed(font) }
-            it.x = 0.0
+            // FlxText(-40, 18, GAME_WIDTH - 16) with CENTER alignment.
+            it.x = -40.0 + (Constants.GAME_WIDTH - 16.0 - it.width) / 2.0
             it.y = 18.0
             it.alpha = 0.6
         }
@@ -420,11 +530,17 @@ class SongSelectScene : Scene() {
                 2 -> atlas?.frame("ALL instance 10000")
                 else -> null
             }
+            // `LetterSort` scales every slot except ALL to 0.8 around the
+            // sprite centre. Compensate for that centre-origin shift so the
+            // rendered left/top edge matches Flixel's screen position.
+            val scale = if (i == 2) 1.0 else 0.8
             if (frame != null && atlas != null) {
                 Image(atlas.slice(frame)).also {
                     it.smoothing = false
-                    it.x = 400.0 + i * 80.0
-                    it.y = 65.0
+                    it.scaleX = scale
+                    it.scaleY = scale
+                    it.x = 400.0 + i * 80.0 + (1.0 - scale) * frame.logicalWidth / 2.0
+                    it.y = 65.0 + (1.0 - scale) * frame.logicalHeight / 2.0
                     it.tint = RGBA(dark, dark, dark)
                     uiLayer.addChild(it)
                 }
@@ -436,10 +552,12 @@ class SongSelectScene : Scene() {
                     3 -> "A-B"
                     else -> "C-D"
                 }
-                uiLayer.text(label, textSize = 36.0, color = RGBA(dark, dark, dark)).also {
+                uiLayer.text(label, textSize = 50.0, color = RGBA(dark, dark, dark)).also {
                     fiveBySeven?.let { font -> it.font = Resourceable.Fixed(font) }
-                    it.x = 400.0 + i * 80.0
-                    it.y = 65.0
+                    it.scaleX = scale
+                    it.scaleY = scale
+                    it.x = 400.0 + i * 80.0 + (1.0 - scale) * 25.0
+                    it.y = 65.0 + (1.0 - scale) * 25.0
                 }
             }
         }
@@ -1195,6 +1313,40 @@ class SongSelectScene : Scene() {
                 difficultySlideActive = false
             }
         }
+
+        if (newCharacterCard) updateNewCharacterCard(dt)
+
+        // FreeplayState.update: hintTimer += elapsed * 2;
+        // charSelectHint.alpha = lerp(0.3, 0.9, (sin(hintTimer) + 1) / 2).
+        hintTimer += dt * 2.0
+        charHint?.alpha = lerp(0.3, 0.9, (sin(hintTimer) + 1.0) / 2.0)
+    }
+
+    private fun updateNewCharacterCard(dt: Double) {
+        newCardTimer += dt * 2.0
+        val s = (sin(newCardTimer) + 1.0) / 2.0
+
+        newCardLight1?.alpha = lerp(0.4, 1.0, s)
+        newCardLight2?.alpha = lerp(0.2, 0.5, s)
+        newCardLight3?.alpha = lerp(0.1, 0.7, s)
+        newCardMultiply1?.alpha = lerp(1.0, 0.21, s)
+        newCardMultiply2?.alpha = lerp(1.0, 0.21, s)
+        newCardYellow?.alpha = lerp(0.2, 0.72, s)
+
+        // `angleMaskShader.extraColor` multiplies the backing image.
+        backingImage?.tint = mixColor(0x2E2E46, 0x60607B, s)
+        newCardBands.forEach { it.update(dt) }
+    }
+
+    private fun lerp(a: Double, b: Double, t: Double): Double = a + (b - a) * t
+
+    private fun mixColor(a: Int, b: Int, t: Double): RGBA {
+        fun channel(shift: Int): Int {
+            val ca = (a shr shift) and 0xFF
+            val cb = (b shr shift) and 0xFF
+            return (ca + (cb - ca) * t).toInt().coerceIn(0, 255)
+        }
+        return RGBA(channel(16), channel(8), channel(0))
     }
 
     private fun updateDj(dt: Double) {
@@ -1212,9 +1364,15 @@ class SongSelectScene : Scene() {
     private fun onDjIntroDone() {
         if (djIntroDone) return
         djIntroDone = true
-        pinkBack?.tint = RGBA(0xFF, 0xD8, 0x63)
-        orangeStrip?.visible = true
-        orangeStripLeft?.visible = true
+        if (newCharacterCard) {
+            // NewCharacterCard keeps the pink plate underneath; its yellow and
+            // red multiply passes create the in-game card colour.
+            newCardGroup?.visible = true
+        } else {
+            pinkBack?.tint = RGBA(0xFF, 0xD8, 0x63)
+            orangeStrip?.visible = true
+            orangeStripLeft?.visible = true
+        }
         glowActive = true
         glowElapsed = 0.0
         cardGlow?.alpha = 1.0
@@ -1319,5 +1477,46 @@ class SongSelectScene : Scene() {
         private var rememberedSongId: String? = "tutorial"
         private var rememberedDifficulty = Constants.DEFAULT_DIFFICULTY
         private var rememberedVariation = Constants.DEFAULT_VARIATION
+    }
+}
+
+/**
+ * Kotlin equivalent of FNF's `BGScrollingText`: a row of identical text
+ * copies that scrolls horizontally and wraps seamlessly.
+ */
+private class BackingScrollBand(
+    val container: Container,
+    val copies: List<Text>,
+    val textWidth: Double,
+    val placementOffset: Double,
+    var speed: Double,
+) {
+    private val positions = copies.map { it.x }.toMutableList()
+
+    fun update(dt: Double) {
+        if (dt <= 0.0) return
+        val step = speed * (dt / (1.0 / 60.0))
+        for (i in positions.indices) positions[i] -= step
+
+        if (speed > 0.0) {
+            var last = positions.maxOrNull() ?: 0.0
+            for (i in positions.indices) {
+                if (positions[i] < -textWidth) {
+                    positions[i] = last + textWidth + placementOffset
+                    last = positions[i]
+                }
+            }
+        } else if (speed < 0.0) {
+            var first = positions.minOrNull() ?: 0.0
+            for (i in positions.indices) {
+                if (positions[i] > textWidth * 2.0) {
+                    positions[i] = first - textWidth - placementOffset
+                    first = positions[i]
+                }
+            }
+        }
+
+        positions.sort()
+        for (i in copies.indices) copies[i].x = positions[i]
     }
 }

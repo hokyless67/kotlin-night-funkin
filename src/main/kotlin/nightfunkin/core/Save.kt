@@ -16,6 +16,14 @@ data class SaveData(
     val highscores: Map<String, Int> = emptyMap(),
     /** `Scoring.tallyCompletion` for the best/current clear, 0..1. */
     val completions: Map<String, Float> = emptyMap(),
+    /**
+     * FNF's `save.data.unlocks.charactersSeen`. A fresh 0.8.6 save has only
+     * Boyfriend marked as seen; Pico is unlocked in the stock data, so the
+     * first Freeplay visit uses `NewCharacterCard`.
+     */
+    val charactersSeen: List<String> = listOf("bf"),
+    /** Stock 0.8.6 player registry unlocks. */
+    val unlockedCharacters: List<String> = listOf("bf", "pico"),
 )
 
 /**
@@ -99,9 +107,16 @@ object Save {
     fun highscore(key: String): Int = data.highscores[key] ?: 0
 
     fun setCompletion(key: String, value: Float) {
-        data = data.copy(completions = data.completions + (key to value.coerceIn(0f, 1f)))
+        val best = maxOf(data.completions[key] ?: 0f, value.coerceIn(0f, 1f))
+        data = data.copy(completions = data.completions + (key to best))
         save()
     }
 
     fun completion(key: String): Float = data.completions[key] ?: 0f
+
+    /** Mirrors `PlayerRegistry.hasNewCharacter()`. */
+    fun hasNewCharacter(): Boolean =
+        data.unlockedCharacters.any { it !in data.charactersSeen }
+
+    fun countUnlockedCharacters(): Int = data.unlockedCharacters.size
 }

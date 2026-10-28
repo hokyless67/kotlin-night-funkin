@@ -252,9 +252,6 @@ internal class FreeplayCapsule(
         // right, so add it on top of the centred-scale compensation.
         capsuleSprite?.x = CAPSULE_OFFSET_X + if (currentlySelected) 0.0 else 5.0
         songText.alpha = if (currentlySelected) 1.0 else 0.6
-        weekText.alpha = if (currentlySelected) 1.0 else 0.8
-        bpmLabel?.alpha = if (currentlySelected) 1.0 else 0.8
-        difficultyLabel?.alpha = if (currentlySelected) 1.0 else 0.8
         rankSprite?.alpha = if (currentlySelected) 1.0 else 0.7
     }
 
