@@ -17,11 +17,12 @@ data class SaveData(
     /** `Scoring.tallyCompletion` for the best/current clear, 0..1. */
     val completions: Map<String, Float> = emptyMap(),
     /**
-     * FNF's `save.data.unlocks.charactersSeen`. A fresh 0.8.6 save has only
-     * Boyfriend marked as seen; Pico is unlocked in the stock data, so the
-     * first Freeplay visit uses `NewCharacterCard`.
+     * FNF's `save.data.unlocks.charactersSeen`. KNF has no Character Select
+     * substate to clear the "new character" flag, so both stock playable
+     * characters start seen. That selects the regular `BoyfriendCard` backing
+     * card, matching the reference build once Pico has been viewed.
      */
-    val charactersSeen: List<String> = listOf("bf"),
+    val charactersSeen: List<String> = listOf("bf", "pico"),
     /** Stock 0.8.6 player registry unlocks. */
     val unlockedCharacters: List<String> = listOf("bf", "pico"),
 )
@@ -56,6 +57,15 @@ object Save {
         }.getOrElse {
             println("KNF: could not read save, starting fresh: ${it.message}")
             SaveData()
+        }
+
+        // Older KNF builds copied FNF's fresh-save `charactersSeen: ["bf"]`
+        // state, which permanently selected `NewCharacterCard` because KNF has
+        // no Character Select to mark Pico as seen. Treat that exact stock
+        // value as the already-viewed state so Freeplay uses `BoyfriendCard`.
+        if (data.charactersSeen == listOf("bf")) {
+            data = data.copy(charactersSeen = listOf("bf", "pico"))
+            save()
         }
     }
 

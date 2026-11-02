@@ -1,11 +1,12 @@
 package nightfunkin.ui
 
 import korlibs.image.bitmap.Bitmap
+import korlibs.image.bitmap.Bitmap32
 import korlibs.image.bitmap.sliceWithSize
 import korlibs.image.color.Colors
 import korlibs.image.color.RGBA
+import korlibs.image.font.BitmapFont
 import korlibs.image.font.TtfFont
-import korlibs.image.paint.Stroke
 import korlibs.io.resources.Resourceable
 import korlibs.korge.blend.BlendMode
 import korlibs.korge.scene.Scene
@@ -36,8 +37,10 @@ import nightfunkin.play.PlayRequest
 import nightfunkin.play.PlayScene
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sin
+import kotlin.random.Random
 
 /**
  * FNF 0.8.6's Freeplay menu.
@@ -46,10 +49,12 @@ import kotlin.math.sin
  * the pink backing card slides in, BF runs his turntable intro, and the song
  * capsules arc down the left side while the album art sits on the right.
  *
- * KNF has no character-select substate yet, so Pico stays marked as unseen and
- * Freeplay uses FNF's `NewCharacterCard`, exactly like a fresh 0.8.6 save. Q/E
- * still cycle song variations (default/erect/pico/bf), preserving the previous
- * song-list behaviour.
+ * KNF has no character-select substate yet, so the stock save counts both
+ * playable characters as seen. Freeplay therefore uses BF's scripted
+ * `BoyfriendCard` (the yellow card with the giant marquee text), while
+ * `NewCharacterCard` remains available for saves with an unseen character.
+ * Q/E still cycle song variations (default/erect/pico/bf), preserving the
+ * previous song-list behaviour.
  */
 class SongSelectScene : Scene() {
 
@@ -64,6 +69,9 @@ class SongSelectScene : Scene() {
     private var fiveBySeven: TtfFont? = null
     private var youreGone: TtfFont? = null
     private var vcr: TtfFont? = null
+    private var bandFontSmall: BitmapFont? = null
+    private var bandFontMedium: BitmapFont? = null
+    private var bandFontLarge: BitmapFont? = null
 
     private var selected = 1
     private var currentDifficulty = rememberedDifficulty
@@ -87,8 +95,20 @@ class SongSelectScene : Scene() {
     private var orangeStrip: SolidRect? = null
     private var orangeStripLeft: SolidRect? = null
 
-    // `NewCharacterCard` (the stock first-run card because Pico is unlocked
-    // but not yet seen in Character Select).
+    // `BoyfriendCard` (assets/preload/scripts/players/backcards/backcard-bf.hxc).
+    private var boyfriendBands: List<BackingScrollBand> = emptyList()
+    private var backingTextYeah: AnimateSpriteView? = null
+    private var beatGlow: Image? = null
+    private var beatGlowDark: Image? = null
+    private var beatClock = 0.0
+    private var beatIndex = 0
+    private var glowTweenElapsed = 0.0
+    private var glowTweenActive = false
+    private var glowDarkTweenElapsed = 0.0
+    private var glowDarkTweenActive = false
+
+    // `NewCharacterCard` is only used for saves that still have an unseen
+    // playable character (KNF's stock save marks both as seen).
     private var newCharacterCard = false
     private var newCardGroup: Container? = null
     private var newCardLight1: Image? = null
@@ -135,6 +155,7 @@ class SongSelectScene : Scene() {
     private var difficultyDots: List<Image> = emptyList()
     private var albumStarsView: AnimateSpriteView? = null
     private var starsAtlas: AnimateAtlas? = null
+    private var albumFlames: FreeplayFlamesView? = null
 
     private var displayedScore = 0.0
     private var targetScore = 0
@@ -156,10 +177,15 @@ class SongSelectScene : Scene() {
 
     override suspend fun SContainer.sceneInit() {
         Save.load()
-        newCharacterCard = Save.hasNewCharacter()
+        newCharacterCard = System.getenv("KNF_NEWCARD") == "1" || Save.hasNewCharacter()
         fiveBySeven = loadFont("fonts/5by7.ttf")
         youreGone = loadFont("fonts/YoureGone-Regular.otf")
         vcr = loadFont("fonts/vcr.ttf")
+        // `BGScrollingText` is static text; a bitmap glyph atlas keeps all of
+        // its repeated copies cheap to draw while they scroll.
+        bandFontSmall = fiveBySeven?.let { runCatching { BitmapFont(it, 43.0) }.getOrNull() }
+        bandFontMedium = fiveBySeven?.let { runCatching { BitmapFont(it, 60.0) }.getOrNull() }
+        bandFontLarge = fiveBySeven?.let { runCatching { BitmapFont(it, 80.0) }.getOrNull() }
 
         ensureDifficultyForVariation()
 
@@ -247,16 +273,7 @@ class SongSelectScene : Scene() {
         if (newCharacterCard) {
             buildNewCharacterCard()
         } else {
-            orangeStrip = cardLayer.solidRect(width, 75.0, RGBA(0xFE, 0xDA, 0x00)).also {
-                it.x = 84.0
-                it.y = 440.0
-                it.visible = false
-            }
-            orangeStripLeft = cardLayer.solidRect(100.0, 75.0, RGBA(0xFF, 0xD4, 0x00)).also {
-                it.x = 0.0
-                it.y = 440.0
-                it.visible = false
-            }
+            buildBoyfriendCard(width)
         }
 
         // BackingCard adds the glow last and uses additive blending, so it sits
@@ -274,9 +291,82 @@ class SongSelectScene : Scene() {
     }
 
     /**
-     * `NewCharacterCard` from 0.8.6. A stock save has Pico unlocked but not
-     * seen in Character Select, so this is the card the real Freeplay menu
-     * shows on its first visit.
+     * `BoyfriendCard`, the scripted backing card from
+     * `assets/preload/scripts/players/backcards/backcard-bf.hxc`.
+     *
+     * The base card paints the yellow plate and the "GET IT!! / YEAH!!!"
+     * collage; the script adds the six giant `BGScrollingText` marquees made
+     * from BF's freeplay DJ lines and the two pulsing beat glows.
+     */
+    private fun buildBoyfriendCard(width: Double) {
+        // `orangeBackShit` is alpha-masked by `pinkBack`. Its 524 px source
+        // width reaches past the plate's slanted right edge, so crop it to the
+        // ~390 px of the plate that is actually visible at y=440..515.
+        orangeStrip = cardLayer.solidRect(width * 0.75, 75.0, RGBA(0xFE, 0xDA, 0x00)).also {
+            it.x = 84.0
+            it.y = 440.0
+            it.visible = false
+        }
+        orangeStripLeft = cardLayer.solidRect(100.0, 75.0, RGBA(0xFF, 0xD4, 0x00)).also {
+            it.x = 0.0
+            it.y = 440.0
+            it.visible = false
+        }
+
+        val yeahAtlas = runCatching {
+            AnimateAtlas("preload/images/freeplay/backing-text-yeah")
+        }.getOrNull()
+        backingTextYeah = yeahAtlas?.takeIf { it.poses.isNotEmpty() }?.let { atlas ->
+            AnimateSpriteView(atlas, applyStageMatrix = false).also {
+                it.x = -320.0
+                it.y = 120.0
+                // `BackingCard` never calls `play` on this sprite while
+                // browsing: the atlas' first pose is empty and the
+                // YEAH!!!/YES YES YES collage only plays on confirm.
+                it.playFrames("", listOf(0), loop = false)
+                cardLayer.addChild(it)
+            }
+        }
+
+        val bands = ArrayList<BackingScrollBand>()
+        // `BGScrollingText` arguments: x, y, text, widthShit, bold, size.
+        buildBackingBand(cardLayer, 0.0, 160.0, "HOT BLOODED IN MORE WAYS THAN ONE",
+            1280.0, RGBA(0xFF, 0xF3, 0x83), 43.0, 6.8, bold = true, out = bands, visible = false)
+        buildBackingBand(cardLayer, 0.0, 220.0, "BOYFRIEND",
+            640.0, RGBA(0xFF, 0x99, 0x63), 60.0, -3.8, bold = false, out = bands, visible = false)
+        buildBackingBand(cardLayer, 0.0, 285.0, "PROTECT YO NUTS",
+            640.0, Colors.WHITE, 43.0, 3.5, bold = true, out = bands, visible = false)
+        buildBackingBand(cardLayer, 0.0, 335.0, "BOYFRIEND",
+            640.0, RGBA(0xFF, 0x99, 0x63), 60.0, -3.8, bold = false, out = bands, visible = false)
+        buildBackingBand(cardLayer, 0.0, 397.0, "HOT BLOODED IN MORE WAYS THAN ONE",
+            1280.0, RGBA(0xFF, 0xF3, 0x83), 43.0, 6.8, bold = true, out = bands, visible = false)
+        buildBackingBand(cardLayer, 0.0, 450.0, "BOYFRIEND",
+            640.0, RGBA(0xFE, 0xA4, 0x00), 60.0, -3.8, bold = false, out = bands, visible = false)
+        boyfriendBands = bands
+
+        val glowBitmap = KnfFiles.bitmapOrNull("preload/images/freeplay/beatglow.png")
+        if (glowBitmap != null) {
+            beatGlowDark = Image(glowBitmap).also {
+                it.x = -300.0
+                it.y = 330.0
+                it.alpha = 0.0
+                it.visible = false
+                cardLayer.addChild(it)
+            }
+            beatGlow = Image(glowBitmap).also {
+                it.x = -300.0
+                it.y = 330.0
+                it.alpha = 0.0
+                it.blendMode = BlendMode.ADD
+                it.visible = false
+                cardLayer.addChild(it)
+            }
+        }
+    }
+
+    /**
+     * `NewCharacterCard` from 0.8.6. Shown only when the save still has an
+     * unseen playable character (`KNF_NEWCARD=1` can force it for testing).
      */
     private fun buildNewCharacterCard() {
         val group = Container().also {
@@ -298,13 +388,14 @@ class SongSelectScene : Scene() {
 
         addImage("darkback.png", 0.0, 0.0)
 
-        // The six `BGScrollingText` lines, top to bottom.
-        buildBackingBand(group, 0.0, 163.0, "COULD IT BE A NEW FRIEND? OR FOE??", 1280.0, RGBA(0x13, 0x93, 0x76), 43.0, -4.0)
-        buildBackingBand(group, -440.0, 215.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0)
-        buildBackingBand(group, 0.0, 286.0, "SOMEONE'S WAITING!", 640.0, RGBA(0x40, 0xEA, 0x84), 43.0, -2.0)
-        buildBackingBand(group, -220.0, 331.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0)
-        buildBackingBand(group, 0.0, 402.0, "COULD IT BE A NEW FRIEND? OR FOE??", 1280.0, RGBA(0x13, 0x93, 0x76), 43.0, -4.0)
-        buildBackingBand(group, 0.0, 458.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0)
+        // The six `BGScrollingText` lines, top to bottom. All six use the
+        // script's `bold = true`.
+        buildBackingBand(group, 0.0, 163.0, "COULD IT BE A NEW FRIEND? OR FOE??", 1280.0, RGBA(0x13, 0x93, 0x76), 43.0, -4.0, bold = true)
+        buildBackingBand(group, -440.0, 215.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0, bold = true)
+        buildBackingBand(group, 0.0, 286.0, "SOMEONE'S WAITING!", 640.0, RGBA(0x40, 0xEA, 0x84), 43.0, -2.0, bold = true)
+        buildBackingBand(group, -220.0, 331.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0, bold = true)
+        buildBackingBand(group, 0.0, 402.0, "COULD IT BE A NEW FRIEND? OR FOE??", 1280.0, RGBA(0x13, 0x93, 0x76), 43.0, -4.0, bold = true)
+        buildBackingBand(group, 0.0, 458.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0, bold = true)
 
         addImage("multiplyBar.png", -10.0, 440.0, BlendMode.MULTIPLY)
 
@@ -317,6 +408,11 @@ class SongSelectScene : Scene() {
         newCardLight3 = addImage("red gradient.png", -360.0, 290.0, BlendMode.ADD)
     }
 
+    /**
+     * One `BGScrollingText`: a row of repeated copies that wraps. Each copy is
+     * a small [Container] so `bold` can be faked with a one-pixel second pass
+     * (FlxText's fake bold) while still using a cached [BitmapFont] atlas.
+     */
     private fun buildBackingBand(
         parent: Container,
         x: Double,
@@ -326,29 +422,61 @@ class SongSelectScene : Scene() {
         color: RGBA,
         textSize: Double,
         speed: Double,
+        bold: Boolean = true,
+        out: MutableList<BackingScrollBand> = newCardBands,
+        visible: Boolean = true,
     ) {
         val holder = Container().also {
             it.x = x
             it.y = y
+            it.visible = visible
             parent.addChild(it)
         }
 
-        fun makeCopy(): Text = holder.text(text, textSize = textSize, color = color).also {
-            fiveBySeven?.let { font -> it.font = Resourceable.Fixed(font) }
-            it.stroke = Stroke(color, 1.0)
-            it.y = 0.0
+        val font = (when {
+            textSize >= 80.0 -> bandFontLarge
+            textSize >= 60.0 -> bandFontMedium
+            else -> bandFontSmall
+        })?.let { Resourceable.Fixed(it) }
+            ?: fiveBySeven?.let { Resourceable.Fixed(it) }
+            ?: return
+
+        fun makeCopy(): Container {
+            val copy = Container().also { holder.addChild(it) }
+            copy.text(
+                text,
+                textSize = textSize,
+                color = color,
+                font = font,
+            ).also { it.y = 0.0 }
+            if (bold) {
+                // `FlxText.bold` is a faux second pass; Korge's bitmap-font
+                // renderer ignores `stroke`, so draw the glyphs twice.
+                copy.text(
+                    text,
+                    textSize = textSize,
+                    color = color,
+                    font = font,
+                ).also {
+                    it.x = 1.0
+                    it.y = 0.0
+                }
+            }
+            return copy
         }
 
         val first = makeCopy()
         first.x = 0.0
-        val textWidth = if (first.width > 0.0) first.width.toDouble() else textSize * text.length * 0.55
+        val firstText = first.getChildAtOrNull(0) as? Text
+        val textWidth = firstText?.width?.takeIf { it > 0.0 }?.toDouble()
+            ?: (textSize * text.length * 0.55)
         val needed = max(1, ceil(widthLimit / textWidth).toInt() + 1)
-        val copies = ArrayList<Text>(needed)
+        val copies = ArrayList<Container>(needed)
         copies += first
         for (i in 1 until needed) {
             copies += makeCopy().also { it.x = i * (textWidth + 20.0) }
         }
-        newCardBands += BackingScrollBand(holder, copies, textWidth, 20.0, speed)
+        out += BackingScrollBand(holder, copies, textWidth, 20.0, speed)
     }
 
     private fun buildDj(parent: Container) {
@@ -375,15 +503,47 @@ class SongSelectScene : Scene() {
 
     private fun buildBackingImage(): Image? {
         val bitmap = KnfFiles.bitmapOrNull("preload/images/freeplay/freeplayBGweek1-bf.png") ?: return null
+        val masked = applyAngleMask(bitmap)
         val targetHeight = Constants.GAME_HEIGHT + 1.0
-        val scale = targetHeight / bitmap.height
+        val scale = targetHeight / masked.height
         val width = pinkBack?.let { it.bitmap.width.toDouble() } ?: 524.0
-        return Image(bitmap).also {
+        return Image(masked).also {
             it.scaleX = scale
             it.scaleY = scale
             it.x = width * 0.74
             it.y = 0.0
         }
+    }
+
+    /**
+     * `AngleMask` from `funkin.graphics.shaders.AngleMask`.
+     *
+     * The backdrop keeps only the pixels right of the line running from the
+     * texture's top-left corner to `(90, height)`, so its left edge follows the
+     * pink card's slanted right edge instead of being a hard rectangle. The
+     * shader supersamples that edge every frame; baking the same coverage into
+     * the bitmap once keeps it antialiased for free.
+     */
+    private fun applyAngleMask(bitmap: Bitmap): Bitmap {
+        val src = bitmap.toBMP32IfRequired()
+        val width = src.width
+        val height = src.height
+        val out = Bitmap32(width, height, src.ints.copyOf(), src.premultiplied)
+        for (y in 0 until height) {
+            // Matches `endPosition = (90, 100)` in normalized texture space.
+            val edge = ANGLE_MASK_X * (y + 0.5) / height
+            val limit = min(width, ceil(edge).toInt() + 1)
+            for (x in 0 until limit) {
+                val coverage = (x + 1.0 - edge).coerceIn(0.0, 1.0)
+                val index = y * width + x
+                val color = out.getRgbaAtIndex(index)
+                out.setRgbaAtIndex(
+                    index,
+                    RGBA(color.r, color.g, color.b, (color.a * coverage).toInt()),
+                )
+            }
+        }
+        return out
     }
 
     private fun buildDifficulty(parent: Container) {
@@ -611,19 +771,21 @@ class SongSelectScene : Scene() {
 
     private fun buildScore() {
         val atlas = TextureAtlas.tryLoad("preload/images/digital_numbers.xml") ?: return
-        val frames = numberFrames(atlas, "DIGITAL")
-        if (frames.isEmpty()) return
+        val animations = numberAnimations(atlas, "DIGITAL")
+        val zeroFrames = animations[0] ?: return
+        // `FreeplayScore` is a `FlxSpriteGroup` at (0, 60) and every `ScoreNum`
+        // is constructed at y = 60; `preAdd` adds the group's offset, so the
+        // digits actually sit at y = 120.
+        val y = 120.0
         scoreDigits = (0 until 7).map { i ->
-            val frame = frames[0] ?: frames.values.first()
-            val image = Image(atlas.slice(frame)).also {
-                it.x = 927.0 + 45.0 * i
-                it.y = 60.0
-                it.scaleX = 0.4
-                it.scaleY = 0.4
+            val baseX = 927.0 + 45.0 * i
+            val image = Image(atlas.slice(zeroFrames.first())).also {
+                it.scaleX = ScoreDigit.SCALE
+                it.scaleY = ScoreDigit.SCALE
                 it.visible = false
                 uiLayer.addChild(it)
             }
-            ScoreDigit(image, atlas, frames)
+            ScoreDigit(image, atlas, animations, baseX, y)
         }
     }
 
@@ -759,23 +921,94 @@ class SongSelectScene : Scene() {
         }
     }
 
-    private fun numberFrames(
+    private fun numberAnimations(
         atlas: TextureAtlas,
         suffix: String,
-    ): Map<Int, TextureAtlas.AtlasFrame> =
+    ): Map<Int, List<TextureAtlas.AtlasFrame>> =
         listOf("ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE")
             .mapIndexedNotNull { index, name ->
-                atlas.framesByPrefix("$name $suffix").firstOrNull()?.let { index to it }
+                atlas.framesByPrefix("$name $suffix")
+                    .sortedBy { it.name }
+                    .takeIf { it.isNotEmpty() }
+                    ?.let { index to it }
             }.toMap()
 
+    /**
+     * One `ScoreNum` from `FreeplayScore.hx`.
+     *
+     * Each digit animation is a 16-frame pop: the first frames are the large
+     * glowing version and the last frames are the crisp resting digit. The
+     * animation only restarts when the digit actually changes, which is why
+     * the glow appears just for the digits that are counting and fades once
+     * they settle.
+     */
     private class ScoreDigit(
-        val image: Image,
+        private val image: Image,
         private val atlas: TextureAtlas,
-        private val frames: Map<Int, TextureAtlas.AtlasFrame>,
+        private val animations: Map<Int, List<TextureAtlas.AtlasFrame>>,
+        private val baseX: Double,
+        private val baseY: Double,
     ) {
+        companion object {
+            /**
+             * `setGraphicSize(Std.int(138 * 0.4))` → 55, so every `ScoreNum`
+             * keeps Flixel's 55 / 138 scale even when the digit's logical
+             * frame width changes.
+             */
+            const val SCALE = 55.0 / 138.0
+
+            /** `animation.addByPrefix(..., 24, false)`. */
+            const val FPS = 24.0
+
+            /** `ScoreNum.set_digit` nudges the narrow "1" 15 px to the right. */
+            const val ONE_SHIFT = 15.0
+        }
+
+        private var value = 0
+        private var clock = 0.0
+        private var animating = true
+
+        init {
+            applyFrame(0)
+        }
+
         fun set(value: Int) {
-            val frame = frames[value] ?: return
+            if (this.value == value) return
+            this.value = value
+            // `ScoreNum.set_digit` restarts the animation at frame 0 only when
+            // the digit differs from the currently displayed one.
+            clock = 0.0
+            animating = true
+            applyFrame(0)
+        }
+
+        fun setVisible(value: Boolean) {
+            image.visible = value
+        }
+
+        fun update(dt: Double) {
+            if (!animating) return
+            clock += dt
+            val frames = animations[value] ?: return
+            val index = (clock * FPS).toInt()
+            if (index >= frames.lastIndex) {
+                applyFrame(frames.lastIndex)
+                animating = false
+            } else {
+                applyFrame(index)
+            }
+        }
+
+        private fun applyFrame(index: Int) {
+            val frames = animations[value] ?: return
+            val frame = frames[index.coerceIn(0, frames.lastIndex)]
             image.bitmap = atlas.slice(frame)
+            // The logical frame stays anchored at (x, y); trimmed frames are
+            // inset by (-frameX, -frameY). `updateHitbox` + `centerOffsets`
+            // cancel out for every digit except "1".
+            val shift = if (value == 1) ONE_SHIFT else 0.0
+            image.x = baseX + shift - frame.frameX * SCALE
+            image.y = baseY - frame.frameY * SCALE
         }
     }
 
@@ -886,11 +1119,27 @@ class SongSelectScene : Scene() {
             AnimateAtlas("preload/images/freeplay/freeplayStars")
         }.getOrNull()?.also { starsAtlas = it } ?: return
 
-        val pose = if (rating == 0) 1500 else (rating - 1) * 100
+        // `DifficultyStars.flameCheck`: ratings 11+ put the excess stars on
+        // fire, one `freeplayFlame` per point above 10. The flames sit behind
+        // the stars and above the album artwork.
+        val flames = albumFlames ?: FreeplayFlamesView().also { albumFlames = it }
+        if (flames.container.parent == null) albumLayer.addChild(flames.container)
+        flames.setCount(if (rating > 10) rating - 10 else 0)
+
+        // `DifficultyStars`: the `diff stars` timeline has one 100-frame band
+        // per rating (0-99 = 1 star, ..., 1400-1499 = 15 stars). Each band
+        // loops in place; rating 0 parks on frame 1500 ("empty rating").
+        val band = when {
+            rating == 0 -> listOf(1500)
+            else -> ((rating - 1) * 100 until rating * 100)
+                .filter { it in atlas.poses.indices }
+        }
+        if (band.isEmpty()) return
         val view = AnimateSpriteView(atlas).also {
             it.x = 950.0
             it.y = 209.0
-            it.playFrames("difficulty-$rating", listOf(pose.coerceIn(0, atlas.poses.lastIndex)), false)
+            it.playFrames("difficulty-$rating", band, loop = rating != 0)
+            if (rating == 0) it.stop()
             albumLayer.addChild(it)
         }
         albumStarsView = view
@@ -1209,8 +1458,20 @@ class SongSelectScene : Scene() {
 
     override suspend fun SContainer.sceneMain() {
         val knfInput = KnfInput(keys)
+        val reportFps = System.getenv("KNF_FPS") == "1"
+        var fpsAccum = 0.0
+        var fpsFrames = 0
         addUpdater { dt ->
             val d = dt.secondsDouble()
+            if (reportFps) {
+                fpsAccum += d
+                fpsFrames++
+                if (fpsAccum >= 1.0) {
+                    println("KNF_FPS ${String.format("%.1f", fpsFrames / fpsAccum)}")
+                    fpsAccum = 0.0
+                    fpsFrames = 0
+                }
+            }
             knfInput.update()
 
             updateCard(d)
@@ -1230,6 +1491,8 @@ class SongSelectScene : Scene() {
             for (capsule in viewCapsules) capsule.update(d)
             for (selector in selectors) selector.update(d)
             albumTitle?.update(d)
+            albumStarsView?.update(d)
+            albumFlames?.update(d)
             highscoreSprite?.update(d)
             preview.update()
 
@@ -1240,6 +1503,7 @@ class SongSelectScene : Scene() {
                 displayedCompletion = targetCompletion
             }
             updateScoreVisual()
+            scoreDigits.forEach { it.update(d) }
             updateCompletionVisual()
 
             charHint?.let { hint ->
@@ -1314,7 +1578,7 @@ class SongSelectScene : Scene() {
             }
         }
 
-        if (newCharacterCard) updateNewCharacterCard(dt)
+        if (newCharacterCard) updateNewCharacterCard(dt) else updateBoyfriendCard(dt)
 
         // FreeplayState.update: hintTimer += elapsed * 2;
         // charSelectHint.alpha = lerp(0.3, 0.9, (sin(hintTimer) + 1) / 2).
@@ -1337,6 +1601,59 @@ class SongSelectScene : Scene() {
         backingImage?.tint = mixColor(0x2E2E46, 0x60607B, s)
         newCardBands.forEach { it.update(dt) }
     }
+
+    /** `BoyfriendCard`: marquees, animated collage and beat-synced glows. */
+    private fun updateBoyfriendCard(dt: Double) {
+        if (!djIntroDone) return
+
+        boyfriendBands.forEach { it.update(dt) }
+
+        val bpm: Double = selectedEntry()?.let { entry ->
+            entry.song.metadataFor(resolvedVariation(entry)).timeChanges.firstOrNull()?.bpm?.toDouble()
+        } ?: 100.0
+        if (bpm > 0.0) {
+            val beatFreq = BEAT_FREQUENCIES[
+                (bpm / 140.0).toInt().coerceIn(0, BEAT_FREQUENCIES.size - 1),
+            ]
+            val secondsPerBeat = 60.0 / bpm
+            beatClock += dt
+            while (beatClock >= secondsPerBeat) {
+                beatClock -= secondsPerBeat
+                beatIndex++
+                if (beatIndex % beatFreq == 0) pulseBeatGlow()
+            }
+        }
+
+        if (glowTweenActive) {
+            glowTweenElapsed += dt
+            val t = (glowTweenElapsed / (16.0 / 24.0)).coerceIn(0.0, 1.0)
+            beatGlow?.alpha = 0.8 * (1.0 - quartOut(t))
+            if (t >= 1.0) {
+                beatGlow?.alpha = 0.0
+                glowTweenActive = false
+            }
+        }
+        if (glowDarkTweenActive) {
+            glowDarkTweenElapsed += dt
+            val t = (glowDarkTweenElapsed / (18.0 / 24.0)).coerceIn(0.0, 1.0)
+            beatGlowDark?.alpha = 0.6 * quartOut(t)
+            if (t >= 1.0) {
+                beatGlowDark?.alpha = 0.6
+                glowDarkTweenActive = false
+            }
+        }
+    }
+
+    private fun pulseBeatGlow() {
+        beatGlow?.alpha = 0.8
+        glowTweenElapsed = 0.0
+        glowTweenActive = true
+        beatGlowDark?.alpha = 0.0
+        glowDarkTweenElapsed = 0.0
+        glowDarkTweenActive = true
+    }
+
+    private fun quartOut(t: Double): Double = 1.0 - (1.0 - t).pow(4.0)
 
     private fun lerp(a: Double, b: Double, t: Double): Double = a + (b - a) * t
 
@@ -1369,9 +1686,14 @@ class SongSelectScene : Scene() {
             // red multiply passes create the in-game card colour.
             newCardGroup?.visible = true
         } else {
+            // BackingCard.introDone(): plate turns yellow, the two strips and
+            // all scripted marquees/beat glows appear.
             pinkBack?.tint = RGBA(0xFF, 0xD8, 0x63)
             orangeStrip?.visible = true
             orangeStripLeft?.visible = true
+            boyfriendBands.forEach { it.container.visible = true }
+            beatGlow?.visible = true
+            beatGlowDark?.visible = true
         }
         glowActive = true
         glowElapsed = 0.0
@@ -1393,7 +1715,7 @@ class SongSelectScene : Scene() {
             it.visible = true
             it.restart()
         }
-        scoreDigits.forEach { it.image.visible = true }
+        scoreDigits.forEach { it.setVisible(true) }
         clearBox?.visible = true
         completionDigits.forEach { it.visible = true }
         difficultyDots.forEach { it.visible = true }
@@ -1473,6 +1795,12 @@ class SongSelectScene : Scene() {
         private const val CAPSULE_HEIGHT = 132.0
         private const val CAPSULE_SCALE = 0.8
 
+        /** `BoyfriendCard.beatFreqList`: `[1, 2, 4, 8]`. */
+        private val BEAT_FREQUENCIES = intArrayOf(1, 2, 4, 8)
+
+        /** `AngleMask.endPosition.x`: the backdrop cut is 90 px at its bottom. */
+        private const val ANGLE_MASK_X = 90.0
+
         /** `FreeplayState.rememberedSongId` starts at the tutorial in FNF. */
         private var rememberedSongId: String? = "tutorial"
         private var rememberedDifficulty = Constants.DEFAULT_DIFFICULTY
@@ -1486,7 +1814,7 @@ class SongSelectScene : Scene() {
  */
 private class BackingScrollBand(
     val container: Container,
-    val copies: List<Text>,
+    val copies: List<Container>,
     val textWidth: Double,
     val placementOffset: Double,
     var speed: Double,
@@ -1518,5 +1846,91 @@ private class BackingScrollBand(
 
         positions.sort()
         for (i in copies.indices) copies[i].x = positions[i]
+    }
+}
+
+/**
+ * `FreeplayFlames.hx`: the blue fire on the excess difficulty stars.
+ *
+ * Ratings above 10 light up `rating - 10` flames: five pre-created sprites
+ * laid out along the top edge of the album cover. Each one plays its ignition
+ * once, then loops from frame 2; newly visible flames are revealed one by one
+ * every 0.25 s.
+ */
+private class FreeplayFlamesView {
+    companion object {
+        const val FLAME_X = 913.0
+        const val FLAME_Y = 91.0
+        const val SPREAD_X = 29.0
+        const val SPREAD_Y = 6.0
+        const val REVEAL_DELAY = 0.25
+    }
+
+    val container = Container()
+    private val flames: List<SparrowSprite>
+
+    private class Pending(val index: Int, val delay: Double)
+
+    private val pending = ArrayList<Pending>()
+    private var clock = 0.0
+
+    init {
+        val atlas = TextureAtlas.tryLoad("preload/images/freeplay/freeplayFlame.xml")
+        val frames = atlas?.framesByPrefix("fire loop full instance 1").orEmpty()
+        flames = if (atlas != null && frames.isNotEmpty()) {
+            (0 until 5).map { i ->
+                // `FlxG.random.int(23, 25)` per flame.
+                SparrowSprite(
+                    atlas,
+                    frames,
+                    fps = Random.nextInt(23, 26).toDouble(),
+                    loop = false,
+                ).also {
+                    it.x = FLAME_X + SPREAD_X * i
+                    it.y = FLAME_Y + SPREAD_Y * i
+                    it.visible = false
+                    container.addChild(it)
+                }
+            }
+        } else {
+            emptyList()
+        }
+    }
+
+    /** `FreeplayFlames.flameCount`, clamped to the five available flames. */
+    fun setCount(count: Int) {
+        val target = count.coerceIn(0, flames.size)
+        // `set_flameCount` destroys every pending reveal timer first.
+        pending.clear()
+        clock = 0.0
+        var waiting = 0
+        for (i in flames.indices) {
+            val flame = flames[i]
+            if (i >= target) {
+                flame.visible = false
+            } else if (!flame.visible) {
+                pending += Pending(i, REVEAL_DELAY * waiting)
+                waiting++
+            }
+        }
+    }
+
+    fun update(dt: Double) {
+        for (flame in flames) {
+            flame.update(dt)
+            // `onFinish`: play("flame", true, false, 2), skipping ignition.
+            if (!flame.playing && flame.finished) flame.seekTo(2)
+        }
+        if (pending.isEmpty()) return
+        clock += dt
+        val iterator = pending.iterator()
+        while (iterator.hasNext()) {
+            val next = iterator.next()
+            if (clock < next.delay) continue
+            val flame = flames[next.index]
+            flame.restart()
+            flame.visible = true
+            iterator.remove()
+        }
     }
 }

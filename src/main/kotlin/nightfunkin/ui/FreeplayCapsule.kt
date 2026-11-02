@@ -1,10 +1,12 @@
 package nightfunkin.ui
 
+import korlibs.image.bitmap.effect.blur
 import korlibs.image.color.Colors
 import korlibs.image.color.RGBA
 import korlibs.image.font.TtfFont
-import korlibs.image.paint.Stroke
+import korlibs.image.font.renderTextToBitmap
 import korlibs.io.resources.Resourceable
+import korlibs.korge.blend.BlendMode
 import korlibs.korge.view.Container
 import korlibs.korge.view.Image
 import korlibs.korge.view.Text
@@ -52,16 +54,22 @@ internal class FreeplayCapsule(
             null
         }
 
+    /**
+     * `CapsuleText.blurredText`: a cyan copy rendered once and Gaussian
+     * blurred. Doing this offline keeps the selected capsule's glow without a
+     * per-frame filter (the source uses a `GaussianBlurShader` here).
+     */
+    private var songGlow: Image? = null
+
     private val songText: Text = text(
         if (entry == null) "Random" else entry.song.name,
         textSize = 32.0,
         color = Colors.WHITE,
     ).also {
         fiveBySeven?.let { font -> it.font = Resourceable.Fixed(font) }
-        // CapsuleText gives the white text a cyan GlowFilter. KorGE's text
-        // stroke is the closest equivalent (and, unlike a second text view,
-        // it never changes the glyph metrics).
-        it.stroke = Stroke(CAPSULE_GLOW, 2.0)
+        // Only `blurredText` is cyan; the white copy stays thin. The glow is
+        // shown for the selected capsule alone (`updateSelected`), matching
+        // the reference where unselected titles are plain grey.
         it.x = 159.12
         it.y = 45.0
     }
@@ -122,6 +130,8 @@ internal class FreeplayCapsule(
                 it.y = 41.0
                 it.scaleX = 0.9
                 it.scaleY = 0.9
+                // `FreeplayRank` uses additive blending so the badge glows.
+                it.blendMode = BlendMode.ADD
                 it.visible = false
                 addChild(it)
             }
@@ -144,11 +154,35 @@ internal class FreeplayCapsule(
     private var introFinished = true
 
     init {
+        setTitle(if (entry == null) "Random" else entry.song.name)
         // Capsules that are filtered out of the first list keep their normal
         // alpha. If a later difficulty/variation reveals one it slides in from
         // the right instead of staying permanently transparent.
         alpha = 1.0
         updateSelected()
+    }
+
+    private fun setTitle(value: String) {
+        songText.text = value
+        songGlow?.removeFromParent()
+        songGlow = null
+        val font = fiveBySeven ?: return
+        val result = runCatching {
+            // Matches the `Text` view's layout: the bitmap's top-left is the
+            // text bounds' top-left, with the usual 1 px raster border.
+            font.renderTextToBitmap(32.0, value, paint = CAPSULE_GLOW)
+        }.getOrNull() ?: return
+        val blurred = runCatching {
+            result.bmp.toBMP32IfRequired().blur(GLOW_BLUR)
+        }.getOrNull() ?: return
+        songGlow = Image(blurred).also {
+            it.smoothing = true
+            // `blur` grows the bitmap by GLOW_BLUR on every side.
+            it.x = 159.12 - GLOW_BLUR
+            it.y = 45.0 - GLOW_BLUR
+            it.visible = currentlySelected
+            addChildAt(it, songText.index)
+        }
     }
 
     /** Positions this capsule relative to the currently selected one. */
@@ -179,7 +213,7 @@ internal class FreeplayCapsule(
     fun refresh(difficulty: String, variation: String) {
         val song = entry?.song
         if (song == null) {
-            songText.text = "Random"
+            setTitle("Random")
             setBpmVisible(false)
             setRatingVisible(false)
             weekText.visible = false
@@ -190,7 +224,7 @@ internal class FreeplayCapsule(
         }
 
         val metadata = song.metadataFor(variation)
-        songText.text = metadata.songName
+        setTitle(metadata.songName)
         setPixelIcon(metadata.playData.characters.opponent)
 
         val bpm = metadata.timeChanges.firstOrNull()?.bpm?.toInt() ?: 100
@@ -252,7 +286,9 @@ internal class FreeplayCapsule(
         // right, so add it on top of the centred-scale compensation.
         capsuleSprite?.x = CAPSULE_OFFSET_X + if (currentlySelected) 0.0 else 5.0
         songText.alpha = if (currentlySelected) 1.0 else 0.6
+        songGlow?.visible = currentlySelected
         rankSprite?.alpha = if (currentlySelected) 1.0 else 0.7
+        rankSprite?.tint = if (currentlySelected) Colors.WHITE else RGBA(0xAA, 0xAA, 0xAA)
     }
 
     private fun setBpm(value: Int) {
@@ -498,6 +534,9 @@ internal class FreeplayCapsule(
 
         /** bf.json `capsuleTextColors` / `CapsuleText`'s glow filter. */
         val CAPSULE_GLOW = RGBA(0x00, 0xCC, 0xFF)
+
+        /** `GaussianBlurShader(1)` + 5x5 GlowFilter: a small cyan halo. */
+        const val GLOW_BLUR = 3
 
         val capsuleAtlas: TextureAtlas? by lazy {
             TextureAtlas.tryLoad(
