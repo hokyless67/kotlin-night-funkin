@@ -18,7 +18,11 @@ import korlibs.korge.view.Text
 import korlibs.korge.view.addUpdater
 import korlibs.korge.view.solidRect
 import korlibs.korge.view.text
+import korlibs.math.geom.Anchor2D
+import korlibs.math.geom.degrees
+import kotlin.math.atan2
 import kotlin.math.ceil
+import kotlin.math.hypot
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -141,6 +145,15 @@ class SongSelectScene : Scene() {
     private var albumArt: Image? = null
     private var albumTitle: SparrowSprite? = null
     private var shownAlbumId: String? = null
+    private var albumArtAtlas: AnimateAtlas? = null
+    private var albumArtAnimator: AlbumArtAnimator? = null
+    private var albumTitleIdleFrames: List<TextureAtlas.AtlasFrame> = emptyList()
+    private var albumTitleSwitchFrames: List<TextureAtlas.AtlasFrame> = emptyList()
+    private var albumTitleSwitching = false
+    private var albumRollReady = false
+
+    private var letterSort: FreeplayLetterSort? = null
+    private var letterFilter = "ALL"
 
     private var headerBg: SolidRect? = null
     private var headerText: korlibs.korge.view.Text? = null
@@ -167,8 +180,10 @@ class SongSelectScene : Scene() {
 
     private var statusTimer = 0.0
 
-    private var upHold = 0.0
-    private var downHold = 0.0
+    // `FreeplayState.spamTimer` / `spamming`: first change on press, then a
+    // 0.9 s pause before held-key repeats every 0.07 s.
+    private var spamTimer = 0.0
+    private var spamming = false
 
     private var transitioning = false
     private var leaving = false
@@ -677,83 +692,69 @@ class SongSelectScene : Scene() {
     }
 
     private fun buildLetterSort() {
-        val atlas = TextureAtlas.tryLoad("preload/images/freeplay/letterStuff.xml")
-        for (i in 0 until 5) {
-            val dark = when (i) {
-                0, 4 -> 0xAA
-                1, 3 -> 0x80
-                else -> 0xFF
+        val atlas = runCatching {
+            AnimateAtlas("preload/images/freeplay/sortedLetters")
+        }.getOrNull() ?: return
+        val sort = FreeplayLetterSort(atlas).also {
+            it.onChange = ::changeLetterFilter
+            it.onSound = {
+                scrollSound?.let { sound -> sfx.play(sound, 0.4) }
             }
-            val frame = when (i) {
-                0 -> atlas?.frame("# instance 10000")
-                1 -> atlas?.frame("fav instance 10000")
-                2 -> atlas?.frame("ALL instance 10000")
-                else -> null
-            }
-            // `LetterSort` scales every slot except ALL to 0.8 around the
-            // sprite centre. Compensate for that centre-origin shift so the
-            // rendered left/top edge matches Flixel's screen position.
-            val scale = if (i == 2) 1.0 else 0.8
-            if (frame != null && atlas != null) {
-                Image(atlas.slice(frame)).also {
-                    it.smoothing = false
-                    it.scaleX = scale
-                    it.scaleY = scale
-                    it.x = 400.0 + i * 80.0 + (1.0 - scale) * frame.logicalWidth / 2.0
-                    it.y = 65.0 + (1.0 - scale) * frame.logicalHeight / 2.0
-                    it.tint = RGBA(dark, dark, dark)
-                    uiLayer.addChild(it)
-                }
-            } else {
-                val label = when (i) {
-                    0 -> "#"
-                    1 -> "fav"
-                    2 -> "ALL"
-                    3 -> "A-B"
-                    else -> "C-D"
-                }
-                uiLayer.text(label, textSize = 50.0, color = RGBA(dark, dark, dark)).also {
-                    fiveBySeven?.let { font -> it.font = Resourceable.Fixed(font) }
-                    it.scaleX = scale
-                    it.scaleY = scale
-                    it.x = 400.0 + i * 80.0 + (1.0 - scale) * 25.0
-                    it.y = 65.0 + (1.0 - scale) * 25.0
-                }
-            }
+            uiLayer.addChild(it.container)
+        }
+        letterSort = sort
+    }
+
+    /**
+     * `letterSort.changeSelectionCallback`: rebuilds the capsule list for the
+     * chosen range. If the current song is still present, keep it selected;
+     * if Random was selected, stay on Random; otherwise land on the first real
+     * song of the new group.
+     */
+    private fun changeLetterFilter(letter: String) {
+        val wasRandom = selected == 0
+        val currentSong = selectedEntry()?.song?.id
+        letterFilter = letter
+
+        rebuildVisible(preserveSongId = currentSong)
+        if (wasRandom && visible.isNotEmpty()) {
+            selected = 0
+            updateSelectionPositions()
+            updateAlbum()
         }
 
-        // Separators and the two mini arrows are part of the letter strip in
-        // `LetterSort.hx`. They sit between the five slots.
-        val separator = KnfFiles.bitmapOrNull("preload/images/freeplay/seperator.png")
-        if (separator != null) {
-            for (i in 0 until 4) {
-                Image(separator).also {
-                    it.smoothing = false
-                    it.x = 460.0 + i * 80.0
-                    it.y = 95.0
-                    val shade = if (i == 1 || i == 2) 0x80 else 0xAA
-                    it.tint = RGBA(shade, shade, shade)
-                    uiLayer.addChild(it)
-                }
-            }
+        // `generateSongList(..., force = true, onlyIfChanged = false)` rebuilds
+        // every capsule and plays the jump-in again after a tab change.
+        viewCapsules.forEachIndexed { index, capsule ->
+            capsule.x = Constants.GAME_WIDTH.toDouble()
+            capsule.startIntro(0.12 + index * 0.035)
         }
-        val arrow = KnfFiles.bitmapOrNull("preload/images/freeplay/miniArrow.png")
-        if (arrow != null) {
-            Image(arrow).also {
-                it.smoothing = false
-                it.x = 380.0
-                it.y = 90.0
-                it.scaleX = -1.0
-                it.alpha = 0.8
-                uiLayer.addChild(it)
-            }
-            Image(arrow).also {
-                it.smoothing = false
-                it.x = 780.0
-                it.y = 90.0
-                it.alpha = 0.8
-                uiLayer.addChild(it)
-            }
+
+        updateSelectionStats()
+        updateTopUi()
+        rememberSelection()
+        requestPreview()
+    }
+
+    /** `FreeplayState.sortSongs`'s REGEXP / FAVORITE cases for the top tabs. */
+    private fun matchesLetterFilter(entry: FreeplayEntry): Boolean {
+        if (letterFilter == "ALL") return true
+        if (letterFilter == "fav") return false // no favourites are stored yet
+        val first = entry.song.name.firstOrNull()?.uppercaseChar() ?: return false
+        if (letterFilter == "#") return first in '0'..'9'
+        if (letterFilter.length == 1) return first == letterFilter[0]
+        val low = letterFilter[0]
+        val high = letterFilter[2]
+        return first in low..high
+    }
+
+    /** REGEXP filters are alphabetised; ALL and FAVORITE keep level order. */
+    private fun letterFilteredEntries(): List<FreeplayEntry> {
+        val pool = entries.filter(::matchesLetterFilter)
+        return if (letterFilter == "ALL" || letterFilter == "fav") {
+            pool
+        } else {
+            pool.sortedBy { it.song.name.lowercase() }
         }
     }
 
@@ -1035,19 +1036,11 @@ class SongSelectScene : Scene() {
 
     private fun updateAlbum() {
         val entry = selectedEntry() ?: run {
-            shownAlbumId = null
-            albumLayer.removeChildren()
-            albumArt = null
-            albumTitle = null
-            clearAlbumStars()
+            resetAlbumRoll()
             return
         }
         val albumId = entry.song.metadataFor(resolvedVariation(entry)).playData.album ?: run {
-            shownAlbumId = null
-            albumLayer.removeChildren()
-            albumArt = null
-            albumTitle = null
-            clearAlbumStars()
+            resetAlbumRoll()
             return
         }
         if (shownAlbumId == albumId) {
@@ -1055,33 +1048,52 @@ class SongSelectScene : Scene() {
             return
         }
 
+        // `FreeplayState` only plays the switch animation once the album
+        // actually changes after the initial DJ intro.
+        val albumChanged = albumRollReady
         shownAlbumId = albumId
         albumLayer.removeChildren()
         albumArt = null
         albumTitle = null
+        albumArtAnimator = null
+        albumTitleSwitching = false
         clearAlbumStars()
 
         val info = FreeplayCatalog.albums[albumId] ?: return
         val art = KnfFiles.bitmapOrNull("preload/images/${info.artAsset}.png")
         if (art != null) {
-            albumArt = Image(art).also {
+            val view = Image(art).also {
                 // AlbumRoll replaces the 262x262 `freeplayAlbum` symbol with
-                // the album graphic; it is not scaled.
-                it.x = 920.0
-                it.y = 220.0
+                // the album graphic; the symbol's pose supplies the tilt.
+                it.anchor = Anchor2D.TOP_LEFT
+                it.x = ALBUM_ART_X
+                it.y = ALBUM_ART_Y
                 albumLayer.addChild(it)
+            }
+            albumArt = view
+
+            val atlas = albumArtAtlas ?: runCatching {
+                AnimateAtlas("preload/images/freeplay/albumRoll/freeplayAlbum")
+            }.getOrNull()?.also { albumArtAtlas = it }
+            if (atlas != null) {
+                val animator = AlbumArtAnimator(atlas, view).also { albumArtAnimator = it }
+                animator.onFinish = { animator.play("idle", loop = true) }
+                animator.play(if (albumChanged) "switch" else "idle", loop = !albumChanged)
             }
         }
 
         val titleAtlas = TextureAtlas.tryLoad("preload/images/${info.titleAsset}.xml")
         if (titleAtlas != null) {
-            val frames = titleAtlas.framesByPrefix("idle")
-            if (frames.isNotEmpty()) {
+            val idle = titleAtlas.framesByPrefix("idle")
+            val switch = titleAtlas.framesByPrefix("switch")
+            if (idle.isNotEmpty()) {
+                albumTitleIdleFrames = idle
+                albumTitleSwitchFrames = switch
                 val offsetX = info.titleOffsets.getOrElse(0) { 0.0 }
                 val offsetY = info.titleOffsets.getOrElse(1) { 0.0 }
                 albumTitle = SparrowSprite(
                     titleAtlas,
-                    frames,
+                    idle,
                     fps = 24.0,
                     loop = true,
                 ).also {
@@ -1091,9 +1103,45 @@ class SongSelectScene : Scene() {
                     it.y = 500.0 + offsetY
                     albumLayer.addChild(it)
                 }
+                if (albumChanged) playAlbumTitleSwitch()
             }
         }
         updateAlbumStars()
+    }
+
+    private fun resetAlbumRoll() {
+        shownAlbumId = null
+        albumLayer.removeChildren()
+        albumArt = null
+        albumTitle = null
+        albumArtAnimator = null
+        albumTitleSwitching = false
+        clearAlbumStars()
+    }
+
+    /**
+     * `AlbumRoll.skipIntro`: the title flashes its blue `switch` frames once
+     * when the album changes, then returns to the black `idle` loop.
+     */
+    private fun playAlbumTitleSwitch() {
+        val title = albumTitle ?: return
+        val frames = albumTitleSwitchFrames
+        if (frames.isEmpty()) return
+        title.loop = false
+        title.play(frames, restart = true)
+        albumTitleSwitching = true
+    }
+
+    private fun updateAlbumTitleSwitch() {
+        if (!albumTitleSwitching) return
+        val title = albumTitle ?: run {
+            albumTitleSwitching = false
+            return
+        }
+        if (!title.finished) return
+        albumTitleSwitching = false
+        title.loop = true
+        if (albumTitleIdleFrames.isNotEmpty()) title.play(albumTitleIdleFrames, restart = true)
     }
 
     private fun clearAlbumStars() {
@@ -1176,7 +1224,7 @@ class SongSelectScene : Scene() {
         val keep = preserveSongId ?: selectedEntry()?.song?.id
         val next = ArrayList<FreeplayEntry?>(entries.size + 1)
         next += null
-        for (entry in entries) {
+        for (entry in letterFilteredEntries()) {
             if (entry.song.difficulty(currentDifficulty, resolvedVariation(entry)) != null) {
                 next += entry
             }
@@ -1489,8 +1537,11 @@ class SongSelectScene : Scene() {
                 }
             }
             for (capsule in viewCapsules) capsule.update(d)
+            letterSort?.update(d)
             for (selector in selectors) selector.update(d)
             albumTitle?.update(d)
+            updateAlbumTitleSwitch()
+            albumArtAnimator?.update(d)
             albumStarsView?.update(d)
             albumFlames?.update(d)
             highscoreSprite?.update(d)
@@ -1721,6 +1772,7 @@ class SongSelectScene : Scene() {
         difficultyDots.forEach { it.visible = true }
         updateTopUi()
         updateAlbum()
+        albumRollReady = true
         requestPreview()
     }
 
@@ -1741,39 +1793,31 @@ class SongSelectScene : Scene() {
             return
         }
 
-        // FNF's MenuTypedList repeats after holding for a moment. 0.35 s feels
-        // close to the 0.9 s/0.07 s pair in FreeplayState's handleDirectionalInput.
-        val up = input.justPressed(2)
-        val down = input.justPressed(1)
-        if (up && !down) {
-            changeSelection(-1)
-            upHold = 0.0
-        } else if (down && !up) {
-            changeSelection(1)
-            downHold = 0.0
+        // `FreeplayState.handleDirectionalInput`: change once on press, then
+        // start repeating every 0.07 s after the key has been held for 0.9 s.
+        val up = input.isDown(2)
+        val down = input.isDown(1)
+        if (up || down) {
+            if (spamming) {
+                if (spamTimer >= 0.07) {
+                    spamTimer = 0.0
+                    changeSelection(if (up) -1 else 1)
+                }
+            } else if (spamTimer >= 0.9) {
+                spamming = true
+            } else if (spamTimer <= 0.0) {
+                changeSelection(if (up) -1 else 1)
+            }
+            spamTimer += dt
         } else {
-            if (input.isDown(2)) {
-                upHold += dt
-                if (upHold >= 0.35) {
-                    changeSelection(-1)
-                    upHold = 0.07
-                }
-            } else {
-                upHold = 0.0
-            }
-            if (input.isDown(1)) {
-                downHold += dt
-                if (downHold >= 0.35) {
-                    changeSelection(1)
-                    downHold = 0.07
-                }
-            } else {
-                downHold = 0.0
-            }
+            spamming = false
+            spamTimer = 0.0
         }
 
         if (input.justPressed(0)) changeDifficulty(-1)
         if (input.justPressed(3)) changeDifficulty(1)
+        if (input.letterSortLeft) letterSort?.changeSelection(-1)
+        if (input.letterSortRight) letterSort?.changeSelection(1)
         if (input.nextVariation) changeVariation(1)
         if (input.previousVariation) changeVariation(-1)
     }
@@ -1934,3 +1978,72 @@ private class FreeplayFlamesView {
         }
     }
 }
+
+/**
+ * Drives the album sleeve through `freeplay/albumRoll/freeplayAlbum`'s
+ * timeline. `intro` rolls it in, `switch` does the 8 px pop when a different
+ * album is selected, and `idle` holds the tilted pose. Each pose is applied to
+ * the plain album `Image` with the same matrix/bounds convention as
+ * `AnimateSpriteView`.
+ */
+private class AlbumArtAnimator(
+    private val atlas: AnimateAtlas,
+    private val art: Image,
+) {
+    private val bounds = atlas.bounds
+    private var frames: List<Int> = emptyList()
+    private var index = 0
+    private var elapsed = 0.0
+    private var loop = false
+    private var playing = false
+
+    /** Fired when a non-looping animation reaches its last frame. */
+    var onFinish: (() -> Unit)? = null
+
+    fun play(label: String, loop: Boolean = false) {
+        val list = atlas.labelFrames(label)
+        if (list.isEmpty()) return
+        frames = list
+        this.loop = loop
+        index = 0
+        elapsed = 0.0
+        playing = true
+        applyFrame(0)
+    }
+
+    fun update(dt: Double) {
+        if (!playing || frames.isEmpty()) return
+        elapsed += dt
+        val step = 1.0 / atlas.frameRate
+        var changed = false
+        while (elapsed >= step) {
+            elapsed -= step
+            if (index + 1 < frames.size) {
+                index++
+                changed = true
+            } else if (loop) {
+                index = 0
+                changed = true
+            } else {
+                playing = false
+                onFinish?.invoke()
+                break
+            }
+        }
+        if (changed) applyFrame(index)
+    }
+
+    private fun applyFrame(i: Int) {
+        val pose = atlas.poses.getOrNull(frames.getOrNull(i) ?: return) ?: return
+        val part = pose.parts.firstOrNull() ?: return
+        val m = part.matrix
+        art.x = ALBUM_ART_X + (m.tx - bounds.minX)
+        art.y = ALBUM_ART_Y + (m.ty - bounds.minY)
+        art.rotation = Math.toDegrees(atan2(m.b, m.a)).degrees
+        art.scaleX = hypot(m.a, m.b)
+        art.scaleY = hypot(m.c, m.d)
+    }
+}
+
+private const val ALBUM_ART_X = 920.0
+private const val ALBUM_ART_Y = 220.0

@@ -60,7 +60,7 @@ suspend fun main() = Korge(
         LoadingSceneTarget.toSong = true
         println(
             "KNF: requested boot song '$songId' " +
-                "(autoplay=${PlayRequest.autoplay}, story=${PlayRequest.storyMode})"
+                    "(autoplay=${PlayRequest.autoplay}, story=${PlayRequest.storyMode})"
         )
     }
 

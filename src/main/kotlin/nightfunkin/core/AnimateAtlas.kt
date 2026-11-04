@@ -498,6 +498,51 @@ class AnimateAtlas(
         }
         return b
     }
+
+    /**
+     * Root-timeline frames that play [symbolName] as a directly placed symbol.
+     *
+     * `sortedLetters` exports every letter as a run of root frames such as
+     * `# move` (56 frames) and `ALL` (one frame). FlxAnimate can address those
+     * symbols by name; this gives the same frames to [AnimateSpriteView]'s
+     * explicit-frame player.
+     */
+    fun symbolFrames(symbolName: String): List<Int> {
+        val timeline = rootTimeline ?: return emptyList()
+        for (layer in timeline.layers) {
+            val out = ArrayList<Int>()
+            for (i in 0 until layer.frameCount) {
+                val keyframe = layer.keyframeAt(i) ?: continue
+                if (keyframe.events.any { it.instance?.symbolName == symbolName }) out += i
+            }
+            if (out.isNotEmpty()) return out
+        }
+        return emptyList()
+    }
+
+    /**
+     * The root-instance translation of [symbolName], in stage coordinates.
+     *
+     * `FlxAnimate.play('ALL move')` swaps the stage symbol for that symbol's own
+     * timeline, so the sprite draws the symbol *without* the root instance
+     * matrix. Subtracting this translation from a root pose gives the same
+     * local coordinates, and `origin` stays where flxanimate puts it (0,0).
+     */
+    fun symbolOrigin(symbolName: String): Pair<Double, Double>? {
+        val timeline = rootTimeline ?: return null
+        for (layer in timeline.layers) {
+            for (i in 0 until layer.frameCount) {
+                val keyframe = layer.keyframeAt(i) ?: continue
+                val instance = keyframe.events.firstNotNullOfOrNull { event ->
+                    event.instance?.takeIf { it.symbolName == symbolName }
+                } ?: continue
+                val matrix = matOf(instance.matrix, instance.matrix3D)
+                return matrix.tx to matrix.ty
+            }
+        }
+        return null
+    }
+
     fun loadSprites(dir: String): Map<String, SpriteDef> {
         val json = KnfFiles.textOrNull("$dir/spritemap1.json") ?: return emptyMap()
         val bitmap: Bitmap = KnfFiles.bitmapOrNull("$dir/spritemap1.png") ?: return emptyMap()

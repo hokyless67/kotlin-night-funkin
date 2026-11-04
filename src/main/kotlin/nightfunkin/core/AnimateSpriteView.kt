@@ -1,5 +1,6 @@
 package nightfunkin.core
 
+import korlibs.image.color.RGBA
 import korlibs.korge.view.Container
 import korlibs.korge.view.Image
 import korlibs.math.geom.Anchor2D
@@ -22,8 +23,8 @@ class AnimateSpriteView(
 ) : Container() {
 
     private val box = atlas.bounds.takeUnless { it.empty } ?: atlas.boundsOf(0)
-    private val originX = if (applyStageMatrix) 0.0 else box.minX
-    private val originY = if (applyStageMatrix) 0.0 else box.minY
+    private var originX = if (applyStageMatrix) 0.0 else box.minX
+    private var originY = if (applyStageMatrix) 0.0 else box.minY
     private val images = ArrayList<Image>()
     private val placeholder = atlas.sprites.values.firstOrNull()?.slice
 
@@ -44,6 +45,7 @@ class AnimateSpriteView(
 
     private var frames: List<Int> = emptyList()
     private var elapsed = 0.0
+    private var tintColor: RGBA? = null
 
     init {
         val parts = atlas.poses.maxOfOrNull { it.parts.size } ?: 0
@@ -71,9 +73,18 @@ class AnimateSpriteView(
         nextFrames: List<Int>,
         loop: Boolean = false,
         restart: Boolean = true,
+        animationBounds: Bounds? = null,
+        origin: Pair<Double, Double>? = null,
     ) {
         if (nextFrames.isEmpty()) return
         if (!restart && name == currentAnimation && playing) return
+        if (origin != null) {
+            originX = origin.first
+            originY = origin.second
+        } else if (animationBounds != null && !animationBounds.empty) {
+            originX = animationBounds.minX
+            originY = animationBounds.minY
+        }
         this.loop = loop
         frames = nextFrames
         currentAnimation = name
@@ -82,6 +93,12 @@ class AnimateSpriteView(
         elapsed = 0.0
         frameIndex = 0
         render(frames[0])
+    }
+
+    /** Tints every part, matching `FlxSprite.color` on a `FreeplayLetter`. */
+    fun applyTint(color: RGBA) {
+        tintColor = color
+        for (img in images) img.tint = color
     }
 
     /** Pauses on the current frame. */
@@ -124,6 +141,7 @@ class AnimateSpriteView(
             }
             img.visible = true
             img.bitmap = def.slice
+            tintColor?.let { img.tint = it }
             val m = if (applyStageMatrix) {
                 part.matrix.under(atlas.stageMatrix)
             } else {

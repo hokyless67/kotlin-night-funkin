@@ -258,9 +258,12 @@ internal class FreeplayCapsule(
             alpha = (introClock / 0.18).coerceIn(0.0, 1.0)
         }
 
-        val follow = 1.0 - 0.18.pow((dt * 60.0).coerceAtLeast(0.0))
-        x += (targetX - x) * follow
-        y += (targetY - y) * follow
+        // `SongMenuItem.update`: x and y use different smoothing durations.
+        // `smoothLerpPrecision` keeps only 1% of the remaining distance after
+        // the duration, which makes held-key scrolling glide instead of
+        // snapping one capsule at a time.
+        x = smoothLerpPrecision(x, targetX, dt, 0.256)
+        y = smoothLerpPrecision(y, targetY, dt, 0.192)
 
         if (!introFinished && introClock >= 0.7) {
             introFinished = true
@@ -580,4 +583,22 @@ internal class FreeplayCapsule(
             }.toMap()
         }
     }
+}
+
+/**
+ * Port of `MathUtil.smoothLerpPrecision` from `funkin.util.MathUtil`.
+ * Framerate-independent exponential decay: after [duration] seconds only
+ * [precision] of the original distance remains.
+ */
+private fun smoothLerpPrecision(
+    base: Double,
+    target: Double,
+    deltaTime: Double,
+    duration: Double,
+    precision: Double = 0.01,
+): Double {
+    if (deltaTime == 0.0) return base
+    if (base == target) return target
+    val factor = precision.pow(deltaTime / duration)
+    return target + factor * (base - target)
 }
