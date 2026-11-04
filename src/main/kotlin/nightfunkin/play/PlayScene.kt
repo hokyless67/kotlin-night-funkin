@@ -903,6 +903,13 @@ class PlayScene : Scene() {
 
         updateHudFade(dt)
         camera.update(dt)
+        // FNF's camHUD zoom scales every HUD element around the screen centre;
+        // shifting by `centre * (1 - zoom)` keeps the middle pinned.
+        val hudZoom = camera.hudZoom
+        hudContainer.scaleX = hudZoom
+        hudContainer.scaleY = hudZoom
+        hudContainer.x = Constants.GAME_WIDTH / 2.0 * (1.0 - hudZoom)
+        hudContainer.y = Constants.GAME_HEIGHT / 2.0 * (1.0 - hudZoom)
         for (layer in characterLayers) {
             layer.container.x = (1.0 - layer.scrollX) * camera.scrollX
             layer.container.y = (1.0 - layer.scrollY) * camera.scrollY

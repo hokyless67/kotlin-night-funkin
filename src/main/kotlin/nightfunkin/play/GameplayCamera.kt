@@ -62,6 +62,14 @@ class GameplayCamera(
     var bopOffset: Int = Constants.DEFAULT_ZOOM_OFFSET
     var hudZoomIntensity: Double = Constants.HUD_ZOOM_INTENSITY.toDouble()
 
+    /**
+     * FNF's `camHUD.zoom`: bumped by [hudZoomIntensity] on every bop step and
+     * decayed back to `defaultHUDCameraZoom` (1.0) each frame. PlayScene scales
+     * the HUD layer with this value.
+     */
+    var hudZoom: Double = 1.0
+        private set
+
     private var snapNextFrame = true
 
     // ---- API ------------------------------------------------------------
@@ -113,7 +121,12 @@ class GameplayCamera(
         if (!bopEnabled) return
         if (bopRate <= 0) return
         if ((step + bopOffset * 4) % (bopRate * 4) == 0) {
+            // `PlayState.stepHit`: one gate covers both the camera bop and the
+            // camHUD bump, including the 135% ceiling for fast bop rates.
+            if (hudZoom >= Constants.MAX_RELATIVE_CAM_ZOOM) return
             bopMultiplier = bopIntensity
+            // `camHUD.zoom += hudCameraZoomIntensity * defaultHUDCameraZoom`.
+            hudZoom += hudZoomIntensity
         }
     }
 
@@ -135,8 +148,15 @@ class GameplayCamera(
         }
 
         // Exponential decay, exactly like FNF's `pow(0.95, elapsed * 60)`.
+        // `PlayState.update` decays both the bop multiplier and the camHUD
+        // zoom inside `if (subState == null && cameraZoomRate > 0.0)`, so a
+        // scripted zero rate freezes them instead of settling.
         val decay = Constants.BOP_DECAY_PER_FRAME.toDouble().pow(dtSeconds * 60.0)
-        bopMultiplier = 1.0 + (bopMultiplier - 1.0) * decay
+        if (bopRate > 0) {
+            bopMultiplier = 1.0 + (bopMultiplier - 1.0) * decay
+            // `camHUD.zoom = FlxMath.lerp(defaultHUDCameraZoom, camHUD.zoom, ...)`.
+            hudZoom = 1.0 + (hudZoom - 1.0) * decay
+        }
 
         zoom += (targetZoom - zoom) * (1.0 - decay).coerceIn(0.0, 1.0)
 
