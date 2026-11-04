@@ -44,6 +44,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.random.Random
 
 /**
@@ -57,8 +58,11 @@ import kotlin.random.Random
  * playable characters as seen. Freeplay therefore uses BF's scripted
  * `BoyfriendCard` (the yellow card with the giant marquee text), while
  * `NewCharacterCard` remains available for saves with an unseen character.
- * Q/E still cycle song variations (default/erect/pico/bf), preserving the
- * previous song-list behaviour.
+ * A/D cycles every difficulty visible to BF (easy/normal/hard/erect/nightmare
+ * per `listAllDifficulties`), the variation is derived per song like
+ * `changeDiff` does, and there is no manual variation cycling. HOME/END jump
+ * to the first/last capsule and F toggles the favourite heart, matching
+ * 0.8.6's Solo bindings.
  */
 class SongSelectScene : Scene() {
 
@@ -79,7 +83,6 @@ class SongSelectScene : Scene() {
 
     private var selected = 1
     private var currentDifficulty = rememberedDifficulty
-    private var currentVariation = rememberedVariation
 
     private val allCapsules = ArrayList<FreeplayCapsule>()
     private val capsuleBySong = HashMap<String, FreeplayCapsule>()
@@ -88,6 +91,7 @@ class SongSelectScene : Scene() {
     private var viewCapsules: MutableList<FreeplayCapsule> = mutableListOf()
 
     private lateinit var cardLayer: Container
+    private lateinit var difficultyLayer: Container
     private lateinit var capsuleLayer: Container
     private lateinit var albumLayer: Container
     private lateinit var selectorLayer: Container
@@ -138,9 +142,20 @@ class SongSelectScene : Scene() {
     private var djAtlas: AnimateAtlas? = null
     private var dj: AnimateSpriteView? = null
 
-    private var difficultyView: Image? = null
+    // `grpDifficulties`: one badge sprite per difficulty id; the stock
+    // nightmare badge is a Sparrow `idle0` glitch loop, the rest are static.
+    private var difficultyView: DifficultyBadge? = null
+    private var difficultyViewIn: DifficultyBadge? = null
+    private val difficultyBadges = HashMap<String, DifficultyBadge>()
     private var shownDifficulty: String? = null
     private var selectors: List<SparrowSprite> = emptyList()
+
+    // `changeDiff`: the outgoing badge tweens out while the incoming one
+    // slides in from the opposite side, both over 0.2 s of circInOut.
+    private var badgeSlideActive = false
+    private var badgeSlideElapsed = 0.0
+    private var badgeSlideSign = 0
+    private var badgePendingDifficulty: String? = null
 
     private var albumArt: Image? = null
     private var albumTitle: SparrowSprite? = null
@@ -185,6 +200,10 @@ class SongSelectScene : Scene() {
     private var spamTimer = 0.0
     private var spamming = false
 
+    // `uiStateMachine.transition(Interacting)` from the favourite wiggle blocks
+    // input until its tweens finish.
+    private var interactLockTimer = 0.0
+
     private var transitioning = false
     private var leaving = false
     private var leaveElapsed = 0.0
@@ -202,8 +221,6 @@ class SongSelectScene : Scene() {
         bandFontMedium = fiveBySeven?.let { runCatching { BitmapFont(it, 60.0) }.getOrNull() }
         bandFontLarge = fiveBySeven?.let { runCatching { BitmapFont(it, 80.0) }.getOrNull() }
 
-        ensureDifficultyForVariation()
-
         solidRect(Constants.GAME_WIDTH.toDouble(), Constants.GAME_HEIGHT.toDouble(), Colors.BLACK)
 
         cardLayer = Container().also { addChild(it) }
@@ -212,7 +229,7 @@ class SongSelectScene : Scene() {
         val djLayer = Container().also { addChild(it) }
         buildDj(djLayer)
 
-        val difficultyLayer = Container().also { addChild(it) }
+        difficultyLayer = Container().also { addChild(it) }
         buildDifficulty(difficultyLayer)
 
         backingImage = buildBackingImage()
@@ -562,21 +579,17 @@ class SongSelectScene : Scene() {
     }
 
     private fun buildDifficulty(parent: Container) {
-        val bitmap = difficultyBitmap(currentDifficulty)
-        difficultyView = bitmap?.let {
-            Image(it).also { image ->
-                // `grpDifficulties` starts at x=-300 and tweens to x=90. The
-                // children are moved by the group setter, then each child is
-                // tweened to the same world x. FlxTypedSpriteGroup.x is only
-                // an offset holder, so the final rendered x is 90 (not 180).
-                // The source only changes the sprite's hitbox height (2.5x),
-                // not its graphic scale.
-                image.x = -300.0
-                image.y = 80.0
-                image.smoothing = false
-                parent.addChild(image)
-            }
-        }
+        val badge = obtainBadge(currentDifficulty) ?: return
+        // `grpDifficulties` starts at x=-300 and tweens to x=90. The
+        // children are moved by the group setter, then each child is
+        // tweened to the same world x. FlxTypedSpriteGroup.x is only
+        // an offset holder, so the final rendered x is 90 (not 180).
+        // The source only changes the sprite's hitbox height (2.5x),
+        // not its graphic scale.
+        badge.x = -300.0
+        badge.y = 80.0
+        badge.visible = true
+        difficultyView = badge
         shownDifficulty = currentDifficulty
     }
 
@@ -588,12 +601,14 @@ class SongSelectScene : Scene() {
         if (frames.isEmpty()) return
 
         val left = SparrowSprite(atlas, frames, fps = 24.0, loop = true).also {
+            it.setPixelArt(true)
             it.x = 20.0
             it.y = 70.0
             it.alpha = 0.0
             parent.addChild(it)
         }
         val right = SparrowSprite(atlas, frames, fps = 24.0, loop = true).also {
+            it.setPixelArt(true)
             it.x = 374.0
             it.y = 70.0
             it.scaleX = -1.0
@@ -714,6 +729,7 @@ class SongSelectScene : Scene() {
     private fun changeLetterFilter(letter: String) {
         val wasRandom = selected == 0
         val currentSong = selectedEntry()?.song?.id
+        val previewBefore = previewTarget()
         letterFilter = letter
 
         rebuildVisible(preserveSongId = currentSong)
@@ -726,20 +742,23 @@ class SongSelectScene : Scene() {
         // `generateSongList(..., force = true, onlyIfChanged = false)` rebuilds
         // every capsule and plays the jump-in again after a tab change.
         viewCapsules.forEachIndexed { index, capsule ->
-            capsule.x = Constants.GAME_WIDTH.toDouble()
-            capsule.startIntro(0.12 + index * 0.035)
+            capsule.startIntro(intendedY((index + 1).toDouble()) + 10.0)
         }
 
         updateSelectionStats()
         updateTopUi()
         rememberSelection()
-        requestPreview()
+        requestPreviewIfTargetChanged(previewBefore)
     }
 
     /** `FreeplayState.sortSongs`'s REGEXP / FAVORITE cases for the top tabs. */
     private fun matchesLetterFilter(entry: FreeplayEntry): Boolean {
         if (letterFilter == "ALL") return true
-        if (letterFilter == "fav") return false // no favourites are stored yet
+        if (letterFilter == "fav") {
+            // `filteredSong.isFav`: favourites are keyed `songId:variation`.
+            val variation = resolvedVariation(entry)
+            return Save.isSongFavorited("${entry.song.id}:$variation")
+        }
         val first = entry.song.name.firstOrNull()?.uppercaseChar() ?: return false
         if (letterFilter == "#") return first in '0'..'9'
         if (letterFilter.length == 1) return first == letterFilter[0]
@@ -763,6 +782,7 @@ class SongSelectScene : Scene() {
         val frames = atlas.framesByPrefix("highscore small instance 1")
         if (frames.isEmpty()) return
         highscoreSprite = SparrowSprite(atlas, frames, fps = 24.0, loop = false).also {
+            it.setPixelArt(true)
             it.x = 860.0
             it.y = 70.0
             it.visible = false
@@ -902,15 +922,13 @@ class SongSelectScene : Scene() {
 
     private fun updateDifficultyDots() {
         if (difficultyDots.isEmpty()) return
-        val full = listOf("easy", "normal", "hard", "erect", "nightmare")
+        val full = Constants.DEFAULT_DIFFICULTY_LIST_FULL
         val selectedIndex = full.indexOf(currentDifficulty)
-        val selectable = if (currentVariation == "erect") {
-            setOf("erect", "nightmare")
-        } else {
-            setOf("easy", "normal", "hard")
-        }
+        val entry = selectedEntry()
         for ((i, dot) in difficultyDots.withIndex()) {
-            val available = full[i] in selectable
+            // `refreshDots`: a difficulty the current song lacks (in any
+            // bf-visible variation) renders in the dimmed INACTIVE state.
+            val available = entry != null && hasDifficultyForCharacter(entry, full[i])
             dot.visible = true
             dot.alpha = if (available) 1.0 else 0.33
             val shade = when {
@@ -1014,20 +1032,111 @@ class SongSelectScene : Scene() {
     }
 
     private fun updateDifficultyVisual() {
+        // The badge slide animation performs the swap itself once the incoming
+        // badge lands.
+        if (badgeSlideActive) return
         if (shownDifficulty == currentDifficulty) return
+        val badge = obtainBadge(currentDifficulty) ?: return
         shownDifficulty = currentDifficulty
-        val bitmap = difficultyBitmap(currentDifficulty) ?: return
-        difficultyView?.bitmap = bitmap.sliceWithSize(0, 0, bitmap.width, bitmap.height)
-        difficultyView?.visible = true
+        difficultyView?.visible = false
+        badge.x = 90.0
+        badge.y = 80.0
+        badge.alpha = 1.0
+        badge.visible = true
+        difficultyView = badge
     }
 
-    private fun difficultyBitmap(difficulty: String): korlibs.image.bitmap.Bitmap? {
-        var assetId = difficulty
-        while (assetId.isNotEmpty()) {
-            KnfFiles.bitmapOrNull("preload/images/freeplay/freeplay$assetId.png")?.let { return it }
-            assetId = assetId.substringBeforeLast('-', "")
+    /**
+     * `changeDiff` + `handleDifficultySwitch`: changeDiff starts a slide-out
+     * tween for the old badge and a slide-in for the new one, but the
+     * generateSongList call right after runs changeSelection -> changeDiff(0),
+     * whose `diffSprite.visible = isCurrentDiff` sync hides the old badge the
+     * same frame. Its slide-out tween is therefore never seen: the old badge
+     * disappears instantly while the new one is already visible at the entry
+     * side (alpha 0.5, drawn 5 px up by the offset flash) and slides to 90
+     * over 0.2 s of circInOut, reaching full alpha on the 1/24 s mark.
+     */
+    private fun startDifficultyBadgeSlide(delta: Int, newDifficulty: String) {
+        // The intro slide shares the sprite; park it on its final position.
+        if (difficultySlideActive) {
+            difficultySlideActive = false
+            difficultyView?.x = 90.0
         }
-        return null
+        // A press during the 0.4 s slide lands the previous tween instantly.
+        if (badgeSlideActive) finishBadgeSlide()
+
+        val outgoing = difficultyView ?: return
+        val incoming = obtainBadge(newDifficulty) ?: return
+
+        badgeSlideSign = if (delta > 0) 1 else -1
+        badgePendingDifficulty = newDifficulty
+        badgeSlideElapsed = 0.0
+
+        // The slide-out tween exists in the source but is occluded the same
+        // frame; park the old badge straight away.
+        outgoing.visible = false
+        outgoing.x = 90.0
+
+        incoming.x = if (badgeSlideSign > 0) 500.0 else -320.0
+        incoming.y = 80.0 - 5.0
+        incoming.alpha = 0.5
+        incoming.visible = true
+        difficultyViewIn = incoming
+        badgeSlideActive = true
+    }
+
+    private fun updateBadgeSlide(dt: Double) {
+        badgeSlideElapsed += dt
+        val t = (badgeSlideElapsed / 0.2).coerceIn(0.0, 1.0)
+        val eased = circInOut(t)
+        val enterX = if (badgeSlideSign > 0) 500.0 else -320.0
+
+        difficultyViewIn?.let { incoming ->
+            incoming.x = enterX + (90.0 - enterX) * eased
+            // The 1/24 s flash timer: full alpha and the offset reset.
+            if (badgeSlideElapsed >= 1.0 / 24.0) {
+                incoming.alpha = 1.0
+                incoming.y = 80.0
+            }
+        }
+
+        if (t >= 1.0) finishBadgeSlide()
+    }
+
+    private fun finishBadgeSlide() {
+        badgeSlideActive = false
+        // The outgoing tween's onComplete: park back at 90 and hide.
+        difficultyView?.also {
+            it.x = 90.0
+            it.y = 80.0
+            it.alpha = 1.0
+            it.visible = false
+        }
+        difficultyViewIn?.also { incoming ->
+            incoming.x = 90.0
+            incoming.y = 80.0
+            incoming.alpha = 1.0
+            incoming.visible = true
+            difficultyView = incoming
+        }
+        difficultyViewIn = null
+        shownDifficulty = badgePendingDifficulty
+    }
+
+    private fun circInOut(t: Double): Double =
+        if (t < 0.5) {
+            (1.0 - sqrt(1.0 - 4.0 * t * t)) / 2.0
+        } else {
+            (1.0 + sqrt(1.0 - (2.0 - 2.0 * t).pow(2.0))) / 2.0
+        }
+
+    /** `grpDifficulties` recycles one sprite per difficulty id. */
+    private fun obtainBadge(difficultyId: String): DifficultyBadge? {
+        difficultyBadges[difficultyId]?.let { return it }
+        val badge = DifficultyBadge(difficultyLayer, difficultyId)
+        if (!badge.hasContent) return null
+        difficultyBadges[difficultyId] = badge
+        return badge
     }
 
     // ======================================================================
@@ -1099,6 +1208,7 @@ class SongSelectScene : Scene() {
                 ).also {
                     // AlbumRoll: FunkinSprite.createSparrow(width - 355, 500)
                     // plus the album's title offsets. No scale.
+                    it.setPixelArt(true)
                     it.x = 925.0 + offsetX
                     it.y = 500.0 + offsetY
                     albumLayer.addChild(it)
@@ -1216,16 +1326,23 @@ class SongSelectScene : Scene() {
     /**
      * Rebuilds the visible capsule list for the current difficulty/variation.
      * Random is always index zero, exactly like `FreeplayState.generateSongList`.
+     *
+     * [fallbackRandom] selects Random when the remembered song is gone, the
+     * way `generateSongList` does; the letter-sort callback instead lands on
+     * the first real song (`curSelected = 1`).
      */
     private fun rebuildVisible(
         preserveSongId: String? = null,
         initial: Boolean = false,
+        fallbackRandom: Boolean = false,
     ) {
         val keep = preserveSongId ?: selectedEntry()?.song?.id
         val next = ArrayList<FreeplayEntry?>(entries.size + 1)
         next += null
         for (entry in letterFilteredEntries()) {
-            if (entry.song.difficulty(currentDifficulty, resolvedVariation(entry)) != null) {
+            // `generateSongList`: keep songs that have the difficulty in any
+            // variation visible to the character.
+            if (hasDifficultyForCharacter(entry, currentDifficulty)) {
                 next += entry
             }
         }
@@ -1248,13 +1365,14 @@ class SongSelectScene : Scene() {
             val entry = visible.getOrNull(index)
             capsule.refresh(
                 currentDifficulty,
-                if (entry == null) currentVariation else resolvedVariation(entry),
+                if (entry == null) Constants.DEFAULT_VARIATION else resolvedVariation(entry),
             )
         }
 
         val keptIndex = if (keep == null) -1 else visible.indexOfFirst { it?.song?.id == keep }
         selected = when {
             keptIndex > 0 -> keptIndex
+            fallbackRandom -> 0
             visible.size > 1 -> 1
             else -> 0
         }
@@ -1264,11 +1382,7 @@ class SongSelectScene : Scene() {
 
         if (initial) {
             viewCapsules.forEachIndexed { index, capsule ->
-                // SongMenuItem.initPosition(width, 0) + intendedY before the
-                // jump-in; only the horizontal position animates in.
-                capsule.x = Constants.GAME_WIDTH.toDouble()
-                capsule.y = capsule.targetY
-                capsule.startIntro(0.12 + index * 0.035)
+                capsule.startIntro(intendedY((index + 1).toDouble()) + 10.0)
             }
         }
 
@@ -1300,99 +1414,182 @@ class SongSelectScene : Scene() {
 
     private fun changeSelection(delta: Int) {
         if (viewCapsules.isEmpty()) return
+        val previous = selected
         selected = ((selected + delta) % viewCapsules.size + viewCapsules.size) % viewCapsules.size
+        // `if (curSelected != prevSelected)` gates the scroll sound, so HOME /
+        // END on the edge of the list stay silent.
+        if (selected == previous) return
         updateSelectionPositions()
         updateAlbum()
         updateSelectionStats()
+        // changeSelection runs changeDiff(0) in the source, and that calls
+        // refreshDots: the dimmed dots follow the newly selected song.
+        updateDifficultyDots()
         rememberSelection()
         scrollSound?.let { sfx.play(it, 0.4) }
         requestPreview()
     }
 
     private fun changeDifficulty(delta: Int) {
-        val choices = difficultyChoices()
+        val choices = availableDifficulties()
         if (choices.isEmpty()) return
-        val index = choices.indexOf(currentDifficulty).let { if (it < 0) 0 else it }
-        currentDifficulty = choices[(index + delta + choices.size) % choices.size]
-        rebuildVisible(preserveSongId = selectedEntry()?.song?.id ?: rememberedSongId)
+        var index = choices.indexOf(currentDifficulty)
+        if (index < 0) index = choices.indexOf(Constants.DEFAULT_DIFFICULTY)
+        if (index < 0) index = 0
+        val newDifficulty = choices[(index + delta + choices.size) % choices.size]
+
+        // `changeDiff`: when the current song lacks the new difficulty, the
+        // selection jumps to the nearest capsule that has it before the list
+        // is regenerated. Selecting Random keeps Random selected.
+        val entry = selectedEntry()
+        val previewBefore = entry?.let { it.song.id to resolvedVariation(it) }
+        val preserveSongId: String? = when {
+            entry == null -> null
+            hasDifficultyForCharacter(entry, newDifficulty) -> entry.song.id
+            else -> visible.getOrNull(findClosestDiff(newDifficulty))?.song?.id
+        }
+
+        startDifficultyBadgeSlide(delta, newDifficulty)
+        currentDifficulty = newDifficulty
+        rebuildVisible(preserveSongId = preserveSongId, fallbackRandom = true)
+        // `handleDifficultySwitch` regenerates the list with force=true, so
+        // the capsules replay the same simultaneous jump-in after every
+        // difficulty change.
+        viewCapsules.forEachIndexed { capsuleIndex, capsule ->
+            capsule.startIntro(intendedY((capsuleIndex + 1).toDouble()) + 10.0)
+        }
         updateTopUi()
         rememberSelection()
         scrollSound?.let { sfx.play(it, 0.4) }
-        requestPreview()
+        // `playCurSongPreview` runs with `restartTrack: false`: a pure
+        // difficulty switch keeps the current preview playing.
+        requestPreviewIfTargetChanged(previewBefore)
     }
 
-    private fun changeVariation(delta: Int) {
-        val variations = Constants.DEFAULT_VARIATION_LIST
-        val index = variations.indexOf(currentVariation).let { if (it < 0) 0 else it }
-        currentVariation = variations[(index + delta + variations.size) % variations.size]
-        ensureDifficultyForVariation()
-        rebuildVisible(preserveSongId = selectedEntry()?.song?.id ?: rememberedSongId)
-        updateTopUi()
-        rememberSelection()
-        scrollSound?.let { sfx.play(it, 0.4) }
-        requestPreview()
+    /** `FreeplayState.favoriteSong`: F toggles the heart on the selected song. */
+    private fun favoriteSong() {
+        val capsule = viewCapsules.getOrNull(selected) ?: return
+        val entry = selectedEntry() ?: return
+        val key = "${entry.song.id}:${resolvedVariation(entry)}"
+        val isFav = if (Save.isSongFavorited(key)) {
+            Save.unfavoriteSong(key)
+            false
+        } else {
+            Save.favoriteSong(key)
+            true
+        }
+        capsule.setFavorite(isFav)
+        if (isFav) {
+            favSound?.let { sfx.play(it, 1.0) }
+        } else {
+            unfavSound?.let { sfx.play(it, 1.0) }
+        }
+        // The wiggle runs under `uiStateMachine.transition(Interacting)`.
+        interactLockTimer = 0.2
     }
+
+    // ----------------------------------------------------------------------
+    // Character variations (`Song.getVariationsByCharacter` for BF)
+    // ----------------------------------------------------------------------
 
     /**
-     * `FreeplaySongData.curVariation` for the default BF profile.
+     * `Song.getVariationsByCharacter(currentCharacter)`: the song's variations
+     * whose player character is visible to BF, in `defaultsThenAlphabetically`
+     * order against `DEFAULT_VARIATION_LIST`.
      *
-     * FNF does not use a global variation for every song: it picks the first
-     * variation owned by the current character. The shipped BF player owns
-     * `bf*`, so weekend 1 songs (whose default chart uses Pico) resolve to the
-     * `bf` mix, while week 1/2/3 songs keep their default charts.
-     *
-     * Q/E still force a concrete variation; in that mode unavailable songs are
-     * filtered out instead of silently falling back.
+     * `shouldShowCharacter` shows a char when BF owns it (`bf*`) or when no
+     * playable character owns it (`bf.json`'s `showUnownedChars = true`). The
+     * only other stock owner is the Pico player, whose chars are hidden from
+     * BF, so visibility reduces to "not a pico char".
      */
-    private fun resolvedVariation(entry: FreeplayEntry): String {
-        if (currentVariation != Constants.DEFAULT_VARIATION) return currentVariation
+    private fun characterVariations(entry: FreeplayEntry): List<String> =
+        entry.song.variations
+            .filter { isVariationVisibleToBf(entry.song.metadataFor(it).playData.characters.player) }
+            .sortedWith(
+                compareBy(
+                    { difficultyOrVariationSortIndex(it, Constants.DEFAULT_VARIATION_LIST) },
+                    { it },
+                ),
+            )
 
-        val defaultPlayer = entry.song.metadataFor(Constants.DEFAULT_VARIATION)
-            .playData.characters.player
-        if (isBfPlayer(defaultPlayer) &&
-            entry.song.difficulty(currentDifficulty, Constants.DEFAULT_VARIATION) != null
-        ) {
-            return Constants.DEFAULT_VARIATION
-        }
+    private fun isVariationVisibleToBf(player: String): Boolean = !isPicoPlayer(player)
 
-        if (entry.song.variations.contains("bf") &&
-            entry.song.difficulty(currentDifficulty, "bf") != null
-        ) {
-            val bfPlayer = entry.song.metadataFor("bf").playData.characters.player
-            if (isBfPlayer(bfPlayer)) return "bf"
-        }
+    private fun isPicoPlayer(player: String): Boolean =
+        player == "pico" || player.startsWith("pico-")
 
-        if (entry.song.difficulty(currentDifficulty, Constants.DEFAULT_VARIATION) != null) {
-            return Constants.DEFAULT_VARIATION
+    /** `Song.listDifficulties(variations)`: declared difficulties, sorted. */
+    private fun listDifficultiesFor(entry: FreeplayEntry, variations: List<String>): List<String> =
+        variations.flatMap { entry.song.difficultiesFor(it) }
+            .distinct()
+            .sortedWith(compareBy({ difficultyOrVariationSortIndex(it, Constants.DEFAULT_DIFFICULTY_LIST_FULL) }, { it }))
+
+    /** `Song.hasDifficulty`: any bf-visible variation declares the difficulty. */
+    private fun hasDifficultyForCharacter(entry: FreeplayEntry, diff: String): Boolean =
+        characterVariations(entry).any { entry.song.difficultiesFor(it).contains(diff) }
+
+    /** `SongRegistry.listAllDifficulties(currentCharacterId)` for BF. */
+    private fun availableDifficulties(): List<String> {
+        val found = LinkedHashSet<String>()
+        for (entry in entries) {
+            found.addAll(listDifficultiesFor(entry, characterVariations(entry)))
         }
-        return entry.song.variations.firstOrNull {
-            entry.song.difficulty(currentDifficulty, it) != null
-        } ?: Constants.DEFAULT_VARIATION
+        if (found.isEmpty()) return Constants.DEFAULT_DIFFICULTY_LIST
+        return found.sortedWith(compareBy({ difficultyOrVariationSortIndex(it, Constants.DEFAULT_DIFFICULTY_LIST_FULL) }, { it }))
     }
 
-    private fun isBfPlayer(player: String): Boolean =
-        player == "bf" || player.startsWith("bf-")
+    /** `SortUtil.defaultsThenAlphabetically`: defaults first, unknowns after, A-Z. */
+    private fun difficultyOrVariationSortIndex(value: String, defaults: List<String>): Int =
+        defaults.indexOf(value).let { if (it < 0) Int.MAX_VALUE else it }
 
-    private fun difficultyChoices(): List<String> =
-        if (currentVariation == "erect") listOf("erect", "nightmare")
-        else Constants.DEFAULT_DIFFICULTY_LIST
+    /**
+     * `changeDiff`'s variation loop: the first bf-visible variation (defaults
+     * first, then alphabetical) that declares the current difficulty owns the
+     * mix. Erect remixes therefore pick the `erect` variation automatically,
+     * and weekend 1 songs resolve to their `bf` mix.
+     */
+    private fun resolvedVariation(entry: FreeplayEntry): String =
+        characterVariations(entry)
+            .firstOrNull { entry.song.difficultiesFor(it).contains(currentDifficulty) }
+            ?: Constants.DEFAULT_VARIATION
 
-    private fun ensureDifficultyForVariation() {
-        val choices = difficultyChoices()
-        if (currentDifficulty in choices) return
-        currentDifficulty =
-            if ("normal" in choices) "normal" else choices.firstOrNull() ?: Constants.DEFAULT_DIFFICULTY
+    /**
+     * `findClosestDiff`: the capsule nearest to the selection (index distance
+     * in the current list) that has [diff]. The source's `closestIndex == 0`
+     * shortcut means "first candidate wins"; index 0 is the Random capsule, so
+     * it doubles as "no candidate yet".
+     */
+    private fun findClosestDiff(diff: String): Int {
+        var closestIndex = -1
+        for ((index, entry) in visible.withIndex()) {
+            entry ?: continue
+            if (!hasDifficultyForCharacter(entry, diff)) continue
+            val distance = abs(selected - index)
+            if (closestIndex == -1 || distance < abs(closestIndex - selected)) closestIndex = index
+        }
+        return closestIndex
     }
 
     private fun rememberSelection() {
         rememberedSongId = selectedEntry()?.song?.id
         rememberedDifficulty = currentDifficulty
-        rememberedVariation = currentVariation
     }
 
     // ======================================================================
     // Preview / playback
     // ======================================================================
+
+    /** The `(songId, variation)` pair the song preview is targeting right now. */
+    private fun previewTarget(): Pair<String, String>? =
+        selectedEntry()?.let { it.song.id to resolvedVariation(it) }
+
+    /**
+     * `playCurSongPreview` calls `FunkinSound.playMusic(..., restartTrack: false)`:
+     * an unchanged target keeps the current preview playing seamlessly instead
+     * of restarting it, so only real song/variation switches reload the track.
+     */
+    private fun requestPreviewIfTargetChanged(previous: Pair<String, String>?) {
+        if (previewTarget() != previous) requestPreview()
+    }
 
     private fun requestPreview() {
         // FNF starts the preview from the `onDJIntroDone` changeSelection call,
@@ -1467,7 +1664,6 @@ class SongSelectScene : Scene() {
 
         rememberedSongId = entry.song.id
         rememberedDifficulty = currentDifficulty
-        rememberedVariation = currentVariation
 
         stopPreview()
         launch { sceneContainer.changeTo<PlayScene>() }
@@ -1493,11 +1689,15 @@ class SongSelectScene : Scene() {
     private var confirmSound: String? = null
     private var scrollSound: String? = null
     private var cancelSound: String? = null
+    private var favSound: String? = null
+    private var unfavSound: String? = null
 
     private suspend fun loadSounds() {
         confirmSound = KnfFiles.resolveSound("preload/sounds/confirmMenu")?.also { sfx.preload(it) }
         scrollSound = KnfFiles.resolveSound("preload/sounds/scrollMenu")?.also { sfx.preload(it) }
         cancelSound = KnfFiles.resolveSound("preload/sounds/cancelMenu")?.also { sfx.preload(it) }
+        favSound = KnfFiles.resolveSound("preload/sounds/fav")?.also { sfx.preload(it) }
+        unfavSound = KnfFiles.resolveSound("preload/sounds/unfav")?.also { sfx.preload(it) }
     }
 
     // ======================================================================
@@ -1539,6 +1739,7 @@ class SongSelectScene : Scene() {
             for (capsule in viewCapsules) capsule.update(d)
             letterSort?.update(d)
             for (selector in selectors) selector.update(d)
+            for (badge in difficultyBadges.values) badge.update(d)
             albumTitle?.update(d)
             updateAlbumTitleSwitch()
             albumArtAnimator?.update(d)
@@ -1628,6 +1829,8 @@ class SongSelectScene : Scene() {
                 difficultySlideActive = false
             }
         }
+
+        if (badgeSlideActive) updateBadgeSlide(dt)
 
         if (newCharacterCard) updateNewCharacterCard(dt) else updateBoyfriendCard(dt)
 
@@ -1784,12 +1987,33 @@ class SongSelectScene : Scene() {
         // until BF's turntable intro reaches `onDJIntroDone`.
         if (!djIntroDone) return
 
+        // The favourite wiggle runs under `Interacting`, which pauses every
+        // input for its 0.2 s just like the source's state machine.
+        if (interactLockTimer > 0.0) {
+            interactLockTimer -= dt
+            return
+        }
+
         if (input.back) {
             backToMenu()
             return
         }
         if (input.accept) {
             startSelected()
+            return
+        }
+
+        // `controls.FREEPLAY_JUMP_TO_TOP` / `FREEPLAY_JUMP_TO_BOTTOM` (HOME/END).
+        if (input.jumpToTop) {
+            changeSelection(-selected)
+            return
+        }
+        if (input.jumpToBottom) {
+            changeSelection(viewCapsules.size - 1 - selected)
+            return
+        }
+        if (input.favorite) {
+            favoriteSong()
             return
         }
 
@@ -1818,8 +2042,6 @@ class SongSelectScene : Scene() {
         if (input.justPressed(3)) changeDifficulty(1)
         if (input.letterSortLeft) letterSort?.changeSelection(-1)
         if (input.letterSortRight) letterSort?.changeSelection(1)
-        if (input.nextVariation) changeVariation(1)
-        if (input.previousVariation) changeVariation(-1)
     }
 
     override suspend fun sceneDestroy() {
@@ -1848,7 +2070,60 @@ class SongSelectScene : Scene() {
         /** `FreeplayState.rememberedSongId` starts at the tutorial in FNF. */
         private var rememberedSongId: String? = "tutorial"
         private var rememberedDifficulty = Constants.DEFAULT_DIFFICULTY
-        private var rememberedVariation = Constants.DEFAULT_VARIATION
+    }
+}
+
+/**
+ * One `DifficultySprite` from `freeplay/components/DifficultySprite.hx`.
+ *
+ * The asset id sheds '-' suffixes until `freeplay<id>.png` exists; when a
+ * Sparrow XML ships next to it (stock nightmare), the sprite plays its
+ * looping `idle0` glitch animation at 24 fps instead of showing a static
+ * image. `Preferences.flashingLights` gates the animation and defaults on.
+ */
+private class DifficultyBadge(
+    parent: Container,
+    difficultyId: String,
+) : Container() {
+    val hasContent: Boolean
+    private val animation: SparrowSprite?
+
+    init {
+        animation = buildChild(difficultyId)
+        hasContent = numChildren > 0
+        x = 90.0
+        y = 80.0
+        visible = false
+        parent.addChild(this)
+    }
+
+    private fun buildChild(difficultyId: String): SparrowSprite? {
+        var assetId = difficultyId
+        while (assetId.isNotEmpty() && !KnfFiles.exists("preload/images/freeplay/freeplay$assetId.png")) {
+            assetId = assetId.substringBeforeLast('-', "")
+        }
+        if (assetId.isEmpty()) return null
+
+        val atlas = TextureAtlas.tryLoad("preload/images/freeplay/freeplay$assetId.xml")
+        val frames = atlas?.framesByPrefix("idle0").orEmpty().sortedBy { it.name }
+        if (atlas != null && frames.isNotEmpty()) {
+            return SparrowSprite(atlas, frames, fps = 24.0, loop = true).also {
+                // FlxSprite renders with antialiasing off; nearest sampling
+                // keeps the badge crisp while it slides.
+                it.setPixelArt(true)
+                addChild(it)
+                it.play(frames, restart = true)
+            }
+        }
+
+        KnfFiles.bitmapOrNull("preload/images/freeplay/freeplay$assetId.png")?.let { bitmap ->
+            addChild(Image(bitmap).also { it.smoothing = false })
+        }
+        return null
+    }
+
+    fun update(dt: Double) {
+        animation?.update(dt)
     }
 }
 
@@ -1930,6 +2205,7 @@ private class FreeplayFlamesView {
                     fps = Random.nextInt(23, 26).toDouble(),
                     loop = false,
                 ).also {
+                    it.setPixelArt(true)
                     it.x = FLAME_X + SPREAD_X * i
                     it.y = FLAME_Y + SPREAD_Y * i
                     it.visible = false

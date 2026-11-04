@@ -111,6 +111,9 @@ object Constants {
 
     // ---- song ids --------------------------------------------------------
     val DEFAULT_DIFFICULTY_LIST = listOf("easy", "normal", "hard")
+
+    /** `Constants.DEFAULT_DIFFICULTY_LIST_FULL`: drives `listAllDifficulties`'s sort order. */
+    val DEFAULT_DIFFICULTY_LIST_FULL = listOf("easy", "normal", "hard", "erect", "nightmare")
     val DEFAULT_VARIATION_LIST = listOf("default", "erect", "pico", "bf")
     const val DEFAULT_DIFFICULTY = "normal"
     const val DEFAULT_VARIATION = "default"

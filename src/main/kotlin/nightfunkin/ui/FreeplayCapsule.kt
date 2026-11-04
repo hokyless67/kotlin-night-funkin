@@ -11,6 +11,7 @@ import korlibs.korge.view.Container
 import korlibs.korge.view.Image
 import korlibs.korge.view.Text
 import korlibs.korge.view.text
+import nightfunkin.core.Constants
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.Save
 import nightfunkin.core.SparrowSprite
@@ -126,6 +127,7 @@ internal class FreeplayCapsule(
     private val rankSprite: SparrowSprite? =
         rankFrames.values.firstOrNull()?.let { first ->
             SparrowSprite(rankAtlas!!, first, fps = 24.0, loop = false).also {
+                it.setPixelArt(true)
                 it.x = 420.0
                 it.y = 41.0
                 it.scaleX = 0.9
@@ -145,13 +147,34 @@ internal class FreeplayCapsule(
     private var pixelIconSprite: SparrowSprite? = null
     private var pixelIconChar: String? = null
 
+    /** `favHeart` frames; the pop animation parks on the full heart. */
+    private val favFrames: List<TextureAtlas.AtlasFrame> =
+        favHeartAtlas?.framesByPrefix("favorite heart").orEmpty().sortedBy { it.name }
+
+    /** `favIconBlurred` is created first, so the plain heart draws above it. */
+    private val favIconBlurred: SparrowSprite? = makeFavHeart()
+    private val favIcon: SparrowSprite? = makeFavHeart()
+
+    // `favoriteSong()`: the capsule wiggles 5 px (expoOut/expoIn, 0.1 s each)
+    // with `doLerp` paused, up for a new favourite and down for a removed one.
+    private var bounceActive = false
+    private var bounceElapsed = 0.0
+    private var bounceStartY = 0.0
+    private var bounceDy = 0.0
+
+    /** Unfavouriting hides the shrinking hearts after a 0.2 s timer. */
+    private var favHideCountdown = 0.0
+
     var targetX = 0.0
         private set
     var targetY = 0.0
         private set
 
-    private var introClock = 0.0
-    private var introFinished = true
+    // `SongMenuItem`'s doJumpIn state: one squash frame per 1/24 s through
+    // `xFrames`, running while the container lerps in from the right edge.
+    private var jumpInActive = false
+    private var jumpInFrame = 0
+    private var jumpInTicker = 0.0
 
     init {
         setTitle(if (entry == null) "Random" else entry.song.name)
@@ -160,6 +183,20 @@ internal class FreeplayCapsule(
         // the right instead of staying permanently transparent.
         alpha = 1.0
         updateSelected()
+    }
+
+    /** `SongMenuItem`'s two ADD-blended `favHeart` sprites at 50x50. */
+    private fun makeFavHeart(): SparrowSprite? {
+        val atlas = favHeartAtlas ?: return null
+        val first = favFrames.firstOrNull() ?: return null
+        return SparrowSprite(atlas, favFrames, fps = 24.0, loop = false).also {
+            it.setPixelArt(true)
+            it.scaleX = FAV_ICON_SIZE / first.logicalWidth
+            it.scaleY = FAV_ICON_SIZE / first.logicalHeight
+            it.blendMode = BlendMode.ADD
+            it.visible = false
+            addChild(it)
+        }
     }
 
     private fun setTitle(value: String) {
@@ -192,13 +229,20 @@ internal class FreeplayCapsule(
     }
 
     /**
-     * Starts the right-to-left jump-in. FNF stages capsules by a frame timer;
-     * a small stagger gives the same cascading look without a timer heap.
+     * `initJumpIn(0, force = true)`: every rebuild replays the same jump-in —
+     * no stagger, alpha 1 immediately, the capsule flying in from the right
+     * edge (`initPosition(FlxG.width, 0)`) from the flattened
+     * `intendedY(index + 1) + 10` start row while its graphic squashes
+     * through `xFrames`.
      */
-    fun startIntro(delay: Double) {
-        introClock = -delay
-        introFinished = false
-        alpha = 0.0
+    fun startIntro(startY: Double) {
+        jumpInActive = true
+        jumpInFrame = 0
+        jumpInTicker = 0.0
+        x = Constants.GAME_WIDTH.toDouble()
+        y = startY
+        alpha = 1.0
+        bounceActive = false
     }
 
     fun setSelected(value: Boolean) {
@@ -208,6 +252,76 @@ internal class FreeplayCapsule(
         currentlySelected = value
         updateSelected()
     }
+
+    /**
+     * `FreeplayState.favoriteSong`: plays the heart pop for a new favourite or
+     * the reversed shrink (from frame 9) for a removed one, and wiggles the
+     * capsule 5 px in the matching direction.
+     */
+    fun setFavorite(isFav: Boolean) {
+        val icon = favIcon ?: return
+        favHideCountdown = 0.0
+        if (isFav) {
+            icon.visible = true
+            icon.play(favFrames, restart = true)
+            favIconBlurred?.also {
+                it.visible = true
+                it.play(favFrames, restart = true)
+            }
+            startBounce(-5.0)
+        } else {
+            // `play('fav', true, true, 9)`: shrink back out from the mid frame.
+            icon.play(favFrames, restart = true, reversed = true)
+            icon.seekTo(9)
+            favIconBlurred?.also {
+                it.play(favFrames, restart = true, reversed = true)
+                it.seekTo(9)
+            }
+            favHideCountdown = 0.2
+            startBounce(5.0)
+        }
+        // updateSelected only runs on a selection change; refresh these now.
+        icon.alpha = if (currentlySelected) 1.0 else 0.6
+        favIconBlurred?.alpha = if (currentlySelected) 1.0 else 0.0
+    }
+
+    private fun startBounce(dy: Double) {
+        bounceActive = true
+        bounceElapsed = 0.0
+        bounceStartY = y
+        bounceDy = dy
+    }
+
+    private fun setFavHeartsVisible(value: Boolean) {
+        favIcon?.visible = value
+        favIconBlurred?.visible = value
+    }
+
+    /**
+     * `initData`'s `favIcon.visible = freeplayData.isFav` plus `checkClip`'s
+     * heart placement: left of the rank badge when one is showing, otherwise
+     * at its resting spot.
+     */
+    private fun updateFavHearts(variation: String) {
+        val song = entry?.song ?: return
+        favHideCountdown = 0.0
+        val isFav = Save.isSongFavorited("${song.id}:$variation")
+        val x = if (rankSprite?.visible == true) FAV_ICON_X_WITH_RANK else FAV_ICON_X
+        favIcon?.also {
+            it.x = x
+            it.y = FAV_ICON_Y
+            it.visible = isFav
+        }
+        favIconBlurred?.also {
+            it.x = x
+            it.y = FAV_ICON_Y
+            it.visible = isFav
+        }
+    }
+
+    private fun expoOut(t: Double): Double = if (t >= 1.0) 1.0 else 1.0 - 2.0.pow(-10.0 * t)
+
+    private fun expoIn(t: Double): Double = if (t <= 0.0) 0.0 else 2.0.pow(10.0 * (t - 1.0))
 
     /** Re-reads the song metadata after a difficulty/variation switch. */
     fun refresh(difficulty: String, variation: String) {
@@ -220,6 +334,7 @@ internal class FreeplayCapsule(
             rankSprite?.visible = false
             appliedRankKey = null
             setPixelIcon(null)
+            setFavHeartsVisible(false)
             return
         }
 
@@ -239,6 +354,7 @@ internal class FreeplayCapsule(
         layoutWeekText()
 
         updateRank(difficulty, variation)
+        updateFavHearts(variation)
         updateSelected()
     }
 
@@ -247,32 +363,60 @@ internal class FreeplayCapsule(
         capsuleSprite?.update(dt)
         rankSprite?.update(dt)
         pixelIconSprite?.update(dt)
+        favIcon?.update(dt)
+        favIconBlurred?.update(dt)
         // Text bounds are only known after the first render.
         layoutWeekText()
 
-        if (!introFinished) {
-            introClock += dt
-            if (introClock < 0.0) {
-                return
+        // `favoriteSong()`'s 0.2 s timer hides the shrinking hearts.
+        if (favHideCountdown > 0.0) {
+            favHideCountdown -= dt
+            if (favHideCountdown <= 0.0) {
+                favHideCountdown = 0.0
+                setFavHeartsVisible(false)
             }
-            alpha = (introClock / 0.18).coerceIn(0.0, 1.0)
         }
 
-        // `SongMenuItem.update`: x and y use different smoothing durations.
-        // `smoothLerpPrecision` keeps only 1% of the remaining distance after
-        // the duration, which makes held-key scrolling glide instead of
-        // snapping one capsule at a time.
-        x = smoothLerpPrecision(x, targetX, dt, 0.256)
-        y = smoothLerpPrecision(y, targetY, dt, 0.192)
+        // `SongMenuItem.update`'s doJumpIn block: the capsule graphic squashes
+        // through `xFrames` while the container keeps lerping into place.
+        if (jumpInActive) {
+            jumpInTicker += dt
+            while (jumpInTicker >= 1.0 / 24.0 && jumpInFrame < X_FRAMES.size) {
+                jumpInTicker -= 1.0 / 24.0
+                applySquash(jumpInFrame)
+                jumpInFrame++
+            }
+            if (jumpInFrame >= X_FRAMES.size) {
+                jumpInActive = false
+            }
+        }
 
-        if (!introFinished && introClock >= 0.7) {
-            introFinished = true
-            x = targetX
-            y = targetY
-            alpha = 1.0
-        } else if (introFinished && abs(targetX - x) < 0.5 && abs(targetY - y) < 0.5) {
-            x = targetX
-            y = targetY
+        if (bounceActive) {
+            // `favoriteSong` tweens y with doLerp paused: 5 px out with
+            // expoOut, then back past the rest point with expoIn before the
+            // normal lerp takes over again.
+            bounceElapsed += dt
+            val t = bounceElapsed / BOUNCE_HALF
+            y = if (t < 1.0) {
+                bounceStartY + bounceDy * expoOut(t)
+            } else {
+                bounceStartY + bounceDy - 2.0 * bounceDy * expoIn((t - 1.0).coerceIn(0.0, 1.0))
+            }
+            x = smoothLerpPrecision(x, targetX, dt, 0.256)
+            if (t >= 2.0) {
+                bounceActive = false
+            }
+        } else {
+            // `SongMenuItem.update`: x and y use different smoothing durations.
+            // `smoothLerpPrecision` keeps only 1% of the remaining distance after
+            // the duration, which makes held-key scrolling glide instead of
+            // snapping one capsule at a time.
+            x = smoothLerpPrecision(x, targetX, dt, 0.256)
+            y = smoothLerpPrecision(y, targetY, dt, 0.192)
+            if (abs(targetX - x) < 0.5 && abs(targetY - y) < 0.5) {
+                x = targetX
+                y = targetY
+            }
         }
     }
 
@@ -287,12 +431,39 @@ internal class FreeplayCapsule(
         // FlxSprite updates `offset.x = -5`, not `x`, when the capsule
         // becomes unselected. A negative offset draws the graphic 5 px to the
         // right, so add it on top of the centred-scale compensation.
-        capsuleSprite?.x = CAPSULE_OFFSET_X + if (currentlySelected) 0.0 else 5.0
+        if (!jumpInActive) {
+            capsuleSprite?.x = capsuleSpriteBaseX(REAL_SCALED)
+        }
         songText.alpha = if (currentlySelected) 1.0 else 0.6
         songGlow?.visible = currentlySelected
         rankSprite?.alpha = if (currentlySelected) 1.0 else 0.7
         rankSprite?.tint = if (currentlySelected) Colors.WHITE else RGBA(0xAA, 0xAA, 0xAA)
+        favIcon?.alpha = if (currentlySelected) 1.0 else 0.6
+        favIconBlurred?.alpha = if (currentlySelected) 1.0 else 0.0
     }
+
+    /**
+     * `SongMenuItem.update`'s doJumpIn squash: `capsule.scale.x = xFrames[i] *
+     * realScaled`, `scale.y = 1 / xFrames[i] * realScaled`, scaled around the
+     * frame centre like FlxSprite's centred origin.
+     */
+    private fun applySquash(frame: Int) {
+        val sprite = capsuleSprite ?: return
+        val factor = X_FRAMES[frame.coerceIn(0, X_FRAMES.lastIndex)]
+        val sx = factor * REAL_SCALED
+        val sy = (1.0 / factor) * REAL_SCALED
+        sprite.scaleX = sx
+        sprite.scaleY = sy
+        sprite.x = capsuleSpriteBaseX(sx)
+        sprite.y = CAPSULE_FRAME_HEIGHT * (1.0 - sy) / 2.0
+    }
+
+    /**
+     * Top-left x that keeps the scaled capsule graphic centred on the frame's
+     * centre, plus the unselected 5 px `offset.x = -5` shift.
+     */
+    private fun capsuleSpriteBaseX(scaleX: Double): Double =
+        CAPSULE_FRAME_WIDTH * (1.0 - scaleX) / 2.0 + if (currentlySelected) 0.0 else 5.0
 
     private fun setBpm(value: Int) {
         if (bpmLabel == null && bpmDigits.isEmpty()) return
@@ -533,6 +704,19 @@ internal class FreeplayCapsule(
         const val WEEK_TEXT_X = 291.0
         const val WEEK_TEXT_Y = 88.0
 
+        // `favIcon`/`favIconBlurred`: `setGraphicSize(50, 50)` at (380, 40),
+        // then `checkClip` moves them to 405, or 370 when a rank badge shows.
+        const val FAV_ICON_SIZE = 50.0
+        const val FAV_ICON_X = 405.0
+        const val FAV_ICON_X_WITH_RANK = 370.0
+        const val FAV_ICON_Y = 40.0
+
+        /** `FlxTween` duration of each half of the favourite wiggle. */
+        const val BOUNCE_HALF = 0.1
+
+        /** `SongMenuItem.xFrames`: the jump-in squash keyframes, 1/24 s apart. */
+        val X_FRAMES = doubleArrayOf(1.7, 1.8, 0.85, 0.85, 0.97, 0.97, 1.0)
+
         const val PIXEL_ICON_DIR = "preload/images/freeplay/icons"
 
         /** bf.json `capsuleTextColors` / `CapsuleText`'s glow filter. */
@@ -561,6 +745,10 @@ internal class FreeplayCapsule(
 
         val rankAtlas: TextureAtlas? by lazy {
             TextureAtlas.tryLoad("preload/images/freeplay/rankbadges.xml")
+        }
+
+        val favHeartAtlas: TextureAtlas? by lazy {
+            TextureAtlas.tryLoad("preload/images/freeplay/favHeart.xml")
         }
 
         val smallNumberFrames: Map<Int, TextureAtlas.AtlasFrame> by lazy {

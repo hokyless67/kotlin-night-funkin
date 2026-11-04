@@ -17,6 +17,11 @@ data class SaveData(
     /** `Scoring.tallyCompletion` for the best/current clear, 0..1. */
     val completions: Map<String, Float> = emptyMap(),
     /**
+     * FNF's `save.data.favoriteSongs`: Freeplay's favourited songs, keyed by
+     * `FreeplaySongData.idAndVariation` (`songId:variation`).
+     */
+    val favoriteSongs: List<String> = emptyList(),
+    /**
      * FNF's `save.data.unlocks.charactersSeen`. KNF has no Character Select
      * substate to clear the "new character" flag, so both stock playable
      * characters start seen. That selects the regular `BoyfriendCard` backing
@@ -123,6 +128,22 @@ object Save {
     }
 
     fun completion(key: String): Float = data.completions[key] ?: 0f
+
+    // ---- freeplay favourites (`Save.isSongFavorited` et al.) --------------
+
+    fun isSongFavorited(id: String): Boolean = id in data.favoriteSongs
+
+    fun favoriteSong(id: String) {
+        if (id in data.favoriteSongs) return
+        data = data.copy(favoriteSongs = data.favoriteSongs + id)
+        save()
+    }
+
+    fun unfavoriteSong(id: String) {
+        if (id !in data.favoriteSongs) return
+        data = data.copy(favoriteSongs = data.favoriteSongs - id)
+        save()
+    }
 
     /** Mirrors `PlayerRegistry.hasNewCharacter()`. */
     fun hasNewCharacter(): Boolean =

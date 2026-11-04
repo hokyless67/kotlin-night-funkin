@@ -39,6 +39,12 @@ class SparrowSprite(
     var frameIndex: Int = 0
         private set
 
+    /**
+     * Steps the animation backwards, like `FlxAnimationController.play`'s
+     * `Reversed` flag (`play('anim', true, true, frame)`).
+     */
+    var reversed: Boolean = false
+
     /** False holds the current frame, like `FlxAnimationController.paused`. */
     var playing: Boolean = frames.isNotEmpty()
 
@@ -47,10 +53,15 @@ class SparrowSprite(
     }
 
     /** Switches to [newFrames], optionally restarting at its first frame. */
-    fun play(newFrames: List<TextureAtlas.AtlasFrame>, restart: Boolean = true) {
+    fun play(
+        newFrames: List<TextureAtlas.AtlasFrame>,
+        restart: Boolean = true,
+        reversed: Boolean = false,
+    ) {
         if (newFrames.isEmpty()) return
         frames = newFrames
         playing = true
+        this.reversed = reversed
         if (restart || frameIndex >= frames.size) {
             frameIndex = 0
             elapsed = 0.0
@@ -104,7 +115,19 @@ class SparrowSprite(
         var changed = false
         while (elapsed >= step) {
             elapsed -= step
-            if (frameIndex + 1 < frames.size) {
+            if (reversed) {
+                if (frameIndex > 0) {
+                    frameIndex--
+                    changed = true
+                } else if (loop) {
+                    frameIndex = frames.size - 1
+                    changed = true
+                } else {
+                    playing = false
+                    elapsed = 0.0
+                    break
+                }
+            } else if (frameIndex + 1 < frames.size) {
                 frameIndex++
                 changed = true
             } else if (loop) {
