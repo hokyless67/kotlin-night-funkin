@@ -13,6 +13,7 @@ import korlibs.korge.view.filter.filter
 import korlibs.korge.view.image
 import korlibs.korge.view.solidRect
 import korlibs.korge.view.text
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import nightfunkin.audio.MusicPlayer
 import nightfunkin.audio.SfxPlayer
@@ -146,6 +147,17 @@ class PlayScene : Scene() {
     private var gameOverPlayerLayer: CharacterLayer? = null
     private var gameOverMusicGeneration = 0
     private val gameOverMusic = MusicPlayer()
+
+    /**
+     * `GameOverSubState.deathQuoteSound` / `hasPlayedDeathQuote`: the
+     * character's `getDeathQuote()` track (BF and Pico insult Tankman). The
+     * random pick is made at scene start so the clip can be preloaded.
+     */
+    private var deathQuotePath: String? = null
+    private var deathQuoteChannel: AudioChannel? = null
+
+    /** `startDeathMusic(startingVolume)`; lowered while a quote plays. */
+    private var deathMusicTargetVolume = 1.0
 
     /** FNF's `isSongEnd`: the results transition is running. */
     private var ending = false
@@ -447,6 +459,17 @@ class PlayScene : Scene() {
         sfx.preload(missSound)
         scrollSound = resolveSfx("preload/sounds/scrollMenu")
         sfx.preload(scrollSound)
+
+        // Preload the death loss SFX and the character's death quote so
+        // `playLossSfx()` / `playDeathQuote()` can start them synchronously
+        // from `tick()` (non-suspend context) instead of relying on a launch
+        // block whose suspend preload may not complete before `play()` runs.
+        val deathSfxPath = resolveDeathSfx(gameOverSuffixes().second)
+        deathSfxPath?.let { sfx.preload(it) }
+        deathQuotePath = resolveDeathQuote()?.also { sfx.preload(it) }
+        if (System.getenv("KNF_DEBUG_DEATH") == "1") {
+            println("KNF: death sfx=[$deathSfxPath] quote=[$deathQuotePath]")
+        }
 
         // Attached only now: `Conductor.update` dispatches step hits immediately,
         // and `onBeat()` needs the characters to already exist.
@@ -931,6 +954,8 @@ class PlayScene : Scene() {
             updateGameOver(dt, gameInput)
             return
         }
+
+        if (System.getenv("KNF_DEBUG_DEATH") == "1" && conductor.songPosition > 1000f) hud.setHealth(0f)
 
         // Characters advance before the conductor dispatches this frame's
         // step/beat events, matching `PlayState.update` where `super.update()`
@@ -1718,9 +1743,12 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         gameOverEnding = false
         gameOverBlueBalled = false
         gameOverAnimStarted = false
+        gameOverLoopStarted = false
         gameOverStartCountdown = 0.0
         gameOverConfirmElapsed = 0.0
         gameOverConfirmFadeDelay = 0.0
+        deathQuoteChannel = null
+        deathMusicTargetVolume = 1.0
         tankmanRimFilter = null
 
         val overlay = sceneRoot.solidRect(
@@ -1778,13 +1806,19 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         }
 
         if (!gameOverEnding) {
-            // Once `firstDeath` finishes: start the loop music and hand the
-            // pose over to the looping `deathLoop`.
+            // Once `firstDeath` finishes: `playDeathQuote` when the character
+            // has one, otherwise start the loop music and hand the pose over
+            // to the looping `deathLoop`.
             if (player.currentAnimationName?.startsWith("firstDeath") == true && player.animationFinished) {
                 if (!gameOverLoopStarted) {
                     gameOverLoopStarted = true
-                    startDeathMusic()
-                    if (player.hasAnimation("deathLoop")) player.play("deathLoop", forceRestart = true)
+                    val quote = deathQuotePath
+                    if (quote != null) {
+                        playDeathQuote(quote)
+                    } else {
+                        startDeathMusic(1.0)
+                        if (player.hasAnimation("deathLoop")) player.play("deathLoop", forceRestart = true)
+                    }
                 }
             }
             // `startDeathMusic`'s onComplete: `gameOverStart` hands over to the
@@ -1838,15 +1872,20 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
 
     /**
      * `startDeathMusic`: `gameOverStart` once (when a variant exists), then
-     * the looping `gameOver`; the `-pixel` variants come from bf-pixel's
-     * character script.
+     * the looping `gameOver`. The suffixes come from the character scripts
+     * (`bf-pixel`, the Pico variants); FNF strips trailing `-` components
+     * until it finds an existing track.
+     *
+     * [startingVolume] is `0.2` while a death quote plays; the quote's
+     * completion then fades the loop in (`gameOverMusic.fadeIn(4, 0.2, 1)`).
      */
-    private fun startDeathMusic() {
+    private fun startDeathMusic(startingVolume: Double = 1.0) {
         gameOverMusicGeneration++
         val generation = gameOverMusicGeneration
-        val suffix = deathMusicSuffix()
+        deathMusicTargetVolume = startingVolume
+        val suffix = gameOverSuffixes().first
         if (gameOverStarting) {
-            val startPath = KnfFiles.resolveSound("shared/music/gameplay/gameover/gameOverStart$suffix")
+            val startPath = resolveDeathMusic("gameOverStart", suffix)
             if (startPath == null) {
                 gameOverStarting = false
             } else {
@@ -1854,20 +1893,19 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
                     if (gameOverMusicGeneration != generation) return@launch
                     if (gameOverMusic.load(startPath)) {
                         gameOverMusic.loop = false
-                        gameOverMusic.volume = 1.0
+                        gameOverMusic.volume = deathMusicTargetVolume
                         gameOverMusic.play()
                         // `onComplete` hands over to the loop track.
                         gameOverStartCountdown = gameOverMusic.totalMs / 1000.0
                     } else {
                         gameOverStarting = false
-                        startDeathMusic()
+                        startDeathMusic(startingVolume)
                     }
                 }
                 return
             }
         }
-        val loopPath = KnfFiles.resolveSound("shared/music/gameplay/gameover/gameOver$suffix")
-            ?: KnfFiles.resolveSound("shared/music/gameplay/gameover/gameOver")
+        val loopPath = resolveDeathMusic("gameOver", suffix)
         if (loopPath == null) {
             println("KNF: game over music missing")
             return
@@ -1876,10 +1914,85 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
             if (gameOverMusicGeneration != generation) return@launch
             if (gameOverMusic.load(loopPath)) {
                 gameOverMusic.loop = true
-                gameOverMusic.volume = 1.0
+                gameOverMusic.volume = deathMusicTargetVolume
                 gameOverMusic.play()
             }
         }
+    }
+
+    /**
+     * `playDeathQuote`: start the loop quietly, play the character's insult,
+     * then fade the music back in once the clip ends.
+     */
+    private fun playDeathQuote(quote: String) {
+        startDeathMusic(0.2)
+        val generation = gameOverMusicGeneration
+        if (player.hasAnimation("deathLoop")) player.play("deathLoop", forceRestart = true)
+        val channel = sfx.play(quote, 1.0)
+        deathQuoteChannel = channel
+        if (channel == null) {
+            // No cached clip: do not leave the music stuck at 0.2.
+            deathMusicTargetVolume = 1.0
+            gameOverMusic.volume = 1.0
+            return
+        }
+        launch {
+            while (channel.playing && generation == gameOverMusicGeneration) delay(50)
+            if (generation != gameOverMusicGeneration) return@launch
+            // `FunkinSound.fadeIn(4, 0.2, 1)`.
+            var elapsed = 0.0
+            while (elapsed < QUOTE_FADE_SECONDS && generation == gameOverMusicGeneration) {
+                elapsed += 0.05
+                val t = (elapsed / QUOTE_FADE_SECONDS).coerceIn(0.0, 1.0)
+                val volume = QUOTE_MUSIC_VOLUME + (1.0 - QUOTE_MUSIC_VOLUME) * t
+                deathMusicTargetVolume = volume
+                gameOverMusic.volume = volume
+                delay(50)
+            }
+        }
+    }
+
+    /**
+     * `BaseCharacter.getDeathQuote` overrides from `bf.hxc`, `bf-holding-gf.hxc`,
+     * `pico-playable.hxc` (inherited by `pico-christmas`/`pico-dark`) and
+     * `pico-holding-nene.hxc`. BF and Pico only insult Tankman, except
+     * `bf-holding-gf` and Pico holding Nene, who always do.
+     */
+    private fun resolveDeathQuote(): String? {
+        val dad = opponent.id
+        val id = player.id
+        val folder: String
+        val max: Int
+        val censored: List<Int>
+        when (id) {
+            "bf" -> {
+                if (dad != "tankman") return null
+                folder = "jeffGameover"
+                max = 25
+                censored = BF_CENSORED_QUOTES
+            }
+            "bf-holding-gf" -> {
+                folder = "jeffGameover"
+                max = 25
+                censored = BF_CENSORED_QUOTES
+            }
+            "pico-playable", "pico-christmas", "pico-dark" -> {
+                if (dad != "tankman") return null
+                folder = "jeffGameover-pico"
+                max = 10
+                censored = PICO_CENSORED_QUOTES
+            }
+            "pico-holding-nene" -> {
+                folder = "jeffGameover-pico"
+                max = 10
+                censored = PICO_CENSORED_QUOTES
+            }
+            else -> return null
+        }
+        val allowed = (1..max).filter { it !in censored }
+        if (allowed.isEmpty()) return null
+        val number = allowed.random()
+        return resolveStageSound("sounds/$folder/jeffGameover-$number")
     }
 
     /** `confirmDeath`: the `deathConfirm` pose, the ending track, the reset. */
@@ -1890,10 +2003,13 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         gameOverConfirmElapsed = 0.0
         gameOverConfirmFadeDelay = 0.0
 
+        // `confirmDeath` stops the quote immediately.
+        deathQuoteChannel?.stop()
+        deathQuoteChannel = null
+
         gameOverMusicGeneration++
         val generation = gameOverMusicGeneration
-        val endPath = KnfFiles.resolveSound("shared/music/gameplay/gameover/gameOverEnd${deathMusicSuffix()}")
-            ?: KnfFiles.resolveSound("shared/music/gameplay/gameover/gameOverEnd")
+        val endPath = resolveDeathMusic("gameOverEnd", gameOverSuffixes().first)
         if (endPath != null) {
             launch {
                 if (gameOverMusicGeneration != generation) return@launch
@@ -1914,27 +2030,83 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
     private fun exitGameOver() {
         if (gameOverEnding) return
         gameOverEnding = true
+        deathQuoteChannel?.stop()
+        deathQuoteChannel = null
         gameOverMusic.stop()
         exitToSongSelect()
     }
 
-    /** `playBlueBalledSFX`, whose suffix follows the same character script. */
+    /**
+     * `playBlueBalledSFX`. Unlike the music path this does not strip suffixes
+     * (`GameOverSubState.playBlueBalledSFX` checks the exact asset), so a
+     * missing variant is logged instead of silently falling back to BF's.
+     */
     private fun playLossSfx() {
         gameOverBlueBalled = true
-        val path = KnfFiles.resolveSound("shared/sounds/gameplay/gameover/fnf_loss_sfx${deathMusicSuffix()}")
-            ?: KnfFiles.resolveSound("shared/sounds/gameplay/gameover/fnf_loss_sfx")
+        val suffix = gameOverSuffixes().second
+        val path = resolveDeathSfx(suffix)
         if (path == null) {
-            println("KNF: fnf_loss_sfx missing")
+            println("KNF: fnf_loss_sfx$suffix missing")
             return
         }
-        launch {
-            sfx.preload(path)
-            sfx.play(path, 1.0)
-        }
+        sfx.play(path, 1.0)
     }
 
-    /** bf-pixel's script points the death music and SFX at `-pixel` files. */
-    private fun deathMusicSuffix(): String = if (player.id == "bf-pixel") "-pixel" else ""
+    /**
+     * `GameOverSubState.musicSuffix` / `blueBallSuffix`, assigned by character
+     * scripts in FNF's creation order (GF, dad, BF), so the last match wins.
+     *
+     * Note that the two suffixes are not always equal: Pico's Weekend 1 and
+     * Week 7 characters use the shared `-pico` death music but their own
+     * `-pico-gutpunch` / `-pico-and-nene` loss SFX.
+     */
+    private fun gameOverSuffixes(): Pair<String, String> {
+        var music = ""
+        var loss = ""
+        val chars = chart.characters
+        for (id in listOf(chars.girlfriend, chars.opponent, chars.player)) {
+            when (id) {
+                "bf-pixel" -> {
+                    music = "-pixel"
+                    loss = "-pixel"
+                }
+                "pico-playable", "pico-christmas", "pico-dark" -> {
+                    music = "-pico"
+                    loss = "-pico"
+                }
+                "pico-blazin" -> {
+                    music = "-pico"
+                    loss = "-pico-gutpunch"
+                }
+                "pico-holding-nene" -> {
+                    music = "-pico"
+                    loss = "-pico-and-nene"
+                }
+                "pico-pixel" -> {
+                    music = "-pixel-pico"
+                    loss = "-pixel-pico"
+                }
+            }
+        }
+        return music to loss
+    }
+
+    /** `GameOverSubState.playBlueBalledSFX`: exact suffix, stage library first. */
+    private fun resolveDeathSfx(suffix: String): String? =
+        resolveStageSound("sounds/gameplay/gameover/fnf_loss_sfx$suffix")
+
+    /**
+     * `GameOverSubState.resolveMusicPath`: try `base+suffix`, then strip the
+     * last `-component` until a track exists (`-pixel-pico` -> `-pixel` -> ``).
+     */
+    private fun resolveDeathMusic(base: String, suffix: String): String? {
+        var current = suffix
+        while (true) {
+            resolveStageSound("music/gameplay/gameover/$base$current")?.let { return it }
+            if (current.isEmpty()) return null
+            current = current.substringBeforeLast('-', "")
+        }
+    }
 
     // ======================================================================
     // song events
@@ -2085,6 +2257,16 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         /** `PauseSubState.MUSIC_FINAL_VOLUME` / `MUSIC_FADE_IN_TIME`. */
         const val PAUSE_MUSIC_VOLUME = 0.75
         const val PAUSE_MUSIC_FADE_SECONDS = 5.0
+
+        /** `playDeathQuote`: `startDeathMusic(0.2)` + `fadeIn(4, 0.2, 1)`. */
+        const val QUOTE_MUSIC_VOLUME = 0.2
+        const val QUOTE_FADE_SECONDS = 4.0
+
+        /** `bf.hxc` / `bf-holding-gf.hxc` `randomCensor` with naughtyness off. */
+        val BF_CENSORED_QUOTES = listOf(1, 3, 8, 13, 17, 21)
+
+        /** `pico-playable.hxc` / `pico-holding-nene.hxc` `randomCensor`. */
+        val PICO_CENSORED_QUOTES = listOf(4, 7, 8, 9)
     }
 
     /**
@@ -2100,7 +2282,8 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         for (id in listOf(chars.girlfriend, chars.opponent, chars.player)) {
             when (id) {
                 "bf-pixel", "pico-pixel" -> suffix = "-pixel"
-                "pico-playable", "pico-blazin", "pico-holding-nene" -> suffix = "-pico"
+                "pico-playable", "pico-christmas", "pico-dark",
+                "pico-blazin", "pico-holding-nene" -> suffix = "-pico"
             }
         }
         return suffix

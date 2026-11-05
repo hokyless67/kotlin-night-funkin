@@ -237,12 +237,22 @@ class SfxPlayer(private val maxVoices: Int = 12) {
     private val cache = HashMap<String, Sound>()
     private val active = ArrayList<AudioChannel>()
 
+    /**
+     * `SoundAudioData` captures the coroutine context it was decoded in and
+     * stops its playback when that job is cancelled. Decoding in a scene's
+     * `sceneInit` would tie every effect to that scene, so the cache is filled
+     * on this detached supervisor instead.
+     */
+    private val loadContext = SupervisorJob()
+
     var volume: Double = 1.0
 
     suspend fun preload(path: String): Sound? {
         cache[path]?.let { return it }
-        val bytes = KnfFiles.bytesOrNull(path) ?: return null
-        val s = bytes.readSound()
+        val s = withContext(loadContext) {
+            val bytes = KnfFiles.bytesOrNull(path) ?: return@withContext null
+            bytes.readSound()
+        } ?: return null
         cache[path] = s
         return s
     }
@@ -253,9 +263,16 @@ class SfxPlayer(private val maxVoices: Int = 12) {
      * callers can keep ignoring the result.
      */
     fun play(path: String, volume: Double = this.volume, pitch: Double = 1.0): AudioChannel? {
-        val s = cache[path] ?: return null
+        val s = cache[path]
+        if (s == null) {
+            println("KNF: sfx.play not cached: $path")
+            return null
+        }
         prune()
-        if (active.size >= maxVoices) return null
+        if (active.size >= maxVoices) {
+            println("KNF: sfx.play voice limit (${active.size}): $path")
+            return null
+        }
         return runCatching {
             val ac = AudioChannel()
             ac.volume = volume
@@ -263,7 +280,7 @@ class SfxPlayer(private val maxVoices: Int = 12) {
             ac.play(s)
             active += ac
             ac
-        }.getOrNull()
+        }.onFailure { println("KNF: sfx.play failed for $path: ${it.message}") }.getOrNull()
     }
 
     private fun prune() {
