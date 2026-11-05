@@ -9,6 +9,7 @@ import korlibs.korge.view.SContainer
 import korlibs.korge.view.SolidRect
 import korlibs.korge.view.View
 import korlibs.korge.view.addUpdater
+import korlibs.korge.view.filter.filter
 import korlibs.korge.view.image
 import korlibs.korge.view.solidRect
 import korlibs.korge.view.text
@@ -119,6 +120,32 @@ class PlayScene : Scene() {
     /** HUD fade-in started by a cutscene; negative when no fade is running. */
     private var hudFadeElapsed = -1.0
     private var hudFadeDuration = 0.0
+
+    /**
+     * `tankmanBattlefieldErect.hxc`'s saved `tankmanRim`: the opponent's rim
+     * light, whose alt mask the `EnableMask` song event turns on.
+     */
+    private var tankmanRimFilter: DropShadowRimFilter? = null
+
+    // ---- game over (`GameOverSubState`) ----------------------------------
+
+    private var gameOverActive = false
+    private var gameOverEnding = false
+
+    /** `isStarting`: a `gameOverStart` track plays once before the loop. */
+    private var gameOverStarting = false
+
+    /** `blueballed`: set when the loss SFX plays, gates both inputs. */
+    private var gameOverBlueBalled = false
+    private var gameOverAnimStarted = false
+    private var gameOverLoopStarted = false
+    private var gameOverStartCountdown = 0.0
+    private var gameOverConfirmElapsed = 0.0
+    private var gameOverConfirmFadeDelay = 0.0
+    private var gameOverWorldLayer: Container? = null
+    private var gameOverPlayerLayer: CharacterLayer? = null
+    private var gameOverMusicGeneration = 0
+    private val gameOverMusic = MusicPlayer()
 
     /** FNF's `isSongEnd`: the results transition is running. */
     private var ending = false
@@ -323,6 +350,7 @@ class PlayScene : Scene() {
                 scrollX = scroll.getOrElse(0) { 1.0 },
                 scrollY = scroll.getOrElse(1) { 1.0 },
             )
+            applyStageCharacterEffects(slot, character, layer)
             if (stage != null) {
                 // A-Bot sits ten zIndexes under its character, like the scripts.
                 support?.let { stage.addCharacter(it, zIndex - 10) }
@@ -475,6 +503,50 @@ class PlayScene : Scene() {
         debugFrames = 0
     }
 
+    /**
+     * `tankmanBattlefieldErect.hxc`'s `addCharacter`: every character gets a
+     * yellow rim light (the `DropShadowShader`) with per-character angles and
+     * thresholds, plus alt masks for the character variants that need them.
+     */
+    private fun applyStageCharacterEffects(slot: String, character: Character, layer: Container) {
+        if (stageFile.id != "tankmanBattlefieldErect") return
+        val rim = when (slot) {
+            "bf" -> stageRimFilter(angle = 90.0)
+            "gf" -> stageRimFilter(angle = 90.0).also { f ->
+                // gf-tankmen / nene-tankmen sit on the tankmen speakers, where
+                // the plain drop shadow picks up conflicting colors and needs
+                // the alternate mask (`useAltMask = true` right away).
+                when (character.id) {
+                    "gf-tankmen" -> f.setAltMask("erect/masks/gfTankmen_mask", 0.4, use = true)
+                    "nene-tankmen" -> f.setAltMask("erect/masks/neneTankmen_mask", 0.4, use = true)
+                }
+            }
+            "dad" -> stageRimFilter(angle = 25.0, threshold = 0.3).also { f ->
+                // tankman-bloody's mask starts off; the `EnableMask` song event
+                // turns it on mid-song.
+                if (character.id == "tankman-bloody") {
+                    f.setAltMask("erect/masks/tankmanCaptainBloody_mask", 1.0, use = false)
+                    tankmanRimFilter = f
+                }
+            }
+            else -> null
+        }
+        if (rim != null) layer.filter = rim
+    }
+
+    /** `rim.setAdjustColor(-46, -38, -25, -20)` + the stage's light color. */
+    private fun stageRimFilter(
+        angle: Double,
+        threshold: Double = 0.1,
+    ): DropShadowRimFilter = DropShadowRimFilter(
+        angle = angle,
+        threshold = threshold,
+        adjustBrightness = -46.0,
+        adjustHue = -38.0,
+        adjustContrast = -25.0,
+        adjustSaturation = -20.0,
+    )
+
     override suspend fun SContainer.sceneMain() {
         sceneRoot = this
         addUpdater { dt -> tick(dt.dtSeconds()) }
@@ -488,6 +560,7 @@ class PlayScene : Scene() {
         music.stop()
         vocals.stop()
         opponentVocals.stop()
+        gameOverMusic.dispose()
         pauseMusic.dispose()
         sfx.stopAll()
         playerStrumline.destroy()
@@ -851,6 +924,13 @@ class PlayScene : Scene() {
         handleOffsetKeys()
 
         if (paused) return
+
+        // `GameOverSubState` over a frozen PlayState: the death camera, the
+        // dying pose and the retry/quit inputs, while everything else waits.
+        if (gameOverActive) {
+            updateGameOver(dt, gameInput)
+            return
+        }
 
         // Characters advance before the conductor dispatches this frame's
         // step/beat events, matching `PlayState.update` where `super.update()`
@@ -1613,12 +1693,248 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
     private fun checkDeath() {
         if (hud.isDead() && !songEnded) {
             songEnded = true
-            music.pause()
-            vocals.pause()
-        opponentVocals.pause()
             println("KNF: died at ${(conductor.songPosition / 1000.0).roundToInt()}s")
+            // `PlayState.startGameOver`: the instrumental and both stems stop.
+            music.stop()
+            vocals.stop()
+            opponentVocals.stop()
+            enterGameOver()
         }
     }
+
+    // ======================================================================
+    // game over (`GameOverSubState`)
+    // ======================================================================
+
+    /**
+     * `GameOverSubState.create`: an opaque black screen over the whole game
+     * with the dead character drawn above it at its world position, and the
+     * camera gliding to the character's death focus point.
+     */
+    private fun enterGameOver() {
+        if (gameOverActive) return
+        gameOverActive = true
+        gameOverStarting = true
+        gameOverEnding = false
+        gameOverBlueBalled = false
+        gameOverAnimStarted = false
+        gameOverStartCountdown = 0.0
+        gameOverConfirmElapsed = 0.0
+        gameOverConfirmFadeDelay = 0.0
+        tankmanRimFilter = null
+
+        val overlay = sceneRoot.solidRect(
+            Constants.GAME_WIDTH * 2.0,
+            Constants.GAME_HEIGHT * 2.0,
+            Colors.BLACK,
+        ).also {
+            it.x = -Constants.GAME_WIDTH / 2.0
+            it.y = -Constants.GAME_HEIGHT / 2.0
+        }
+
+        // The world layer copies the gameplay camera's transform every frame,
+        // so the character sits exactly where it was on the stage.
+        val world = Container()
+        sceneRoot.addChild(world)
+        gameOverWorldLayer = world
+        val playerLayer = characterLayers.firstOrNull { it.character === player }
+        if (playerLayer != null) {
+            playerLayer.container.removeFromParent()
+            world.addChild(playerLayer.container)
+        }
+        gameOverPlayerLayer = playerLayer
+
+        // `GameOverSubState.create`: `boyfriend.isDead = true` keeps the beat
+        // handler from dancing over the death animation.
+        player.isDead = true
+
+        // `tankmanBattlefieldErect.hxc`'s `onGameOver`: the dead character
+        // loses its rim light on this screen.
+        playerLayer?.container?.filter = null
+
+        // `setCameraTarget`: FNF starts from `resetCameraFocusPoint`'s center
+        // (original position + half the idle frame), subtracts the character's
+        // own and the stage's camera offsets - the character's own cancel
+        // against the center - and adds the death offsets. Half the normal
+        // follow rate; zoom = stage zoom * death zoom.
+        val (cx, cy) = player.idleFrameCenter()
+        val stageOffsets = stageFile.characterFor("bf")?.cameraOffsets.orEmpty()
+        val deathOffsets = player.deathCameraOffsets
+        val focusX = cx - stageOffsets.getOrElse(0) { 0.0 } + deathOffsets.getOrElse(0) { 0.0 }
+        val focusY = cy - stageOffsets.getOrElse(1) { 0.0 } + deathOffsets.getOrElse(1) { 0.0 }
+        camera.followRate = (Constants.DEFAULT_CAMERA_FOLLOW_RATE / 2.0).toDouble()
+        camera.setFocus(focusX, focusY)
+        camera.targetZoom = camera.stageZoom * player.deathCameraZoom
+    }
+
+    /** `GameOverSubState.update`: the dying pose, the music hand-off, inputs. */
+    private fun updateGameOver(dt: Double, input: KnfInput) {
+        // First frame: the dying pose and the "blue ball" SFX. FNF's 1/4096
+        // `fakeoutDeath` easter egg is skipped.
+        if (!gameOverAnimStarted) {
+            gameOverAnimStarted = true
+            if (player.hasAnimation("firstDeath")) player.play("firstDeath", forceRestart = true)
+            playLossSfx()
+        }
+
+        if (!gameOverEnding) {
+            // Once `firstDeath` finishes: start the loop music and hand the
+            // pose over to the looping `deathLoop`.
+            if (player.currentAnimationName?.startsWith("firstDeath") == true && player.animationFinished) {
+                if (!gameOverLoopStarted) {
+                    gameOverLoopStarted = true
+                    startDeathMusic()
+                    if (player.hasAnimation("deathLoop")) player.play("deathLoop", forceRestart = true)
+                }
+            }
+            // `startDeathMusic`'s onComplete: `gameOverStart` hands over to the
+            // loop track when its one-shot run ends.
+            if (gameOverStarting && gameOverStartCountdown > 0.0) {
+                gameOverStartCountdown -= dt
+                if (gameOverStartCountdown <= 0.0) {
+                    gameOverStartCountdown = 0.0
+                    gameOverStarting = false
+                    startDeathMusic()
+                }
+            }
+        }
+
+        // `controls.ACCEPT_P && blueballed` restarts, BACK quits. The blue
+        // ball flag is set the moment the loss SFX plays, so both work right
+        // away; `isEnding` guards double presses.
+        if (gameOverBlueBalled && !gameOverEnding) {
+            if (input.accept) {
+                confirmGameOver()
+            } else if (input.back) {
+                exitGameOver()
+            }
+        }
+
+        // The dead character keeps animating while the camera glides over.
+        player.update(dt)
+        camera.update(dt)
+        gameOverWorldLayer?.also { world ->
+            world.scaleX = camera.cam.scaleX
+            world.scaleY = camera.cam.scaleY
+            world.x = camera.cam.x
+            world.y = camera.cam.y
+        }
+        gameOverPlayerLayer?.let { layer ->
+            layer.container.x = (1.0 - layer.scrollX) * camera.scrollX
+            layer.container.y = (1.0 - layer.scrollY) * camera.scrollY
+        }
+
+        // Confirm sequence: `FADE_TIMER = length / 7000` after the ending
+        // music starts, then two seconds of black, then the scene rebuilds.
+        if (gameOverEnding) {
+            gameOverConfirmElapsed += dt
+            if (gameOverConfirmElapsed >= gameOverConfirmFadeDelay + 2.0) {
+                gameOverEnding = false
+                gameOverActive = false
+                restartSong()
+            }
+        }
+    }
+
+    /**
+     * `startDeathMusic`: `gameOverStart` once (when a variant exists), then
+     * the looping `gameOver`; the `-pixel` variants come from bf-pixel's
+     * character script.
+     */
+    private fun startDeathMusic() {
+        gameOverMusicGeneration++
+        val generation = gameOverMusicGeneration
+        val suffix = deathMusicSuffix()
+        if (gameOverStarting) {
+            val startPath = KnfFiles.resolveSound("shared/music/gameplay/gameover/gameOverStart$suffix")
+            if (startPath == null) {
+                gameOverStarting = false
+            } else {
+                launch {
+                    if (gameOverMusicGeneration != generation) return@launch
+                    if (gameOverMusic.load(startPath)) {
+                        gameOverMusic.loop = false
+                        gameOverMusic.volume = 1.0
+                        gameOverMusic.play()
+                        // `onComplete` hands over to the loop track.
+                        gameOverStartCountdown = gameOverMusic.totalMs / 1000.0
+                    } else {
+                        gameOverStarting = false
+                        startDeathMusic()
+                    }
+                }
+                return
+            }
+        }
+        val loopPath = KnfFiles.resolveSound("shared/music/gameplay/gameover/gameOver$suffix")
+            ?: KnfFiles.resolveSound("shared/music/gameplay/gameover/gameOver")
+        if (loopPath == null) {
+            println("KNF: game over music missing")
+            return
+        }
+        launch {
+            if (gameOverMusicGeneration != generation) return@launch
+            if (gameOverMusic.load(loopPath)) {
+                gameOverMusic.loop = true
+                gameOverMusic.volume = 1.0
+                gameOverMusic.play()
+            }
+        }
+    }
+
+    /** `confirmDeath`: the `deathConfirm` pose, the ending track, the reset. */
+    private fun confirmGameOver() {
+        if (gameOverEnding) return
+        gameOverEnding = true
+        gameOverStarting = false
+        gameOverConfirmElapsed = 0.0
+        gameOverConfirmFadeDelay = 0.0
+
+        gameOverMusicGeneration++
+        val generation = gameOverMusicGeneration
+        val endPath = KnfFiles.resolveSound("shared/music/gameplay/gameover/gameOverEnd${deathMusicSuffix()}")
+            ?: KnfFiles.resolveSound("shared/music/gameplay/gameover/gameOverEnd")
+        if (endPath != null) {
+            launch {
+                if (gameOverMusicGeneration != generation) return@launch
+                if (gameOverMusic.load(endPath)) {
+                    gameOverMusic.loop = false
+                    gameOverMusic.volume = 1.0
+                    gameOverMusic.play()
+                    // `FADE_TIMER = length / 7000` keeps mods with longer
+                    // confirm tracks from being cut off.
+                    gameOverConfirmFadeDelay = (gameOverMusic.totalMs / 1000.0) / 7.0
+                }
+            }
+        }
+        if (player.hasAnimation("deathConfirm")) player.play("deathConfirm", forceRestart = true)
+    }
+
+    /** `goBack`: stop the death music and leave to the song list. */
+    private fun exitGameOver() {
+        if (gameOverEnding) return
+        gameOverEnding = true
+        gameOverMusic.stop()
+        exitToSongSelect()
+    }
+
+    /** `playBlueBalledSFX`, whose suffix follows the same character script. */
+    private fun playLossSfx() {
+        gameOverBlueBalled = true
+        val path = KnfFiles.resolveSound("shared/sounds/gameplay/gameover/fnf_loss_sfx${deathMusicSuffix()}")
+            ?: KnfFiles.resolveSound("shared/sounds/gameplay/gameover/fnf_loss_sfx")
+        if (path == null) {
+            println("KNF: fnf_loss_sfx missing")
+            return
+        }
+        launch {
+            sfx.preload(path)
+            sfx.play(path, 1.0)
+        }
+    }
+
+    /** bf-pixel's script points the death music and SFX at `-pixel` files. */
+    private fun deathMusicSuffix(): String = if (player.id == "bf-pixel") "-pixel" else ""
 
     // ======================================================================
     // song events
@@ -1678,6 +1994,9 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
             "SetTargetBopSpeed", "SetCharacter", "SetStage", "PlayAnimation", "SetHealthIcon" -> {
                 // Needs character sprites; handled in a later milestone.
             }
+
+            // `tankmanBattlefieldErect.hxc`: turns on tankman-bloody's mask.
+            "EnableMask" -> tankmanRimFilter?.useAltMask = true
 
             else -> println("KNF: unhandled song event '${ev.kind}'")
         }

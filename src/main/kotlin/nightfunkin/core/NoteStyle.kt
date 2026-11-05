@@ -435,15 +435,17 @@ class NoteStyle(val id: String) {
             else -> "right"
         }
         val dirData = root[key] as? kotlinx.serialization.json.JsonObject ?: return null
-        // FNF falls back from the direction's asset to the root asset before
-        // trying the fallback style. `pixel` relies on this: every direction
-        // shares `week6:pixelNoteHoldCover`, so the per-direction entry has no
-        // assetPath at all.
+        // FNF's `getHoldCoverDirectionAssetPath` chain: the direction's own
+        // assetPath first, then the root `holdNoteCover.assetPath`. `pixel`
+        // relies on that second step - its four directions share one
+        // `week6:pixelNoteHoldCover` atlas, so the per-direction entries carry
+        // no assetPath of their own.
         fun jsonString(obj: kotlinx.serialization.json.JsonObject, field: String): String? =
             ((obj[field] as? kotlinx.serialization.json.JsonPrimitive)?.content)
                 ?.takeIf { it.isNotEmpty() }
 
-        val atlasPath = jsonString(dirData, "assetPath") ?: jsonString(root, "assetPath")
+        val atlasPath = jsonString(dirData, "assetPath")
+            ?: asset.assetPath.takeIf { it.isNotEmpty() }
             ?: return null
         val atlas = style.atlasFor(atlasPath) ?: return null
 

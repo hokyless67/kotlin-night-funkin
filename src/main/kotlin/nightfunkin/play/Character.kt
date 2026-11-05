@@ -42,6 +42,12 @@ data class CharacterAnimationDef(
      * right/down of a 128x128 idle frame unless this is subtracted.
      */
     val offsets: List<Double>? = null,
+    /**
+     * `multianimateatlas`: the Animate atlas this animation's symbols live in,
+     * concatenated with the character's own (`shared:characters/bf-death` holds
+     * BF's skeleton death poses).
+     */
+    val assetPath: String? = null,
 )
 
 /**
@@ -83,6 +89,14 @@ data class CharacterData(
     val cameraOffsets: List<Double> = listOf(0.0, 0.0),
     val danceEvery: Double = 1.0,
     val animations: List<CharacterAnimationDef> = emptyList(),
+    /** FNF's `_data.death`: death camera tuning (`GameOverSubState.setCameraTarget`). */
+    val death: CharacterDeathData? = null,
+)
+
+@Serializable
+data class CharacterDeathData(
+    val cameraOffsets: List<Double> = listOf(0.0, 0.0),
+    val cameraZoom: Double = 1.0,
 )
 
 // ===========================================================================
@@ -153,6 +167,42 @@ class Character(val id: String) : Container() {
     private val animateAtlas: AnimateAtlas? = animateDir?.let { AnimateAtlas(it) }
 
     /**
+     * `multianimateatlas` (`MultiAnimateAtlasCharacter.loadAtlases`): every
+     * animation that carries its own `assetPath` contributes one extra Animate
+     * atlas, concatenated after the main one. Its poses are appended and its
+     * sprites renamed so name clashes cannot mix the two art sets.
+     */
+    private data class SubAtlas(
+        val assetPath: String,
+        val prefix: String,
+        val atlas: AnimateAtlas,
+        val poseOffset: Int,
+    )
+
+    private val subAtlases: List<SubAtlas> = loadSubAtlases()
+
+    private fun loadSubAtlases(): List<SubAtlas> {
+        if (animateAtlas == null) return emptyList()
+        val out = ArrayList<SubAtlas>()
+        var offset = animateAtlas.poses.size
+        for (def in data.animations) {
+            val assetPath = def.assetPath?.takeIf { it.isNotEmpty() } ?: continue
+            if (out.any { it.assetPath == assetPath }) continue
+            val subPath = assetPath.substringAfter(':')
+            val dir = ASSET_ROOTS.firstNotNullOfOrNull { root ->
+                val candidate = "$root/$subPath".removePrefix("/")
+                if (KnfFiles.exists("$candidate/spritemap1.json")) candidate else null
+            } ?: continue
+            val atlas = runCatching { AnimateAtlas(dir) }
+                .onFailure { println("KNF: sub atlas '$assetPath' failed: ${it.message}") }
+                .getOrNull() ?: continue
+            out += SubAtlas(assetPath, "$subPath/", atlas, offset)
+            offset += atlas.poses.size
+        }
+        return out
+    }
+
+    /**
      * Legacy atlas for every character that predates the Animate pipeline.
      *
      * `renderType` says `animateatlas` for most of them, but senpai, spooky,
@@ -166,20 +216,91 @@ class Character(val id: String) : Container() {
         legacyXml?.let { TextureAtlas.tryLoad(it) } ?: legacyTxt?.let { TextureAtlas.tryLoadPacker(it) }
     }
 
+    /**
+     * `multisparrow` (`MultiSparrowCharacter.loadAtlases`): every animation
+     * that carries its own `assetPath` contributes one Sparrow atlas,
+     * concatenated after the character's own frames.
+     */
+    private data class LegacySubAtlas(val assetPath: String, val prefix: String, val atlas: TextureAtlas)
+
+    private val legacySubAtlases: List<LegacySubAtlas> = loadLegacySubAtlases()
+
+    private fun loadLegacySubAtlases(): List<LegacySubAtlas> {
+        if (legacyAtlas == null) return emptyList()
+        val out = ArrayList<LegacySubAtlas>()
+        for (def in data.animations) {
+            val assetPath = def.assetPath?.takeIf { it.isNotEmpty() } ?: continue
+            if (out.any { it.assetPath == assetPath }) continue
+            val subPath = assetPath.substringAfter(':')
+            val atlas = ASSET_ROOTS.firstNotNullOfOrNull { root ->
+                val candidate = "$root/$subPath".removePrefix("/")
+                if (KnfFiles.exists("$candidate.xml")) TextureAtlas.tryLoad("$candidate.xml") else null
+            } ?: continue
+            out += LegacySubAtlas(assetPath, "$subPath/", atlas)
+        }
+        return out
+    }
+
     private val sprites: Map<String, SpriteDef> =
-        animateAtlas?.sprites ?: loadLegacySprites(legacyAtlas)
+        if (animateAtlas != null) combineSprites() else combineLegacySprites()
+
+    private fun combineLegacySprites(): Map<String, SpriteDef> {
+        val main = loadLegacySprites(legacyAtlas)
+        if (legacySubAtlases.isEmpty()) return main
+        val out = LinkedHashMap<String, SpriteDef>(main)
+        for (sub in legacySubAtlases) {
+            for ((name, def) in loadLegacySprites(sub.atlas)) out[sub.prefix + name] = def
+        }
+        return out
+    }
+
+    private fun combineSprites(): Map<String, SpriteDef> {
+        val main = animateAtlas ?: return emptyMap()
+        if (subAtlases.isEmpty()) return main.sprites
+        val out = LinkedHashMap<String, SpriteDef>(main.sprites)
+        for (sub in subAtlases) {
+            for ((name, def) in sub.atlas.sprites) out[sub.prefix + name] = def
+        }
+        return out
+    }
 
     /** All poses, indexed by timeline frame of the main symbol (or atlas frame). */
     private val poses: List<Pose> =
-        if (legacyAtlas != null) legacyPoses() else animateAtlas?.poses ?: emptyList()
+        if (legacyAtlas != null) legacyPoses() else combinePoses()
+
+    private fun combinePoses(): List<Pose> {
+        val main = animateAtlas ?: return emptyList()
+        if (subAtlases.isEmpty()) return main.poses
+        val out = ArrayList<Pose>(main.poses.size + subAtlases.sumOf { it.atlas.poses.size })
+        out.addAll(main.poses)
+        for (sub in subAtlases) {
+            for (pose in sub.atlas.poses) {
+                out += Pose(pose.parts.map { PosePart(sub.prefix + it.sprite, it.matrix) })
+            }
+        }
+        return out
+    }
 
     private data class Playback(
         val frames: List<Int>,
         val looped: Boolean,
         val frameRate: Double,
+        /**
+         * Authoring origin override (`timeline._bounds` of a concatenated sub
+         * atlas). Null for the character's own atlas, whose origin is the
+         * global [bounds] - reading it here would be a cycle, because `bounds`
+         * itself starts from the idle animation.
+         */
+        val originX: Double? = null,
+        val originY: Double? = null,
     )
 
-    private val anims: Map<String, Playback> = runCatching { loadAnimations() }.getOrElse { emptyMap() }
+    private val anims: Map<String, Playback> = runCatching { loadAnimations() }
+        .getOrElse {
+            println("KNF: character '$id' loadAnimations failed: ${it.message}")
+            it.printStackTrace()
+            emptyMap()
+        }
 
     /**
      * Per-animation offsets from the character JSON, in source pixels.
@@ -383,8 +504,10 @@ class Character(val id: String) : Container() {
      * rect sits inside the logical frame, which is what Flixel does when it plays
      * a sub-texture with one shared origin.
      */
-    private fun legacyPoses(): List<Pose> = sprites.values.map { def ->
-        Pose(listOf(PosePart(def.name, Mat(1.0, 0.0, 0.0, 1.0, def.dx.toDouble(), def.dy.toDouble()))))
+    private fun legacyPoses(): List<Pose> = sprites.entries.map { (name, def) ->
+        // The pose part carries the *map key*: `multisparrow` sub-atlas sprites
+        // are stored renamed, and `renderPose` looks parts up by that key.
+        Pose(listOf(PosePart(name, Mat(1.0, 0.0, 0.0, 1.0, def.dx.toDouble(), def.dy.toDouble()))))
     }
 
     /**
@@ -442,37 +565,58 @@ class Character(val id: String) : Container() {
         val out = LinkedHashMap<String, Playback>()
 
         for (def in data.animations) {
+            // `multianimateatlas`: this animation's symbols live in its own
+            // concatenated atlas, whose poses start at its pose offset.
+            val sub = def.assetPath?.takeIf { it.isNotEmpty() }
+                ?.let { path -> subAtlases.firstOrNull { it.assetPath == path } }
             val frames = if (legacyAtlas != null) {
                 legacyAnimationFrames(def)
             } else if (!def.frameIndices.isNullOrEmpty()) {
-                val found = labelFrames(def.prefix)
-                def.frameIndices.mapNotNull { found.getOrNull(it) }
+                val found = sub?.atlas?.labelFrames(def.prefix) ?: labelFrames(def.prefix)
+                val shifted = sub?.let { found.map { f -> f + it.poseOffset } } ?: found
+                def.frameIndices.mapNotNull { shifted.getOrNull(it) }
             } else {
-                labelFrames(def.prefix)
+                val found = sub?.atlas?.labelFrames(def.prefix) ?: labelFrames(def.prefix)
+                if (sub != null) found.map { it + sub.poseOffset } else found
             }
             if (frames.isNotEmpty()) {
+                val atlas = sub?.atlas ?: animateAtlas
                 out[def.name] = Playback(
                     frames = frames,
                     looped = def.looped,
-                    frameRate = def.frameRate?.toDouble() ?: animateAtlas?.frameRate ?: 24.0,
+                    frameRate = def.frameRate?.toDouble() ?: atlas?.frameRate ?: 24.0,
+                    originX = atlas?.bounds?.minX,
+                    originY = atlas?.bounds?.minY,
                 )
             }
         }
 
         if (out.isEmpty()) {
-            out["idle"] = Playback(poses.indices.toList(), looped = true, frameRate = 24.0)
+            out["idle"] = Playback(
+                poses.indices.toList(),
+                looped = true,
+                frameRate = 24.0,
+            )
         }
         return out
     }
 
     private fun legacyAnimationFrames(def: CharacterAnimationDef): List<Int> {
         val order = sprites.keys.toList()
+        // `multisparrow` sub-atlas sprites are stored under their asset path,
+        // so strip that back off before matching the animation's prefix.
+        fun spriteName(key: String): String {
+            for (sub in legacySubAtlases) {
+                if (key.startsWith(sub.prefix)) return key.removePrefix(sub.prefix)
+            }
+            return key
+        }
         // FNF uses `FlxSprite.animation.addByIndices(name, prefix, indices)`,
         // so the indices are relative to the frames matching `prefix`, not to
         // the whole sheet. gfTankmen puts all "GF Crying" frames before the
         // "GF Dancing" ones; treating 30 as a sheet index made every dance
         // pose play a crying frame.
-        val matching = order.indices.filter { order[it].startsWith(def.prefix) }
+        val matching = order.indices.filter { spriteName(order[it]).startsWith(def.prefix) }
         if (def.frameIndices.isNullOrEmpty()) return matching
         return def.frameIndices.mapNotNull { matching.getOrNull(it) }
     }
@@ -485,6 +629,45 @@ class Character(val id: String) : Container() {
     val isSinging: Boolean
         get() = currentAnim?.startsWith("sing") == true
 
+    /** FNF's `BaseCharacter.isDead`: set while the death screen owns the pose. */
+    var isDead: Boolean = false
+
+    /** Name of the animation currently on screen, for death-flow checks. */
+    val currentAnimationName: String?
+        get() = currentAnim
+
+    /** FNF's `hasAnimation` (`FlxAnimationController.exists`). */
+    fun hasAnimation(name: String): Boolean = anims.containsKey(name)
+
+    /** Temporary diagnostics for the Probe main. */
+    val spriteCount: Int get() = sprites.size
+    val poseCount: Int get() = poses.size
+    fun debugSpriteKeys(): List<String> = sprites.keys.toList()
+
+    /** Temporary diagnostics: where the current pose's parts would draw. */
+    fun debugRender(): String {
+        val playback = currentAnim?.let { anims[it] } ?: return "no anim"
+        val pose = poses.getOrNull(playback.frames.getOrNull(frameIndex) ?: -1)
+            ?: return "no pose"
+        val parts = pose.parts.mapNotNull { part ->
+            val def = sprites[part.sprite] ?: return@mapNotNull null
+            val (cx, cy) = part.matrix.xform(def.width / 2.0, def.height / 2.0)
+            "(x=" + (cx - (playback.originX ?: originX)).toString() +
+                ", y=" + (cy - (playback.originY ?: originY)).toString() +
+                ", w=" + def.width + ", h=" + def.height + ")"
+        }
+        return "anim=" + currentAnim + " origin=(" + (playback.originX ?: originX) + "," +
+            (playback.originY ?: originY) + ") parts=" + parts.joinToString(" ")
+    }
+
+    /** FNF's `getDeathCameraOffsets` (`_data.death.cameraOffsets`). */
+    val deathCameraOffsets: List<Double>
+        get() = data.death?.cameraOffsets ?: listOf(0.0, 0.0)
+
+    /** FNF's `getDeathCameraZoom` (`_data.death.cameraZoom`). */
+    val deathCameraZoom: Double
+        get() = data.death?.cameraZoom ?: 1.0
+
     /**
      * FNF's `BaseCharacter.dance()`.
      *
@@ -494,6 +677,8 @@ class Character(val id: String) : Container() {
      * singing and idling.
      */
     fun dance(forceRestart: Boolean = false) {
+        // FNF's `BaseCharacter.dance`: the death screen owns the pose.
+        if (isDead) return
         if (!forceRestart) {
             if (isSinging) return
             // FNF also refuses to chop a non-idle special animation (hey,
@@ -620,7 +805,8 @@ class Character(val id: String) : Container() {
     }
 
     private fun renderPose() {
-        val frames = currentAnim?.let { anims[it]?.frames } ?: return
+        val playback = currentAnim?.let { anims[it] } ?: return
+        val frames = playback.frames
         if (frames.isEmpty()) return
         val pose = poses.getOrNull(frames[frameIndex % frames.size]) ?: return
 
@@ -657,8 +843,11 @@ class Character(val id: String) : Container() {
             // origin to the sprite's own top-left. Without it every character is
             // drawn shifted by its bounding-box corner.
             val (cx, cy) = part.matrix.xform(def.width / 2.0, def.height / 2.0)
-            img.x = cx - originX + localOffsetX
-            img.y = cy - originY - animOffsetY
+            // The origin is the authoring bounds of the atlas the pose comes
+            // from: FNF's `drawAnimate` subtracts `timeline._bounds`, which
+            // switches to the sub-atlas when a death animation plays.
+            img.x = cx - (playback.originX ?: originX) + localOffsetX
+            img.y = cy - (playback.originY ?: originY) - animOffsetY
 
             // KGE builds `translation * rotation * scale`, i.e. `R * S`, whose
             // first column is `sx * (cos, sin)` and second is
@@ -764,6 +953,40 @@ class Character(val id: String) : Container() {
             data.cameraOffsets.getOrElse(1) { 0.0 }
         return (cx + stageCameraOffsets.getOrElse(0) { 0.0 }) to
             (cy + stageCameraOffsets.getOrElse(1) { 0.0 })
+    }
+
+    /**
+     * FNF's `resetCameraFocusPoint` center: the original position plus half
+     * the **idle frame**, not the whole-atlas bounds - the death camera
+     * subtracts the offsets back out, so the frame size is what remains and
+     * the union bounds would shove the character off the screen.
+     */
+    fun idleFrameCenter(): Pair<Double, Double> {
+        var index = anims["idle"]?.frames?.firstOrNull() ?: -1
+        if (index < 0) index = anims["danceLeft"]?.frames?.firstOrNull() ?: -1
+        if (index < 0) index = anims.values.firstOrNull()?.frames?.firstOrNull() ?: -1
+        val width: Double
+        val height: Double
+        when {
+            animateAtlas != null -> {
+                val b = animateAtlas.boundsOf(index.coerceAtLeast(0))
+                width = b.width
+                height = b.height
+            }
+            else -> {
+                val name = poses.getOrNull(index.coerceAtLeast(0))?.parts?.firstOrNull()?.sprite
+                val frame = name?.let { legacyAtlas?.frame(it) }
+                if (frame != null) {
+                    width = frame.logicalWidth.toDouble()
+                    height = frame.logicalHeight.toDouble()
+                } else {
+                    width = localWidth
+                    height = localHeight
+                }
+            }
+        }
+        return originalX + width * kotlin.math.abs(scaleX) / 2.0 to
+            originalY + height * kotlin.math.abs(scaleY) / 2.0
     }
 
     fun destroy() = removeFromParent()
