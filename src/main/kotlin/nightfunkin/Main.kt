@@ -4,8 +4,10 @@ import korlibs.image.color.Colors
 import korlibs.event.Key
 import korlibs.korge.Korge
 import korlibs.korge.scene.sceneContainer
+import korlibs.korge.view.Views
 import korlibs.korge.view.addUpdater
 import korlibs.math.geom.Size
+import korlibs.time.seconds
 import nightfunkin.core.Constants
 import nightfunkin.core.Knf
 import nightfunkin.play.PlayRequest
@@ -70,5 +72,50 @@ suspend fun main() = Korge(
         scenes.changeTo<SongSelectScene>()
     } else {
         scenes.changeTo<LoadingScene>()
+    }
+
+    if (System.getenv("KNF_WINDOW_BOP") == "1") {
+        stage.addUpdater { dt -> WindowBop.update(views, dt.seconds) }
+    }
+}
+
+object WindowBop {
+    private const val BOP_MULTIPLY = 50.0
+    private const val INTENSITY_MULTIPLY = 1000.0
+    private const val DECAY_POWER = 5.0
+    private const val SPEED = 0.1
+
+    var intensity = 0.0
+    private var elapsed = 0.0
+    private var duration = 0.0
+    private var active = false
+
+    private fun bopAmount(intensity: Double): Double =
+        BOP_MULTIPLY * Math.tanh(intensity * INTENSITY_MULTIPLY)
+
+    fun start(stepLengthMs: Double) {
+        duration = stepLengthMs / 1000.0
+        elapsed = 0.0
+        active = duration > 0.0
+        System.out.println("KNF: beat, intensity = $intensity, \n bop = ${bopAmount(intensity)}")
+    }
+
+    fun update(views: Views, dtSeconds: Double) {
+        if (!active) return
+        elapsed += dtSeconds * SPEED
+        val t = (elapsed / duration).coerceIn(0.0, 1.0)
+
+        val k = Math.pow(1.0 - t, DECAY_POWER)
+        val extra = bopAmount(intensity) * k
+
+        val w = Constants.GAME_WIDTH + extra.toInt()
+        val h = Constants.GAME_HEIGHT + (extra * Constants.GAME_HEIGHT / Constants.GAME_WIDTH).toInt()
+        views.gameWindow.setSize(w, h)
+
+        if (t >= 1.0) {
+            active = false
+            intensity = 0.0
+            views.gameWindow.setSize(Constants.GAME_WIDTH, Constants.GAME_HEIGHT)
+        }
     }
 }

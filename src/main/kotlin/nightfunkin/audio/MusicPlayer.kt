@@ -5,8 +5,10 @@ import korlibs.audio.sound.PlaybackTimes
 import korlibs.audio.sound.Sound
 import korlibs.audio.sound.SoundChannel
 import korlibs.audio.sound.readSound
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import nightfunkin.core.KnfFiles
 import java.io.File
@@ -245,6 +247,10 @@ class SfxPlayer(private val maxVoices: Int = 12) {
      */
     private val loadContext = SupervisorJob()
 
+    /** Late loads for paths `play()` was asked for before `preload()` cached them. */
+    private val loader = CoroutineScope(loadContext + Dispatchers.Default)
+    private val loading = HashSet<String>()
+
     var volume: Double = 1.0
 
     suspend fun preload(path: String): Sound? {
@@ -253,6 +259,9 @@ class SfxPlayer(private val maxVoices: Int = 12) {
             val bytes = KnfFiles.bytesOrNull(path) ?: return@withContext null
             bytes.readSound()
         } ?: return null
+        // `withContext` spins up a short-lived child job; bind playback to the
+        // long-lived supervisor instead so scene teardown cannot cancel it.
+        s.defaultCoroutineContext = loadContext
         cache[path] = s
         return s
     }
@@ -261,16 +270,40 @@ class SfxPlayer(private val maxVoices: Int = 12) {
      * Plays [path] and returns its channel so callers that need to wait for the
      * sound to finish (the intro cutscenes) can poll it. Existing fire-and-forget
      * callers can keep ignoring the result.
+     *
+     * A missing cache entry - the scene can be replaced before `sceneInit`
+     * finished its preloads, which is how the first song of a session used to
+     * lose its death SFX - is decoded on demand, like `FunkinSound.playOnce`.
+     * [onLateStart] fires once with the channel (or `null`) in that case.
      */
-    fun play(path: String, volume: Double = this.volume, pitch: Double = 1.0): AudioChannel? {
+    fun play(
+        path: String,
+        volume: Double = this.volume,
+        pitch: Double = 1.0,
+        onLateStart: ((AudioChannel?) -> Unit)? = null,
+    ): AudioChannel? {
         val s = cache[path]
         if (s == null) {
-            println("KNF: sfx.play not cached: $path")
+            if (loading.add(path)) {
+                loader.launch {
+                    val loaded = preload(path)
+                    loading.remove(path)
+                    val channel = loaded?.let { sound ->
+                        println("KNF: sfx late load: $path")
+                        start(sound, volume, pitch, path)
+                    }
+                    onLateStart?.invoke(channel)
+                }
+            }
             return null
         }
+        return start(s, volume, pitch, path)
+    }
+
+    private fun start(s: Sound, volume: Double, pitch: Double, path: String): AudioChannel? {
         prune()
         if (active.size >= maxVoices) {
-            println("KNF: sfx.play voice limit (${active.size}): $path")
+            println("KNF: sfx voice limit (${active.size}): $path")
             return null
         }
         return runCatching {
@@ -280,7 +313,7 @@ class SfxPlayer(private val maxVoices: Int = 12) {
             ac.play(s)
             active += ac
             ac
-        }.onFailure { println("KNF: sfx.play failed for $path: ${it.message}") }.getOrNull()
+        }.onFailure { println("KNF: sfx play failed for $path: ${it.message}") }.getOrNull()
     }
 
     private fun prune() {

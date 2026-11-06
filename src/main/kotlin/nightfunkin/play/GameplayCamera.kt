@@ -1,6 +1,7 @@
 package nightfunkin.play
 
 import korlibs.korge.view.Container
+import nightfunkin.WindowBop
 import nightfunkin.core.Constants
 import kotlin.math.pow
 
@@ -125,6 +126,7 @@ class GameplayCamera(
             // camHUD bump, including the 135% ceiling for fast bop rates.
             if (hudZoom >= Constants.MAX_RELATIVE_CAM_ZOOM) return
             bopMultiplier = bopIntensity
+            WindowBop.intensity = bopIntensity
             // `camHUD.zoom += hudCameraZoomIntensity * defaultHUDCameraZoom`.
             hudZoom += hudZoomIntensity
         }

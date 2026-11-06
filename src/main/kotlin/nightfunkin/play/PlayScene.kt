@@ -19,6 +19,7 @@ import nightfunkin.audio.MusicPlayer
 import nightfunkin.audio.SfxPlayer
 import nightfunkin.audio.dtSeconds
 import korlibs.math.geom.degrees
+import nightfunkin.WindowBop
 import nightfunkin.core.Constants
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfInput
@@ -140,6 +141,13 @@ class PlayScene : Scene() {
     private var gameOverBlueBalled = false
     private var gameOverAnimStarted = false
     private var gameOverLoopStarted = false
+
+    /**
+     * `bf.hxc`'s `fakeoutDeath` easter egg (1/4096): `fakeout_death` plays, then
+     * `firstDeath` restarts and only then does the blue-ball SFX play.
+     */
+    private var gameOverFakeout = false
+    private var fakeoutSoundPath: String? = null
     private var gameOverStartCountdown = 0.0
     private var gameOverConfirmElapsed = 0.0
     private var gameOverConfirmFadeDelay = 0.0
@@ -467,8 +475,14 @@ class PlayScene : Scene() {
         val deathSfxPath = resolveDeathSfx(gameOverSuffixes().second)
         deathSfxPath?.let { sfx.preload(it) }
         deathQuotePath = resolveDeathQuote()?.also { sfx.preload(it) }
+        fakeoutSoundPath = if (player.id == "bf" && player.hasAnimation("fakeoutDeath")) {
+            resolveStageSound("sounds/gameplay/gameover/fakeout_death")
+        } else {
+            null
+        }
+        fakeoutSoundPath?.let { sfx.preload(it) }
         if (System.getenv("KNF_DEBUG_DEATH") == "1") {
-            println("KNF: death sfx=[$deathSfxPath] quote=[$deathQuotePath]")
+            println("KNF: death sfx=[$deathSfxPath] quote=[$deathQuotePath] fakeout=[$fakeoutSoundPath]")
         }
 
         // Attached only now: `Conductor.update` dispatches step hits immediately,
@@ -481,6 +495,7 @@ class PlayScene : Scene() {
             // (`bopEvery = Constants.STEPS_PER_BEAT`), not on the hits.
             if (step % Constants.STEPS_PER_BEAT == 0) {
                 hud.bopIcons(conductor.stepLengthMs.toDouble())
+                WindowBop.start(conductor.stepLengthMs.toDouble())
             }
             // `danceEvery` counts beats and defaults to one, so everyone re-poses
             // on every quarter note.
@@ -1744,6 +1759,7 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         gameOverBlueBalled = false
         gameOverAnimStarted = false
         gameOverLoopStarted = false
+        gameOverFakeout = false
         gameOverStartCountdown = 0.0
         gameOverConfirmElapsed = 0.0
         gameOverConfirmFadeDelay = 0.0
@@ -1797,19 +1813,30 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
 
     /** `GameOverSubState.update`: the dying pose, the music hand-off, inputs. */
     private fun updateGameOver(dt: Double, input: KnfInput) {
-        // First frame: the dying pose and the "blue ball" SFX. FNF's 1/4096
-        // `fakeoutDeath` easter egg is skipped.
+        // First frame: the dying pose and the "blue ball" SFX. `bf.hxc` rolls
+        // the 1/4096 `fakeoutDeath` easter egg instead, which restarts
+        // `firstDeath` (and plays the loss SFX) once it finishes.
         if (!gameOverAnimStarted) {
             gameOverAnimStarted = true
-            if (player.hasAnimation("firstDeath")) player.play("firstDeath", forceRestart = true)
-            playLossSfx()
+            val fakeout = fakeoutSoundPath
+            if (fakeout != null && Random.nextDouble() < FAKEOUT_CHANCE) {
+                gameOverFakeout = true
+                sfx.play(fakeout, 1.0)
+                player.play("fakeoutDeath", forceRestart = true)
+            } else {
+                if (player.hasAnimation("firstDeath")) player.play("firstDeath", forceRestart = true)
+                playLossSfx()
+            }
         }
 
         if (!gameOverEnding) {
-            // Once `firstDeath` finishes: `playDeathQuote` when the character
-            // has one, otherwise start the loop music and hand the pose over
-            // to the looping `deathLoop`.
-            if (player.currentAnimationName?.startsWith("firstDeath") == true && player.animationFinished) {
+            if (gameOverFakeout) {
+                if (player.currentAnimationName?.startsWith("fakeoutDeath") == true && player.animationFinished) {
+                    gameOverFakeout = false
+                    if (player.hasAnimation("firstDeath")) player.play("firstDeath", forceRestart = true)
+                    playLossSfx()
+                }
+            } else if (player.currentAnimationName?.startsWith("firstDeath") == true && player.animationFinished) {
                 if (!gameOverLoopStarted) {
                     gameOverLoopStarted = true
                     val quote = deathQuotePath
@@ -1928,10 +1955,25 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         startDeathMusic(0.2)
         val generation = gameOverMusicGeneration
         if (player.hasAnimation("deathLoop")) player.play("deathLoop", forceRestart = true)
-        val channel = sfx.play(quote, 1.0)
+        val channel = sfx.play(quote, 1.0) { late -> startDeathQuoteFade(late, generation) }
+        if (channel != null) {
+            startDeathQuoteFade(channel, generation)
+        } else {
+            // A late load should start the clip within a frame or two; if the
+            // asset is truly missing, do not leave the music ducked forever.
+            launch {
+                delay(1_500)
+                if (deathQuoteChannel == null && generation == gameOverMusicGeneration) {
+                    deathMusicTargetVolume = 1.0
+                    gameOverMusic.volume = 1.0
+                }
+            }
+        }
+    }
+
+    private fun startDeathQuoteFade(channel: AudioChannel?, generation: Int) {
         deathQuoteChannel = channel
-        if (channel == null) {
-            // No cached clip: do not leave the music stuck at 0.2.
+        if (channel == null || generation != gameOverMusicGeneration) {
             deathMusicTargetVolume = 1.0
             gameOverMusic.volume = 1.0
             return
@@ -1957,41 +1999,37 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
      * `pico-playable.hxc` (inherited by `pico-christmas`/`pico-dark`) and
      * `pico-holding-nene.hxc`. BF and Pico only insult Tankman, except
      * `bf-holding-gf` and Pico holding Nene, who always do.
+     *
+     * Stock 0.8.6 is built with `CENSOR_EXPLETIVES` off and defaults
+     * `Preferences.naughtyness` to true, so no clip numbers are excluded.
      */
     private fun resolveDeathQuote(): String? {
         val dad = opponent.id
         val id = player.id
         val folder: String
         val max: Int
-        val censored: List<Int>
         when (id) {
             "bf" -> {
                 if (dad != "tankman") return null
                 folder = "jeffGameover"
                 max = 25
-                censored = BF_CENSORED_QUOTES
             }
             "bf-holding-gf" -> {
                 folder = "jeffGameover"
                 max = 25
-                censored = BF_CENSORED_QUOTES
             }
             "pico-playable", "pico-christmas", "pico-dark" -> {
                 if (dad != "tankman") return null
                 folder = "jeffGameover-pico"
                 max = 10
-                censored = PICO_CENSORED_QUOTES
             }
             "pico-holding-nene" -> {
                 folder = "jeffGameover-pico"
                 max = 10
-                censored = PICO_CENSORED_QUOTES
             }
             else -> return null
         }
-        val allowed = (1..max).filter { it !in censored }
-        if (allowed.isEmpty()) return null
-        val number = allowed.random()
+        val number = (1..max).random()
         return resolveStageSound("sounds/$folder/jeffGameover-$number")
     }
 
@@ -2262,11 +2300,8 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         const val QUOTE_MUSIC_VOLUME = 0.2
         const val QUOTE_FADE_SECONDS = 4.0
 
-        /** `bf.hxc` / `bf-holding-gf.hxc` `randomCensor` with naughtyness off. */
-        val BF_CENSORED_QUOTES = listOf(1, 3, 8, 13, 17, 21)
-
-        /** `pico-playable.hxc` / `pico-holding-nene.hxc` `randomCensor`. */
-        val PICO_CENSORED_QUOTES = listOf(4, 7, 8, 9)
+        /** `GameOverSubState.update`: `FlxG.random.bool((1 / 4096) * 100)`. */
+        const val FAKEOUT_CHANCE = 1.0 / 4096.0
     }
 
     /**
