@@ -1,6 +1,5 @@
 package nightfunkin.play
 
-import korlibs.audio.sound.AudioChannel
 import korlibs.image.color.Colors
 import korlibs.image.bitmap.sliceWithSize
 import korlibs.korge.scene.Scene
@@ -18,6 +17,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import nightfunkin.audio.MusicPlayer
+import nightfunkin.audio.SfxChannel
 import nightfunkin.audio.SfxPlayer
 import nightfunkin.audio.dtSeconds
 import korlibs.math.geom.degrees
@@ -37,6 +37,8 @@ import nightfunkin.data.SongRegistry
 import nightfunkin.platform.KnfEnv
 import nightfunkin.timing.Conductor
 import nightfunkin.ui.SongSelectScene
+import nightfunkin.ui.StickerOverlay
+import nightfunkin.ui.StickerSceneTarget
 import nightfunkin.ui.TouchControls
 import kotlin.math.abs
 import kotlin.math.exp
@@ -125,7 +127,7 @@ class PlayScene : Scene() {
 
     /** Non-null while a scripted intro cutscene has replaced the countdown. */
     private var cutscene: SongCutscene? = null
-    private var cutsceneSound: AudioChannel? = null
+    private var cutsceneSound: SfxChannel? = null
     private var blackScreen: SolidRect? = null
 
     /** HUD fade-in started by a cutscene; negative when no fade is running. */
@@ -171,7 +173,7 @@ class PlayScene : Scene() {
      * random pick is made at scene start so the clip can be preloaded.
      */
     private var deathQuotePath: String? = null
-    private var deathQuoteChannel: AudioChannel? = null
+    private var deathQuoteChannel: SfxChannel? = null
 
     /** `startDeathMusic(startingVolume)`; lowered while a quote plays. */
     private var deathMusicTargetVolume = 1.0
@@ -185,6 +187,8 @@ class PlayScene : Scene() {
     private var prePosition = 0f
 
     // ---- audio clock smoothing (see [updateClock]) ------------------------
+    private var exitingViaStickers = false
+
     private var smoothedAudioMs = 0.0
     private var smoothedAudioInit = false
     private var lastRawAudioMs = 0.0
@@ -959,7 +963,7 @@ class PlayScene : Scene() {
         // gameplay, the stage and the conductor until it closes.
         val menu = pauseMenu
         if (menu != null) {
-            menu.update(dt, gameInput)
+            if (!exitingViaStickers) menu.update(dt, gameInput)
             if (pauseMenu != null) {
                 pauseMusicFade += dt
                 pauseMusic.volume = PAUSE_MUSIC_VOLUME *
@@ -1268,14 +1272,16 @@ class PlayScene : Scene() {
         launch { sceneContainer.changeTo<PlayScene>() }
     }
 
-    /** `PauseSubState.quitToMenu`: back to the song list, as the results screen does. */
+    /** `PauseSubState.quitToMenu`: sticker transition back to the song list. */
     private fun exitToSongSelect() {
-        pauseMenu?.removeFromParent()
-        pauseMenu = null
-        paused = true
-        pauseMusicGeneration++
-        pauseMusic.stop()
-        launch { sceneContainer.changeTo<SongSelectScene>() }
+        StickerSceneTarget.beginCover()
+        exitingViaStickers = true
+        // `PauseSubState.quitToMenu` opens the sticker substate OVER the live
+        // pause menu; the scene switch happens once the screen is covered.
+        val overlay = StickerOverlay(chart.characters.player, sfx) {
+            launch { sceneContainer.changeTo<SongSelectScene>() }
+        }
+        sceneRoot.addChild(overlay)
     }
 
     /**
@@ -2035,7 +2041,7 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         }
     }
 
-    private fun startDeathQuoteFade(channel: AudioChannel?, generation: Int) {
+    private fun startDeathQuoteFade(channel: SfxChannel?, generation: Int) {
         deathQuoteChannel = channel
         if (channel == null || generation != gameOverMusicGeneration) {
             deathMusicTargetVolume = 1.0
@@ -2128,7 +2134,7 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         if (player.hasAnimation("deathConfirm")) player.play("deathConfirm", forceRestart = true)
     }
 
-    /** `goBack`: stop the death music and leave to the song list. */
+    /** `GameOverSubState` quit: sticker transition back to the song list. */
     private fun exitGameOver() {
         if (gameOverEnding) return
         gameOverEnding = true

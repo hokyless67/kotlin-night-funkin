@@ -1,11 +1,14 @@
 package nightfunkin.audio
 
 import korlibs.audio.format.defaultAudioFormats
-import korlibs.audio.sound.AudioChannel
+import korlibs.audio.sound.AudioData
+import korlibs.audio.sound.AudioSample
 import korlibs.audio.sound.PlaybackTimes
 import korlibs.audio.sound.Sound
 import korlibs.audio.sound.SoundChannel
+import korlibs.audio.sound.nativeSoundProvider
 import korlibs.audio.sound.readSound
+import korlibs.concurrent.lock.Lock
 import korlibs.io.stream.openAsync
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -274,10 +277,12 @@ class MusicPlayer {
  * FNF 0.8.6 dropped per-song hitsounds, so KNF reuses the real countdown and
  * miss samples that ship in `shared/sounds/` and synthesises a click for taps.
  */
-class SfxPlayer(private val maxVoices: Int = 12) {
+class SfxPlayer {
 
     private val cache = HashMap<String, Sound>()
-    private val active = ArrayList<AudioChannel>()
+
+    /** Decoded PCM per cached sound: the software mixer reads samples directly. */
+    private val audioCache = HashMap<String, AudioData>()
 
     /**
      * `SoundAudioData` captures the coroutine context it was decoded in and
@@ -291,7 +296,16 @@ class SfxPlayer(private val maxVoices: Int = 12) {
     private val loader = CoroutineScope(loadContext + Dispatchers.Default)
     private val loading = HashSet<String>()
 
-    var volume: Double = 1.0
+    // ---- software mixer ---------------------------------------------------
+    //
+    // korlibs opens one platform audio output PER playing channel; desktop
+    // WaveOut hard-caps them (~a dozen), so a sticker transition popping ~90
+    // key clicks crashed the process. All SFX therefore mix into ONE shared
+    // output through this tiny software mixer: unlimited voices, one device.
+
+    private val mixLock = Lock()
+    private val voices = ArrayList<Voice>()
+    private var mixerStarted = false
 
     suspend fun preload(path: String): Sound? {
         cache[path]?.let { return it }
@@ -302,14 +316,16 @@ class SfxPlayer(private val maxVoices: Int = 12) {
         // `withContext` spins up a short-lived child job; bind playback to the
         // long-lived supervisor instead so scene teardown cannot cancel it.
         s.defaultCoroutineContext = loadContext
+        // Decode the PCM once for the software mixer (small files: clicks etc).
+        runCatching { s.decode() }.getOrNull()?.also { audioCache[path] = it }
         cache[path] = s
         return s
     }
 
     /**
-     * Plays [path] and returns its channel so callers that need to wait for the
-     * sound to finish (the intro cutscenes) can poll it. Existing fire-and-forget
-     * callers can keep ignoring the result.
+     * Plays [path] and returns a handle so callers that need to wait for the
+     * sound to finish (the intro cutscenes) can poll it. Existing
+     * fire-and-forget callers can keep ignoring the result.
      *
      * A missing cache entry - the scene can be replaced before `sceneInit`
      * finished its preloads, which is how the first song of a session used to
@@ -318,10 +334,10 @@ class SfxPlayer(private val maxVoices: Int = 12) {
      */
     fun play(
         path: String,
-        volume: Double = this.volume,
+        volume: Double = 1.0,
         pitch: Double = 1.0,
-        onLateStart: ((AudioChannel?) -> Unit)? = null,
-    ): AudioChannel? {
+        onLateStart: ((SfxChannel?) -> Unit)? = null,
+    ): SfxChannel? {
         val s = cache[path]
         if (s == null) {
             if (loading.add(path)) {
@@ -340,28 +356,95 @@ class SfxPlayer(private val maxVoices: Int = 12) {
         return start(s, volume, pitch, path)
     }
 
-    private fun start(s: Sound, volume: Double, pitch: Double, path: String): AudioChannel? {
-        prune()
-        if (active.size >= maxVoices) {
-            println("KNF: sfx voice limit (${active.size}): $path")
-            return null
-        }
-        return runCatching {
-            val ac = AudioChannel()
-            ac.volume = volume
-            ac.pitch = pitch
-            ac.play(s)
-            active += ac
-            ac
-        }.onFailure { println("KNF: sfx play failed for $path: ${it.message}") }.getOrNull()
-    }
-
-    private fun prune() {
-        active.removeAll { it.playing.not() }
+    private fun start(s: Sound, volume: Double, pitch: Double, path: String): SfxChannel? {
+        ensureMixer()
+        // `preload` always fills `audioCache` before caching the sound.
+        val audio = audioCache[path] ?: return null
+        val voice = Voice(audio, volume = volume.toFloat(), pitch = pitch)
+        val channel = SfxChannel(mixLock, voice)
+        mixLock { voices += voice }
+        return channel
     }
 
     fun stopAll() {
-        active.forEach { it.stop() }
-        active.clear()
+        mixLock { voices.forEach { it.done = true } }
+    }
+
+    @OptIn(kotlin.ExperimentalStdlibApi::class)
+    private fun ensureMixer() {
+        if (mixerStarted) return
+        mixerStarted = true
+        // The gen callback runs on the platform audio thread; `mixLock` guards
+        // the voice list against plays/late loads on other threads.
+        var mixerDebugCalls = 0
+        nativeSoundProvider.createNewPlatformAudioOutput(2, 44100) { buffer ->
+            mixLock {
+                if (mixerDebugCalls % 20 == 0) {
+                    val first = voices.firstOrNull()
+                    println(
+                        "KNF: mix#${mixerDebugCalls} voices=${voices.size} " +
+                            "firstPos=${first?.pos?.toInt()} firstTotal=${first?.data?.totalSamples} " +
+                            "firstDone=${first?.done} bufSamples=${buffer.totalSamples} bufCh=${buffer.channels}"
+                    )
+                }
+                mixerDebugCalls++
+                for (ch in 0 until buffer.channels) {
+                    for (n in 0 until buffer.totalSamples) buffer[ch, n] = AudioSample.ZERO
+                }
+                val finished = ArrayList<Voice>()
+                for (voice in voices) {
+                    if (voice.done) continue
+                    val total = voice.data.totalSamples
+                    val dataChannels = voice.data.channels
+                    var pos = voice.pos
+                    for (n in 0 until buffer.totalSamples) {
+                        if (pos >= total) {
+                            voice.done = true
+                            finished += voice
+                            break
+                        }
+                        val sampleIndex = pos.toInt()
+                        for (ch in 0 until buffer.channels) {
+                            val sample = voice.data[if (ch < dataChannels) ch else 0, sampleIndex].toFloat() * voice.volume
+                            buffer[ch, n] = AudioSample(buffer[ch, n].toFloat() + sample)
+                        }
+                        // Naive resampling: `pitch` scales the read speed.
+                        pos += voice.pitch
+                    }
+                    // Persist the read position, or every mix pass restarts
+                    // the voice from its beginning (the looping-buzz bug).
+                    voice.pos = pos
+                    if (pos >= total) {
+                        voice.done = true
+                        finished += voice
+                    }
+                }
+                if (finished.isNotEmpty()) voices.removeAll(finished.toSet())
+            }
+        }.start()
+    }
+}
+
+/** One mixed sfx voice: reads its decoded PCM at a `pitch`-scaled speed. */
+internal class Voice(
+    val data: AudioData,
+    var pos: Double = 0.0,
+    var volume: Float = 1f,
+    val pitch: Double = 1.0,
+    var done: Boolean = false,
+)
+
+/** A handle over a playing voice: volume can be nudged live, `stop` cuts it. */
+class SfxChannel internal constructor(private val mixLock: Lock, private val voice: Voice) {
+    var volume: Double
+        get() = voice.volume.toDouble()
+        set(value) {
+            mixLock { voice.volume = value.toFloat() }
+        }
+
+    val playing: Boolean get() = !voice.done
+
+    fun stop() {
+        mixLock { voice.done = true }
     }
 }

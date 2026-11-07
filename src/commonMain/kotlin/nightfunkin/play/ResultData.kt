@@ -77,6 +77,8 @@ data class PlayerData(
     val name: String = "",
     val ownedChars: List<String> = emptyList(),
     val results: PlayerResultsData? = null,
+    /** `PlayableCharacter.getStickerPackID` — the sticker transition pack. */
+    val stickerPack: String? = null,
 )
 
 /**
@@ -114,6 +116,10 @@ object ResultPlayerRegistry {
 
     fun resultsFor(characterId: String): PlayerResultsData? =
         entries[ownerOf(characterId)]?.results
+
+    /** `PlayableCharacter.getStickerPackID` for the owning player entry. */
+    fun stickerPackOf(characterId: String): String? =
+        entries[ownerOf(characterId)]?.stickerPack
 
     fun ownerName(characterId: String): String =
         entries[ownerOf(characterId)]?.name ?: ownerOf(characterId)

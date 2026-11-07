@@ -100,7 +100,7 @@ object WindowBop {
         duration = stepLengthMs / 1000.0
         elapsed = 0.0
         active = duration > 0.0
-        println("KNF: beat, intensity = $intensity, \n bop = ${bopAmount(intensity)}")
+        // println("KNF: beat, intensity = $intensity, \n bop = ${bopAmount(intensity)}")
     }
 
     fun update(views: Views, dtSeconds: Double) {

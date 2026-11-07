@@ -214,6 +214,7 @@ class SongSelectScene : Scene() {
     private var fadeRect: SolidRect? = null
 
     override suspend fun SContainer.sceneInit() {
+        sceneRoot = this
         Save.load()
         newCharacterCard = KnfEnv["KNF_NEWCARD"] == "1" || Save.hasNewCharacter()
         fiveBySeven = loadFont("fonts/5by7.ttf")
@@ -287,6 +288,16 @@ class SongSelectScene : Scene() {
 
         if (entries.isEmpty()) {
             setStatus("No songs found - is the FNF 'assets' folder reachable?")
+        }
+
+        // `FreeplayState.new(params, stickers)`: the sticker transition's
+        // REVEAL phase plays over the freshly built scene, hiding it until
+        // every sticker peels off.
+        StickerSceneTarget.consumeReveal()?.let { reveal ->
+            if (reveal.placements.isNotEmpty()) {
+                revealActive = true
+                addStickerRevealOverlay(reveal)
+            }
         }
     }
 
@@ -1703,6 +1714,9 @@ class SongSelectScene : Scene() {
 
     private var headerSized = false
 
+    /** Scene root container captured in [sceneInit] for late view additions. */
+    private var sceneRoot: SContainer? = null
+
     private suspend fun loadSounds() {
         confirmSound = KnfFiles.resolveSound("preload/sounds/confirmMenu")?.also { sfx.preload(it) }
         scrollSound = KnfFiles.resolveSound("preload/sounds/scrollMenu")?.also { sfx.preload(it) }
@@ -1710,6 +1724,50 @@ class SongSelectScene : Scene() {
         favSound = KnfFiles.resolveSound("preload/sounds/fav")?.also { sfx.preload(it) }
         unfavSound = KnfFiles.resolveSound("preload/sounds/unfav")?.also { sfx.preload(it) }
     }
+
+
+    /**
+     * `StickerSubState.degenStickers`: the stickers that covered the screen
+     * during the switch peel off one by one, key clicks and all, revealing
+     * the scene behind them.
+     */
+    private fun addStickerRevealOverlay(reveal: StickerReveal) {
+        val root = sceneRoot ?: return
+        println("KNF: reveal overlay: ${reveal.placements.size} placements")
+        val overlay = Container()
+        root.addChild(overlay)
+        val images = reveal.placements.map { placement ->
+            Image(KnfFiles.bitmap("shared/images/${placement.path}.png")).also { img ->
+                img.smoothing = true
+                img.x = placement.x
+                img.y = placement.y
+                img.rotation = placement.angleDegrees.degrees
+                img.scaleX = placement.popScale
+                img.scaleY = placement.popScale
+                overlay.addChild(img)
+            }
+        }
+        overlay.addUpdater { dt ->
+            revealElapsed += dt.secondsDouble()
+            var remaining = 0
+            for ((index, img) in images.withIndex()) {
+                val placement = reveal.placements[index]
+                if (img.visible && placement.appearAt <= revealElapsed) {
+                    img.visible = false
+                    if (placement.soundStem.isNotEmpty()) sfx.play(placement.soundStem)
+                }
+                if (img.visible) remaining++
+            }
+            if (remaining == 0 || revealElapsed >= 2.0) {
+                println("KNF: reveal done, elapsed=${KnfFmt.decimals(revealElapsed, 2)}")
+                overlay.removeFromParent()
+                revealActive = false
+            }
+        }
+    }
+
+    private var revealActive = false
+    private var revealElapsed = 0.0
 
     // ======================================================================
     // Update loop
@@ -1805,7 +1863,7 @@ class SongSelectScene : Scene() {
                 }
             }
 
-            if (!transitioning && !leaving) {
+            if (!transitioning && !leaving && !revealActive) {
                 handleInputs(knfInput, d)
             }
 

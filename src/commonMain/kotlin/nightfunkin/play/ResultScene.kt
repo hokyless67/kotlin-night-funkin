@@ -26,6 +26,8 @@ import nightfunkin.core.KnfTouch
 import nightfunkin.core.SparrowSprite
 import nightfunkin.core.TextureAtlas
 import nightfunkin.ui.SongSelectScene
+import nightfunkin.ui.StickerOverlay
+import nightfunkin.ui.StickerSceneTarget
 import nightfunkin.ui.TouchControls
 import nightfunkin.ui.secondsDouble
 import kotlin.math.cos
@@ -118,6 +120,7 @@ class ResultScene : Scene() {
     // =====================================================================
 
     override suspend fun SContainer.sceneInit() {
+        sceneRoot = this
         val data = ResultRequest.data
         if (data == null) {
             println("KNF: ResultScene started without ResultRequest.data")
@@ -670,16 +673,17 @@ class ResultScene : Scene() {
     // input / transition
     // =====================================================================
 
+    private var sceneRoot: SContainer? = null
+
     private fun startExit() {
         if (busy) return
         busy = true
-        exiting = true
-        exitElapsed = 0.0
-        tween(0.0, EXIT_FADE_SECONDS, ::expoOut, { t ->
-            rankBg.alpha = t
-        }, {
+        // `ResultState`: non-story exits go through the sticker transition
+        // (`StickerSubState` over the results screen).
+        val overlay = StickerOverlay(ResultRequest.data?.characterId ?: "bf", sfx) {
             launch { sceneContainer.changeTo<SongSelectScene>() }
-        })
+        }
+        sceneRoot?.addChild(overlay)
     }
 
     // =====================================================================
