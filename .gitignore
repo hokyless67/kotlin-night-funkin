@@ -7,6 +7,9 @@ out/
 *.jar
 !gradle/wrapper/gradle-wrapper.jar
 
+# Machine-local Android SDK location (absolute path)
+local.properties
+
 # ---- IDE / editor -----------------------------------------------------------
 .idea/
 *.iml
