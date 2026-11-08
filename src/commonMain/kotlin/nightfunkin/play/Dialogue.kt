@@ -864,7 +864,7 @@ class DialogueCutscene(
         }
         val player = MusicPlayer()
         player.loop = musicData.looped
-        if (!player.load(path, 0.0, streaming = true)) {
+        if (!player.load(path, 0.0)) {
             println("KNF: could not load dialogue music '$path'")
             player.dispose()
             return

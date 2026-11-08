@@ -144,10 +144,10 @@ class ResultScene : Scene() {
         val introPath = KnfFiles.resolveSound("$musicStem-intro")
         if (loopPath != null) {
             music.loop = true
-            music.load(loopPath, 1.0, streaming = true)
+            music.load(loopPath, 1.0)
         }
         if (introPath != null) {
-            introAvailable = introMusic.load(introPath, 1.0, streaming = true)
+            introAvailable = introMusic.load(introPath, 1.0)
         }
 
         // ---- background + flash -----------------------------------------

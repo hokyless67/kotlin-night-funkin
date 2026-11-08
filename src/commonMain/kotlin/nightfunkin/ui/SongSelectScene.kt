@@ -1733,7 +1733,6 @@ class SongSelectScene : Scene() {
      */
     private fun addStickerRevealOverlay(reveal: StickerReveal) {
         val root = sceneRoot ?: return
-        println("KNF: reveal overlay: ${reveal.placements.size} placements")
         val overlay = Container()
         root.addChild(overlay)
         val images = reveal.placements.map { placement ->
@@ -1759,7 +1758,6 @@ class SongSelectScene : Scene() {
                 if (img.visible) remaining++
             }
             if (remaining == 0 || revealElapsed >= 2.0) {
-                println("KNF: reveal done, elapsed=${KnfFmt.decimals(revealElapsed, 2)}")
                 overlay.removeFromParent()
                 revealActive = false
             }

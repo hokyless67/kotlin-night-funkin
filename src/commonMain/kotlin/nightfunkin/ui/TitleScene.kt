@@ -88,7 +88,7 @@ class TitleScene : Scene() {
         buildTitleScreen(titleGroup)
         titleGroup.visible = !playIntro
 
-        KnfFiles.resolveSound("preload/music/freakyMenu/freakyMenu")?.let { music.load(it, 0.55, streaming = true) }
+        KnfFiles.resolveSound("preload/music/freakyMenu/freakyMenu")?.let { music.load(it, 0.55) }
         KnfFiles.resolveSound("preload/sounds/confirmMenu")?.let {
             confirmSoundPath = it
             sfx.preload(it)

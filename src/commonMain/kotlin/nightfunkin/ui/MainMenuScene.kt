@@ -173,7 +173,7 @@ class MainMenuScene : Scene() {
         // persist = true. Loading the same sound is a no-op, and `playing`
         // keeps the track running across the title/main-menu transition.
         val wasPaused = music.isPaused
-        music.load(path, 1.0, streaming = true)
+        music.load(path, 1.0)
         if (!music.playing) {
             if (wasPaused) {
                 // Freeplay closed: FNF's playMusic sees a paused track as not

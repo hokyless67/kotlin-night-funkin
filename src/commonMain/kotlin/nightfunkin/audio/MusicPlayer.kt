@@ -16,6 +16,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import nightfunkin.core.KnfFiles
+import nightfunkin.platform.KnfPlatform
 import nightfunkin.core.KnfFmt
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -94,15 +95,22 @@ class MusicPlayer {
 
     val playing: Boolean get() = channel?.state?.playing == true
 
-    /** Loads [path] (an asset key relative to the FNF asset root). */
+    /**
+     * Loads [path] (an asset key relative to the FNF asset root).
+     *
+     * [streaming] `null` picks per platform: mobile streams (memory is
+     * scarce, a solo track tolerates decode hiccups), desktop fully decodes
+     * into memory (fast CPU, big heap, gapless start).
+     */
     suspend fun load(
         path: String,
         volume: Double = 1.0,
-        streaming: Boolean = false,
+        streaming: Boolean? = null,
         analyze: Boolean = true,
     ): Boolean {
         if (loadedPath == path && sound != null) return true
-        return loadInternal(path, path, volume, streaming, analyze) { KnfFiles.bytesOrNull(path) }
+        val useStreaming = streaming ?: KnfPlatform.isMobile
+        return loadInternal(path, path, volume, useStreaming, analyze) { KnfFiles.bytesOrNull(path) }
     }
 
     /**
@@ -145,10 +153,11 @@ class MusicPlayer {
 
             // Gameplay stems MUST be fully decoded: the streaming decoder's
             // output position jumps in buffer-sized chunks and can underrun
-            // under CPU load, which desyncs the stems from each other. Solo
-            // tracks (menu music, previews) opt into streaming instead — a
-            // momentary gap there is harmless. Decoded PCM costs ~10 MB per
-            // minute of stereo audio; `largeHeap` covers a song's worth.
+            // under CPU load, which desyncs the stems from each other AND
+            // cuts the track's beginning. Solo tracks (menu music, previews)
+            // stream on mobile — a momentary gap there is harmless. Decoded
+            // PCM costs ~10 MB per minute of stereo audio; `largeHeap`
+            // covers a song's worth on mobile, desktop has 2 GB.
             val loadedSound = bytes.readSound(streaming = streaming)
 
             // Sound.length is zero for KorGE's non-streaming SoundAudioData,
@@ -376,19 +385,8 @@ class SfxPlayer {
         mixerStarted = true
         // The gen callback runs on the platform audio thread; `mixLock` guards
         // the voice list against plays/late loads on other threads.
-        var mixerDebugCalls = 0
         nativeSoundProvider.createNewPlatformAudioOutput(2, 44100) { buffer ->
-            mixLock {
-                if (mixerDebugCalls % 20 == 0) {
-                    val first = voices.firstOrNull()
-                    println(
-                        "KNF: mix#${mixerDebugCalls} voices=${voices.size} " +
-                            "firstPos=${first?.pos?.toInt()} firstTotal=${first?.data?.totalSamples} " +
-                            "firstDone=${first?.done} bufSamples=${buffer.totalSamples} bufCh=${buffer.channels}"
-                    )
-                }
-                mixerDebugCalls++
-                for (ch in 0 until buffer.channels) {
+            mixLock {                for (ch in 0 until buffer.channels) {
                     for (n in 0 until buffer.totalSamples) buffer[ch, n] = AudioSample.ZERO
                 }
                 val finished = ArrayList<Voice>()

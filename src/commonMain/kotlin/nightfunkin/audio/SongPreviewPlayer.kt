@@ -29,7 +29,7 @@ class SongPreviewPlayer {
         isCurrent: () -> Boolean = { true },
     ): Boolean {
         stop()
-        if (!player.load(path, streaming = true)) return false
+        if (!player.load(path)) return false
         // Loading is asynchronous; the selection may have moved on while the
         // file was decoding. Never start a preview that is no longer current.
         if (!isCurrent()) {

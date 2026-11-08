@@ -43,7 +43,6 @@ class StickerOverlay(
         val packId = resolveStickerPackFor(playerCharacterId)
         val packStickers = loadPack(packId)
         val sounds = stickerSoundStems()
-        println("KNF: sticker overlay init: pack='$packId' stickers=${packStickers.size} sounds=${sounds.size}")
 
         if (packStickers.isEmpty()) {
             // Nothing to show — hand off on the first updater tick, right
@@ -129,7 +128,6 @@ class StickerOverlay(
             }
             if (!covered && placements.last().popped) {
                 covered = true
-                println("KNF: sticker overlay covered (${images.size} stickers)")
                 // `switchState(() -> targetState(this))`: the popped stickers
                 // are carried into the next state for the peel-off phase.
                 StickerSceneTarget.handOff(placements)

@@ -461,7 +461,7 @@ class PlayScene : Scene() {
 
         // ---- audio -------------------------------------------------------
         val instPath = song.instrumentalPath(PlayRequest.variation)
-        if (instPath == null || !music.load(instPath)) {
+        if (instPath == null || !music.load(instPath, streaming = false)) {
             println("KNF: no instrumental found for '${song.name}'")
         } else if (KnfFiles.isMp3(instPath)) {
             // MP3 decoders add ~12 ms of latency; FNF compensates the same way.
@@ -474,11 +474,11 @@ class PlayScene : Scene() {
         // opponent stays silent.
         chart.characters.let { chars ->
             song.vocalsPath(chars.player, PlayRequest.variation)?.let { path ->
-                vocals.load(path)
+                vocals.load(path, streaming = false)
                 println("KNF: vocals player " + path)
             }
             song.vocalsPath(chars.opponent, PlayRequest.variation)?.let { path ->
-                opponentVocals.load(path)
+                opponentVocals.load(path, streaming = false)
                 println("KNF: vocals opponent " + path)
             }
         }
