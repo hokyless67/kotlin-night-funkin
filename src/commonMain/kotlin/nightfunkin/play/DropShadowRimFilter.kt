@@ -19,6 +19,7 @@ import korlibs.korge.view.filter.ShaderFilter.Companion.texture2DZeroOutside
 import korlibs.math.geom.Vector4F
 import nightfunkin.core.KnfFiles
 import kotlin.math.cos
+import kotlin.math.pow
 import kotlin.math.sin
 import nightfunkin.core.KnfMath
 
@@ -159,7 +160,7 @@ class DropShadowRimFilter(
             var cv = 1.0 + c / 100.0
             if (cv > 1.0) {
                 val e = 2.718281828459045
-                cv = ((0.00852259 * Math.pow(e, 4.76454 * (cv - 1.0))) * 1.01 - 0.0086078159) * 10.0 + 1.0
+                cv = ((0.00852259 * e.pow(4.76454 * (cv - 1.0))) * 1.01 - 0.0086078159) * 10.0 + 1.0
             }
 
             val brightness = b / 255.0

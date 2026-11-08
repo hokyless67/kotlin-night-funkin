@@ -9,6 +9,7 @@ import nightfunkin.core.setPixelArt
 import kotlin.time.Duration
 import kotlin.math.cos
 import kotlin.math.sin
+import kotlin.random.Random
 
 /**
  * Judgement popups and the combo counter.
@@ -65,8 +66,8 @@ class PopUpStuff(
             asset.offsets.getOrElse(1) { 0.0 }
 
         addChild(img)
-        launch(img, accelerationY = 550.0, velocityY = -(140.0 + Math.random() * 35.0),
-            velocityX = -(Math.random() * 10.0), delay = beatLengthMs * 0.001, stepped = asset.isPixel)
+        launch(img, accelerationY = 550.0, velocityY = -(140.0 + Random.nextDouble() * 35.0),
+            velocityX = -(Random.nextDouble() * 10.0), delay = beatLengthMs * 0.001, stepped = asset.isPixel)
     }
 
     /**
@@ -98,9 +99,9 @@ class PopUpStuff(
                 asset.offsets.getOrElse(1) { 0.0 }
 
             addChild(img)
-            launch(img, accelerationY = 250.0 + Math.random() * 50.0,
-                velocityY = -(130.0 + Math.random() * 20.0),
-                velocityX = -5.0 + Math.random() * 10.0,
+            launch(img, accelerationY = 250.0 + Random.nextDouble() * 50.0,
+                velocityY = -(130.0 + Random.nextDouble() * 20.0),
+                velocityX = -5.0 + Random.nextDouble() * 10.0,
                 delay = beatLengthMs * 0.002, stepped = asset.isPixel)
             daLoop++
         }

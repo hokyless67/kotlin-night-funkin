@@ -6,6 +6,7 @@ import korlibs.image.bitmap.Bitmap
 import korlibs.image.format.RegisteredImageFormats
 import nightfunkin.platform.KnfFile
 import nightfunkin.platform.KnfPlatform
+import kotlin.concurrent.Volatile
 
 
 /**

@@ -20,6 +20,7 @@ import nightfunkin.core.SparrowSprite
 import nightfunkin.core.TextureAtlas
 import nightfunkin.core.setPixelArt
 import kotlin.math.atan2
+import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.max
 import nightfunkin.core.KnfMath
@@ -435,7 +436,7 @@ private class ScoreNum(
                 timer += dt
                 val t = (timer / SETTLE_DURATION).coerceIn(0.0, 1.0)
                 val eased = 1.0 - (1.0 - t) * (1.0 - t)
-                val shown = Math.floor(eased * finalDigit).toInt()
+                val shown = floor(eased * finalDigit).toInt()
                 if (shown != value) {
                     value = shown
                     playDigit(value)

@@ -33,6 +33,8 @@ import nightfunkin.ui.secondsDouble
 import kotlin.math.cos
 import kotlin.math.floor
 import kotlin.math.max
+import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import nightfunkin.core.KnfMath
 import kotlin.random.Random
@@ -523,7 +525,7 @@ class ResultScene : Scene() {
 
         var lastTicked = start
         tween(0.0, 58.0 / 24.0, ::quartOut, { t ->
-            val value = Math.round(start + (clearPercentTarget - start) * t).toInt()
+            val value = (start + (clearPercentTarget - start) * t).roundToInt()
             if (value != lastTicked) {
                 lastTicked = value
                 scrollMenuSound?.let { sfx.play(it) }
@@ -829,7 +831,7 @@ class ResultScene : Scene() {
     }
 
     private fun expoOut(t: Double): Double =
-        if (t >= 1.0) 1.0 else 1.0 - Math.pow(2.0, -10.0 * t)
+        if (t >= 1.0) 1.0 else 1.0 - 2.0.pow(-10.0 * t)
 
     private fun quadIn(t: Double): Double = t * t
 
@@ -850,7 +852,7 @@ class ResultScene : Scene() {
     }
 
     private fun lerpChannel(a: Int, b: Int, t: Double): Int =
-        Math.round(a + (b - a) * t).toInt()
+        (a + (b - a) * t).roundToInt()
 
     // =====================================================================
     // data holders

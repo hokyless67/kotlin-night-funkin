@@ -13,6 +13,7 @@ import nightfunkin.core.NoteStyle
 import nightfunkin.core.setPixelArt
 import nightfunkin.data.SongNoteData
 import nightfunkin.timing.Conductor
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
@@ -200,7 +201,7 @@ class Strumline(
         val t = (vwooshElapsed / vwooshDuration).coerceIn(0.0, 1.0)
         val start = if (downscroll) -vwooshDistance else vwooshDistance
         // FlxEase.expoOut: 1 - 2^(-10t).
-        val ease = 1.0 - Math.pow(2.0, -10.0 * t)
+        val ease = 1.0 - 2.0.pow(-10.0 * t)
         val offset = start * (1.0 - ease)
         for (note in notes) note.vwooshOffsetY = offset
         if (t >= 1.0) {

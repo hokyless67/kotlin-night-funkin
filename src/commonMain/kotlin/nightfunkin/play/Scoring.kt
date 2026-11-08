@@ -1,6 +1,7 @@
 package nightfunkin.play
 
 import nightfunkin.core.Constants
+import kotlin.math.exp
 
 /** Timing verdict for a note. Order matters: `>=` when compared in a `when`. */
 enum class Judgement(val label: String) {
@@ -139,7 +140,7 @@ object Scoring {
         val t = absTimingMs
         if (t > Constants.PBOT1_MISS_THRESHOLD) return Constants.PBOT1_MISS_SCORE
         if (t < Constants.PBOT1_PERFECT_THRESHOLD) return Constants.PBOT1_MAX_SCORE
-        val factor = 1.0 - (1.0 / (1.0 + Math.exp(-Constants.PBOT1_SCORING_SLOPE.toDouble() * (t.toDouble() - Constants.PBOT1_SCORING_OFFSET.toDouble()))))
+        val factor = 1.0 - (1.0 / (1.0 + exp(-Constants.PBOT1_SCORING_SLOPE.toDouble() * (t.toDouble() - Constants.PBOT1_SCORING_OFFSET.toDouble()))))
         return (Constants.PBOT1_MAX_SCORE * factor + Constants.PBOT1_MIN_SCORE).toInt()
     }
 

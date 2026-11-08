@@ -47,9 +47,15 @@ actual class KnfFile actual constructor(private val path: String) {
         return st.st_mode.toInt()
     }
 
-    actual fun isFile(): Boolean = (modeFlags() ?: return false) and S_IFMT == S_IFREG
+    actual fun isFile(): Boolean {
+        val mode = modeFlags() ?: return false
+        return mode and S_IFMT == S_IFREG
+    }
 
-    actual fun isDirectory(): Boolean = (modeFlags() ?: return false) and S_IFMT == S_IFDIR
+    actual fun isDirectory(): Boolean {
+        val mode = modeFlags() ?: return false
+        return mode and S_IFMT == S_IFDIR
+    }
 
     actual fun listNames(): List<String>? {
         if (!isDirectory()) return null
