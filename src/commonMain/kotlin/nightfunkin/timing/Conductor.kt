@@ -166,12 +166,18 @@ class Conductor {
     fun update(songPosMs: Float, applyOffsets: Boolean = true) {
         var pos = songPosMs + if (applyOffsets) combinedOffset else 0f
 
-        currentTimeChange = findTimeChange(pos)
+        // `Conductor.hx`: `songPosition` is assigned *before* the step/beat
+        // signals are dispatched. Handlers (including `PlayState.beatHit`'s
+        // vocal resync) must see the position they are being notified about,
+        // otherwise they act on the previous frame's time.
+        songPosition = pos
+
+        currentTimeChange = findTimeChange(songPosition)
 
         val tc = currentTimeChange!!
-        currentStepTime = round(tc.beatTime * 4f + (pos - tc.timeStamp) / stepLengthMs, 6)
+        currentStepTime = round(tc.beatTime * 4f + (songPosition - tc.timeStamp) / stepLengthMs, 6)
         currentBeatTime = currentStepTime / 4f
-        currentMeasureTime = timeInMeasures(pos)
+        currentMeasureTime = timeInMeasures(songPosition)
 
         currentStep = floor(currentStepTime).toInt()
         currentBeat = floor(currentBeatTime).toInt()
@@ -190,10 +196,9 @@ class Conductor {
             onMeasureHit?.invoke()
         }
 
-        if (prevTime != pos) {
+        if (prevTime != songPosition) {
             songPositionDelta = 0f
-            prevTime = pos
-            songPosition = pos
+            prevTime = songPosition
         }
     }
 

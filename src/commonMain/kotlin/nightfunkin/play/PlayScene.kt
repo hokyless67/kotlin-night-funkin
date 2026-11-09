@@ -41,10 +41,11 @@ import nightfunkin.ui.StickerOverlay
 import nightfunkin.ui.StickerSceneTarget
 import nightfunkin.ui.TouchControls
 import kotlin.math.abs
-import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.time.DurationUnit
+import kotlin.time.TimeSource
 import kotlin.random.Random
 
 /** What to play вЂ” stashed before switching scenes. */
@@ -186,19 +187,29 @@ class PlayScene : Scene() {
     private var startTimestampMs = 0.0
     private var prePosition = 0f
 
-    // ---- audio clock smoothing (see [updateClock]) ------------------------
     private var exitingViaStickers = false
-
-    private var smoothedAudioMs = 0.0
-    private var smoothedAudioInit = false
-    private var lastRawAudioMs = 0.0
 
     private var countdownStep = -1
     private var countdownTimer = 0.0
     private val clockDebug = KnfEnv["KNF_DEBUG_CLOCK"] == "1"
+    /** KorGE clamps `dt`, so the song needs a real monotonic clock. */
+    private val realClock = TimeSource.Monotonic.markNow()
     private var wallClock = 0.0
-    private var songStartWallMs = -1.0
+
+    /**
+     * Audible song time in ms (instrumental content position).
+     *
+     * `MusicPlayer.positionMs` is the number of samples *generated into the
+     * output queue*, not the sample reaching the speakers; the backends buffer
+     * 40-100 ms ahead. The audio thread plays in real time independently of
+     * rendering, so a monotonic clock advanced from [wallClock] is the clock
+     * the player actually hears.
+     */
+    private var songClockMs = 0.0
+    private var lastSongWallMs = -1.0
     private var clockSampleTimer = 0.0
+
+    private fun realNowMs(): Double = realClock.elapsedNow().toDouble(DurationUnit.MILLISECONDS)
 
     private var nextEventIndex = 0
 
@@ -953,7 +964,7 @@ class PlayScene : Scene() {
     // ======================================================================
 
     private fun tick(dt: Double) {
-        wallClock += dt * 1000.0
+        wallClock = realNowMs()
         gameInput.update()
         // While an overlay owns the screen the touch overlay switches to
         // menu gestures (tap = accept, drags = navigation).
@@ -1154,7 +1165,11 @@ class PlayScene : Scene() {
         sceneRoot.addChild(menu)
 
         // `openSubState`: the instrumental and both vocal stems stop where they
-        // are; `closeSubState` resumes them from the same position.
+        // are; `closeSubState` resumes them from the same audible position.
+        // Advance the song clock to this frame first: the tick returns early
+        // while the menu is open, so otherwise the last frame would be replayed
+        // on resume.
+        advanceSongClock()
         music.pause()
         vocals.pause()
         opponentVocals.pause()
@@ -1235,6 +1250,10 @@ class PlayScene : Scene() {
         pauseMenu = null
         paused = false
         pauseMusic.stop()
+        // The tick stood still while the overlay was open; don't bill that time
+        // to the song clock (the stems themselves were not paused here, but a
+        // conversation's own music may have been).
+        lastSongWallMs = wallClock
         println("KNF: cutscene pause closed")
     }
 
@@ -1246,18 +1265,16 @@ class PlayScene : Scene() {
         pauseMenu = null
         paused = false
         pauseMusic.stop()
-        // The stems restart from the paused sample; re-anchor the clock
-        // (`PlayState.resyncVocals` does the same after a substate close).
-        smoothedAudioInit = false
-        // Restart all three stems from the instrumental's paused sample. Their
-        // own positions can differ by a whole WaveOut buffer (~90 ms), and the
-        // JVM backend's per-channel pause leaves those queues frozen, so
-        // resuming each track where it happened to stop makes the vocals drift
-        // from the instrumental after every pause.
-        val resumeAt = music.pausedAtMs
+        // `PlayState.closeSubState` resumes the stems and then calls
+        // `resyncVocals()`. Restart all three from the audible position: the
+        // channels' own last samples are *generated* samples, buffered ahead
+        // of what was heard, so resuming from them would skip ~50-100 ms of
+        // music and put every stem behind the arrows.
+        val resumeAt = songClockMs
         music.play(resumeAt)
         vocals.play(resumeAt)
         opponentVocals.play(resumeAt)
+        lastSongWallMs = wallClock
     }
 
     /** `PauseSubState.restartPlayState`: rebuild the scene from `PlayRequest`. */
@@ -1285,14 +1302,35 @@ class PlayScene : Scene() {
     }
 
     /**
-     * Advances the Conductor.
+     * Advances [songClockMs] by the real time elapsed since the last frame.
      *
-     * Notes advance by the frame delta from a predicted clock; the audio
-     * position steers it back on course. The Android *streaming* audio backend
-     * reports `positionMs` with jitter around the real playback position as
-     * buffers are scheduled, and feeding it straight into the Conductor made
-     * the note scroll visibly twitch back and forth. Small errors are absorbed
-     * gradually; large ones (song start, pause resume) snap immediately.
+     * Playback is real-time on its own high-priority thread, so the audible
+     * song position is exactly the wall clock. Unlike KorGE's frame delta it is
+     * not clamped to 100 ms (`Views.clampElapsedTimeTo`), which is what made a
+     * dt-integrated song clock fall behind on every freeze and never recover.
+     */
+    private fun advanceSongClock() {
+        if (!music.playing) {
+            lastSongWallMs = wallClock
+            return
+        }
+        val now = wallClock
+        if (lastSongWallMs >= 0.0) {
+            val realDt = (now - lastSongWallMs).coerceIn(0.0, 5000.0) / 1000.0
+            songClockMs += realDt * 1000.0 * music.pitch
+        }
+        lastSongWallMs = now
+    }
+
+    /**
+     * Advances the Conductor from the audible song clock.
+     *
+     * FNF reads `FlxG.sound.music.time`, which OpenAL/lime report as the sample
+     * actually being played. KorGE instead reports the sample *generated* into
+     * the platform output's queue: the JVM WaveOut backend keeps up to eight
+     * 512-sample headers queued (~93 ms), and Android's `AudioTrack` and iOS
+     * CoreAudio buffer comparably. Following it made every note fire 50-100 ms
+     * before the music was heard.
      */
     private fun updateClock(dt: Double) {
         if (startingSong) {
@@ -1307,35 +1345,23 @@ class PlayScene : Scene() {
             return
         }
 
-        conductor.accumulateDelta(dt.toFloat(), music.pitch.toFloat())
+        if (!music.playing) return
 
-        // The streaming audio position on Android is a *decode* position: it
-        // sits still for hundreds of ms, then jumps forward by the whole
-        // buffer (~1.5 s) at once. Neither extreme is usable as a clock, so
-        // notes advance by the frame delta (wall clock, always smooth) and
-        // the audio position only applies a rate-limited correction inside a
-        // deadband — real clock drift is slow, buffer jumps are fast and
-        // large, the two are easy to tell apart.
-        val raw = music.positionMs
-        val audioTicked = raw != lastRawAudioMs
-        lastRawAudioMs = raw
-
-        if (!smoothedAudioInit) {
-            smoothedAudioMs = raw
-            smoothedAudioInit = true
-        } else {
-            smoothedAudioMs += dt * 1000.0 * music.pitch
-            if (audioTicked) {
-                val error = raw - smoothedAudioMs
-                if (abs(error) <= CLOCK_DEADBAND_MS) {
-                    val maxStepMs = CLOCK_CORRECTION_SPEED_MS_PER_S * dt
-                    smoothedAudioMs += error.coerceIn(-maxStepMs, maxStepMs)
-                }
-            }
+        if (lastSongWallMs < 0.0) {
+            // The audio thread has not queued its first block yet. `play()`
+            // returns immediately; `waveOutOpen` / `AudioTrack` start a few
+            // milliseconds later. Anchoring before that would make every note
+            // arrive by the device-open latency.
+            if (music.positionMs <= startTimestampMs) return
+            lastSongWallMs = wallClock
+            return
         }
 
-        val target = (smoothedAudioMs + conductor.combinedOffset).toFloat()
-        conductor.update(target, false)
+        advanceSongClock()
+        // Sub-frame interpolation for smooth scrolling; the authoritative
+        // position remains the wall clock.
+        conductor.accumulateDelta(dt.toFloat(), music.pitch.toFloat())
+        conductor.update(songClockMs.toFloat() + conductor.combinedOffset, false)
     }
 
     private fun updateCountdown(dt: Double) {
@@ -1367,11 +1393,45 @@ class PlayScene : Scene() {
 
     private fun startSong() {
         startingSong = false
-        smoothedAudioInit = false
+        songClockMs = startTimestampMs
+        // Anchor when the audio thread submits its first buffer (see
+        // `updateClock`): `play` starts the output asynchronously, and starting
+        // the wall clock now would count the device-open latency as song time.
+        lastSongWallMs = -1.0
         music.play(startTimestampMs)
-vocals.play(startTimestampMs - conductor.instrumentalOffset)
+        vocals.play(startTimestampMs - conductor.instrumentalOffset)
         opponentVocals.play(startTimestampMs - conductor.instrumentalOffset)
         hud.showCountdown("go", conductor.beatLengthMs.toDouble())
+        // No `resyncVocals()` here. `SoundChannel.current` is the decoder's
+        // read cursor, while the samples already queued in the output keep
+        // playing; seeking one stem to the other's (block-quantized) position
+        // can therefore move it by a whole 2048-sample block (~46 ms), which
+        // then stays for the whole song. All three stems already start at the
+        // same sample, so there is nothing to align.
+    }
+
+    /**
+     * `PlayState.resyncVocals` (`PlayState.hx:2724-2743`).
+     *
+     * Restarts the instrumental and both vocal stems from the same *audible*
+     * song position, the same path `closePause` uses. An in-place
+     * `SoundChannel.current` seek cannot do this: it moves only the decoder's
+     * read cursor while the samples already queued in the output keep playing,
+     * so it can land one 2048-sample block (~46 ms) off - the persistent
+     * "one stem is a block ahead" offset this exists to remove. FNF can seek
+     * `FlxSound.time` directly because its backends expose a real sample
+     * position; KorGE does not.
+     */
+    private fun resyncVocals() {
+        if (!music.playing) return
+
+        val resumeAt = songClockMs
+        music.pause()
+        vocals.pause()
+        opponentVocals.pause()
+        music.play(resumeAt)
+        vocals.play(resumeAt)
+        opponentVocals.play(resumeAt)
     }
 
     private fun checkSongEnd() {
@@ -1437,8 +1497,12 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
 
         if (avsyncDebug && avcount > 0) {
             val avg = avsum / avcount
-            println("KNF: AVSYNC notes=$avcount avg=${KnfFmt.decimals(avg, 2)}ms audio-vs-chart")
-            println("KNF: AVSYNC conductor=${conductor.songPosition}ms audio=${music.positionMs}ms offset=${conductor.combinedOffset}ms")
+            println("KNF: AVSYNC notes=$avcount avg=${KnfFmt.decimals(avg, 2)}ms audible-vs-chart")
+            println(
+                "KNF: AVSYNC conductor=${conductor.songPosition}ms " +
+                    "audible=${(songClockMs + conductor.combinedOffset)}ms " +
+                    "generated=${music.positionMs}ms offset=${conductor.combinedOffset}ms"
+            )
         }
         println(
             "KNF: song finished $rank (${(tallies.completion * 100).roundToInt()}%), " +
@@ -1497,29 +1561,30 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
     }
 
     /**
-     * Compares three clocks: real time since the instrumental started, the
-     * position KorGE reports for it, and the Conductor derived from that.
+     * Compares the audible song clock, the position KorGE reports for the
+     * instrumental, and the Conductor derived from the audible clock.
      *
-     * If `audio` runs ahead of `wall` the conductor is driving the notes from a
-     * clock that is ahead of what the speakers are actually emitting, which
-     * reads as "the arrows arrive before the music".
+     * `audio - wall` is the output queue: the samples generated but not yet
+     * heard. It is expected to stay at ~50-100 ms and is not drift.
      */
     private fun sampleClock(dt: Double) {
         clockSampleTimer += dt
         if (clockSampleTimer < 0.5) return
         clockSampleTimer = 0.0
-        // Anchor on the frame the instrumental was started, not on the first sample.
-        if (songStartWallMs < 0.0) songStartWallMs = wallClock
-        val wall = wallClock - songStartWallMs
+        val wall = songClockMs
         val audio = music.positionMs
         val lead = playerStrumline.notes.minOfOrNull { it.strumTime.toDouble() } ?: -1.0
+        val playerVoice = if (vocals.playing) vocals.positionMs - audio else 0.0
+        val opponentVoice = if (opponentVocals.playing) opponentVocals.positionMs - audio else 0.0
         println(
             "KNF: CLOCK wall=" + KnfFmt.decimals(wall, 0) +
                 "ms audio=" + KnfFmt.decimals(audio, 0) +
                 "ms drift=" + KnfFmt.decimals(audio - wall, 0) +
                 "ms cond=" + KnfFmt.decimals(conductor.songPosition.toDouble(), 0) +
                 "ms nextNote=" + KnfFmt.decimals(lead, 0) +
-                "ms ahead=" + KnfFmt.decimals(lead - conductor.songPosition.toDouble(), 0)
+                "ms ahead=" + KnfFmt.decimals(lead - conductor.songPosition.toDouble(), 0) +
+                " pv=" + KnfFmt.decimals(playerVoice, 0) +
+                " ov=" + KnfFmt.decimals(opponentVoice, 0)
         )
     }
 
@@ -1597,6 +1662,32 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         if (opponent.dancesOnBeat) opponent.dance()
         girlfriend?.let { if (it.dancesOnBeat) it.dance() }
         for (support in speakerSupports) support.onBeat()
+
+        // `PlayState.beatHit` (PlayState.hx:1897-1921). All stems report the
+        // same *generated* clock here, so the instrumental is the reference:
+        // their queue-fill jitter cancels out and only a real drift remains.
+        // The instrumental itself is driven by `updateClock`, so it is the only
+        // stem never compared against anything.
+        if (!startingSong && music.playing) {
+            val length = music.totalMs
+            if (length > 0.0) {
+                val correctSync = min(length, max(0.0, music.positionMs))
+                val playerError = if (vocals.playing) vocals.positionMs - correctSync else 0.0
+                val opponentError = if (opponentVocals.playing) opponentVocals.positionMs - correctSync else 0.0
+                if (
+                    abs(playerError) > RESYNC_THRESHOLD_MS ||
+                    abs(opponentError) > RESYNC_THRESHOLD_MS
+                ) {
+                    if (clockDebug) {
+                        println(
+                            "KNF: VOCALS NEED RESYNC player=${playerError.roundToInt()}ms " +
+                                "opponent=${opponentError.roundToInt()}ms"
+                        )
+                    }
+                    resyncVocals()
+                }
+            }
+        }
     }
 
     private fun goodNoteHit(note: NoteSprite) {
@@ -2302,13 +2393,17 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
     }
 
     /**
-     * Measures how far the audio clock leads the Conductor at the instant each
-     * note's strum time is crossed. A non-zero average is the visual offset
-     * players would perceive.
+     * Measures the residual between the audible song clock and the instant each
+     * note's strum time is crossed. It should stay near zero; a growing value
+     * means the Conductor is not tracking the audible clock.
+     *
+     * `music.positionMs` is deliberately not used here: it is the *generated*
+     * position, buffered ahead of the speakers, so it would report the output
+     * queue as a permanent offset.
      */
     private fun measureAvSync() {
         val nowC = conductor.songPosition
-        val nowA = music.positionMs.toFloat() + conductor.combinedOffset
+        val nowA = songClockMs.toFloat() + conductor.combinedOffset
         val dC = nowC - prevConductorMs
         val dA = nowA - prevAudioMs
 
@@ -2374,13 +2469,15 @@ vocals.play(startTimestampMs - conductor.instrumentalOffset)
         const val FAKEOUT_CHANCE = 1.0 / 4096.0
 
         /**
-         * Errors beyond this are buffer jumps, not drift — ignored. Real
-         * audio-vs-CPU clock drift over a 3-minute song stays far below.
+         * `PlayState.RESYNC_THRESHOLD` is 40 ms in FNF, where `FlxSound.time`
+         * is sample-accurate. Here `SoundChannel.current` is the number of
+         * *generated* samples, and each stem's output queue is filled
+         * independently, so two stems routinely report 0 or one 2048-sample
+         * block (~46 ms), occasionally two, while staying audibly in phase.
+         * Resyncing on that reporting jitter would restart the stems for no
+         * reason, so `resyncVocals()` only reacts to a real, gross drift.
          */
-        const val CLOCK_DEADBAND_MS = 250.0
-
-        /** Correction speed cap, in ms of clock per second of playback. */
-        const val CLOCK_CORRECTION_SPEED_MS_PER_S = 60.0
+        const val RESYNC_THRESHOLD_MS = 150.0
     }
 
     /**
