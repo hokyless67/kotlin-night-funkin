@@ -68,36 +68,6 @@ korge {
 }
 
 /**
- * XcodeGen resolves its `SettingPresets/*.yml` files relative to the current
- * working directory first. KorGE builds XcodeGen from source, which leaves the
- * presets in the checkout instead of next to the binary, so XcodeGen prints
- * "No \"base\" settings found" and the generated project silently loses every
- * default Xcode build setting.
- *
- * The important one is `CLANG_ENABLE_MODULES`: without Objective-C modules
- * clang does not emit the `-framework UIKit` autolink hint for `main.m`, and
- * the final `Ld` step fails with undefined `UIResponder`/`UIApplicationMain`.
- *
- * Copying the presets into the project folder (XcodeGen's first lookup path)
- * restores the full default settings set.
- */
-fun copyXcodegenPresets(projectFolder: File): Boolean {
-    val target = File(projectFolder, "SettingPresets")
-    if (target.isDirectory) return false
-
-    val candidates = listOf(
-        File(project.iosXcodegenExt.xcodeGenFolder, "SettingPresets"),
-        File("/usr/local/share/xcodegen/SettingPresets"),
-        File("/opt/homebrew/share/xcodegen/SettingPresets"),
-        File("/usr/local/share/XcodeGen/SettingPresets"),
-    )
-    val source = candidates.firstOrNull { it.isDirectory } ?: return false
-
-    source.copyRecursively(target)
-    return true
-}
-
-/**
  * The Korge plugin generates the Xcode project with a hardcoded Info.plist
  * (portrait + landscape, no document sharing). The game is landscape-only and
  * loads its assets from the app's Documents folder, so patch the generated
@@ -197,8 +167,28 @@ val knfIosPrepareProject = tasks.register("knfIosPrepareProject") {
             regenerateProject = true
         }
 
-        if (copyXcodegenPresets(projectFolder)) {
-            regenerateProject = true
+        // XcodeGen resolves its `SettingPresets/*.yml` files relative to the
+        // current working directory first. KorGE builds XcodeGen from source,
+        // which leaves the presets in the checkout instead of next to the
+        // binary, so XcodeGen prints `No "base" settings found` and the
+        // generated project silently loses every default Xcode build setting.
+        //
+        // The important one is `CLANG_ENABLE_MODULES`: without Objective-C
+        // modules clang does not emit the `-framework UIKit` autolink hint for
+        // `main.m`, and the final `Ld` step fails with undefined
+        // `UIResponder`/`UIApplicationMain`. Copying the presets into the
+        // project folder (XcodeGen's first lookup path) restores them.
+        val presetsFolder = File(projectFolder, "SettingPresets")
+        if (!presetsFolder.isDirectory) {
+            val presetsSource = listOf(
+                File(project.iosXcodegenExt.xcodeGenFolder, "SettingPresets"),
+                File("/usr/local/share/xcodegen/SettingPresets"),
+                File("/opt/homebrew/share/xcodegen/SettingPresets"),
+            ).firstOrNull { it.isDirectory }
+            if (presetsSource != null) {
+                presetsSource.copyRecursively(presetsFolder)
+                regenerateProject = true
+            }
         }
 
         if (regenerateProject) {
