@@ -85,6 +85,17 @@ val knfIosPrepareProject = tasks.register("knfIosPrepareProject") {
     }
 
     doLast {
+        // `copyIosResources` copies `build/processedResources/iosArm64/main` into
+        // `build/combinedResources/resources`. This project embeds no resources
+        // (game assets are loaded from Documents/KNF/assets), so that source
+        // does not exist and Gradle marks the task NO-SOURCE without creating
+        // the destination folder. The generated Xcode project still has an
+        // (optional) folder reference to it, and xcodebuild then fails with
+        // "No such file or directory" while copying it into the app bundle.
+        // Create the destination up front so the folder reference always has a
+        // valid (empty) source directory.
+        layout.buildDirectory.dir("combinedResources/resources").get().asFile.mkdirs()
+
         val projectFolder = layout.buildDirectory.dir("platforms/ios").get().asFile
         val plistFile = File(projectFolder, "app/Info.plist")
         check(plistFile.isFile) { "KNF: missing generated Info.plist at $plistFile" }
