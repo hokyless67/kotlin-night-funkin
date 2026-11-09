@@ -5,8 +5,8 @@ import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.convert
 import kotlinx.cinterop.usePinned
+import kotlin.experimental.ExperimentalNativeApi
 import kotlin.native.EagerInitialization
-import kotlin.native.ExperimentalNativeApi
 import kotlin.native.setUnhandledExceptionHook
 import nightfunkin.platform.KnfPlatform
 import platform.posix.FILE
