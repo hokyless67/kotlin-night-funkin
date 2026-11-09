@@ -24,6 +24,7 @@ import nightfunkin.core.Constants
 import nightfunkin.core.KnfFiles
 import nightfunkin.data.SongRegistry
 import nightfunkin.platform.KnfEnv
+import nightfunkin.platform.KnfPlatform
 import nightfunkin.play.PlayScene
 import nightfunkin.play.Stage
 import kotlin.math.abs
@@ -80,6 +81,7 @@ class LoadingScene : Scene() {
     private lateinit var progressLines: Container
     private lateinit var rightTextGroup: Container
     private lateinit var vfdOverlay: Image
+    private lateinit var missingAssetsText: Text
 
     private var progressY = 0.0
 
@@ -152,6 +154,21 @@ class LoadingScene : Scene() {
             it.y = 0.0
             addChild(it)
         }
+
+        // The preloader waits forever for the asset tree. On a fresh mobile
+        // install nothing tells the player what to do, so after a couple of
+        // seconds show where the app expects `assets` to be.
+        missingAssetsText = text(
+            "FNF assets not found. Copy the 'assets' folder to:\n" +
+                KnfPlatform.assetRootCandidates().joinToString("\n"),
+            textSize = 24.0,
+            color = BAR_COLOR,
+        ).also {
+            it.x = BAR_PADDING * 2
+            it.y = BAR_PADDING * 2
+            it.visible = false
+            addChild(it)
+        }
     }
 
     override suspend fun SContainer.sceneMain() {
@@ -162,8 +179,10 @@ class LoadingScene : Scene() {
         // grant storage access in the system settings screen it opened. The
         // loader holds on "Downloading assets..." until the tree shows up.
         while (!KnfFiles.hasAssets()) {
+            if (now() >= 2.0) missingAssetsText.visible = true
             delay(300L)
         }
+        missingAssetsText.visible = false
 
         // FNF opens on `NotStarted`; this frame is the initial "Loading 0/11".
         updateGraphics(0.0, 0.0)

@@ -69,12 +69,22 @@ object KnfFiles {
 
     fun file(path: String): KnfFile = assetsRoot.child(path)
 
-    fun fileOrNull(path: String): KnfFile? = file(path).takeIf { it.isFile() }
+    /**
+     * Null-safe variants of [file]/[exists]. The preloader runs before the
+     * asset tree is guaranteed to exist (on a fresh iOS install the user has
+     * not copied `KNF/assets` yet), so probing must not throw: an uncaught
+     * Kotlin exception aborts the whole app on Kotlin/Native.
+     */
+    fun fileOrNull(path: String): KnfFile? {
+        val root = tryResolveRoot() ?: return null
+        return root.child(path).takeIf { it.isFile() }
+    }
 
-    fun exists(path: String): Boolean = file(path).isFile()
+    fun exists(path: String): Boolean = fileOrNull(path) != null
 
     /** Like [exists], but for a folder - Animate atlases live in one. */
-    fun isDirectory(path: String): Boolean = file(path).isDirectory()
+    fun isDirectory(path: String): Boolean =
+        tryResolveRoot()?.child(path)?.isDirectory() == true
 
     /**
      * Finds the folder holding an Animate atlas, given the stage's library and
@@ -106,9 +116,10 @@ object KnfFiles {
      * `week6/images`.
      */
     val imageLibraries: List<String> by lazy {
-        assetsRoot.listNames().orEmpty()
+        val root = tryResolveRoot() ?: return@lazy emptyList()
+        root.listNames().orEmpty()
             .filter { name ->
-                val dir = assetsRoot.child(name)
+                val dir = root.child(name)
                 dir.isDirectory() && dir.child("images").isDirectory()
             }
             .sortedBy { when (it) { "shared" -> 0; "preload" -> 2; else -> 1 } }
