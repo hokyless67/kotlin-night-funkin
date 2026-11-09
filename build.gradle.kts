@@ -100,9 +100,21 @@ val knfIosPrepareProject = tasks.register("knfIosPrepareProject") {
         // the 32-bit `armv7` requirement.
         plist = plist.replace("<string>armv7</string>", "<string>arm64</string>")
 
+        // `ibtool` on GitHub's macOS runners sometimes refuses to compile the
+        // generated LaunchScreen.storyboard ("iOS 18.0 Platform Not
+        // Installed"), which fails the whole Xcode build. Replace it with the
+        // native iOS 14+ `UILaunchScreen` dictionary and delete the storyboard
+        // below, so no Interface Builder step runs at all.
+        plist = plist.replace(
+            Regex("""\s*<key>UILaunchStoryboardName</key>\s*<string>[^<]*</string>"""),
+            ""
+        )
+
         // Let users drop the FNF asset tree into Files/Finder and keep a
         // landscape-only iPad app (iPad requires full screen for that).
         val extraKeys = """
+            <key>UILaunchScreen</key>
+            <dict/>
             <key>UIFileSharingEnabled</key>
             <true/>
             <key>LSSupportsOpeningDocumentsInPlace</key>
@@ -125,6 +137,17 @@ val knfIosPrepareProject = tasks.register("knfIosPrepareProject") {
 
         var yml = projectYml.readText()
         var regenerateProject = false
+
+        // Drop the generated LaunchScreen.storyboard (see the Info.plist patch
+        // above): the app uses the `UILaunchScreen` key instead. XcodeGen only
+        // picks up files present at generation time, so remove it before the
+        // project is regenerated.
+        val launchStoryboard = File(projectFolder, "app/Base.lproj/LaunchScreen.storyboard")
+        if (launchStoryboard.isFile) {
+            launchStoryboard.delete()
+            launchStoryboard.parentFile?.delete()
+            regenerateProject = true
+        }
 
         // XcodeGen does not create schemes unless they are listed, but the
         // KorGE plugin builds with `xcodebuild -scheme app-<arch>-<config>`.
