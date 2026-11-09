@@ -21,6 +21,7 @@ import korlibs.time.PerformanceCounter
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import nightfunkin.core.Constants
+import nightfunkin.core.KnfBootLog
 import nightfunkin.core.KnfFiles
 import nightfunkin.data.SongRegistry
 import nightfunkin.platform.KnfEnv
@@ -86,10 +87,12 @@ class LoadingScene : Scene() {
     private var progressY = 0.0
 
     override suspend fun SContainer.sceneInit() {
+        KnfBootLog.mark("LoadingScene.sceneInit start")
         val width = Constants.GAME_WIDTH.toDouble()
         val height = Constants.GAME_HEIGHT.toDouble()
 
         solidRect(width, height, BACKGROUND)
+        KnfBootLog.mark("LoadingScene.sceneInit background")
 
         progressY = height * 0.67
         progressLines = Container().also {
@@ -118,6 +121,7 @@ class LoadingScene : Scene() {
         val quantico = loadFont("fonts/Quantico-Regular.ttf")
         val inconsolataBlack = loadFont("fonts/Inconsolata-Black.ttf")
         val inconsolataBold = loadFont("fonts/Inconsolata-Bold.ttf")
+        KnfBootLog.mark("LoadingScene.sceneInit fonts")
 
         // FNF measures the height while this is still the single-line
         // "Downloading assets..." placeholder, then never repositions it when
@@ -154,6 +158,7 @@ class LoadingScene : Scene() {
             it.y = 0.0
             addChild(it)
         }
+        KnfBootLog.mark("LoadingScene.sceneInit vfd overlay")
 
         // The preloader waits forever for the asset tree. On a fresh mobile
         // install nothing tells the player what to do, so after a couple of
@@ -169,9 +174,11 @@ class LoadingScene : Scene() {
             it.visible = false
             addChild(it)
         }
+        KnfBootLog.mark("LoadingScene.sceneInit end")
     }
 
     override suspend fun SContainer.sceneMain() {
+        KnfBootLog.mark("LoadingScene.sceneMain start")
         val startNanos = PerformanceCounter.nanoseconds
         fun now(): Double = (PerformanceCounter.nanoseconds - startNanos) / 1_000_000_000.0
 
@@ -183,12 +190,14 @@ class LoadingScene : Scene() {
             delay(300L)
         }
         missingAssetsText.visible = false
+        KnfBootLog.mark("LoadingScene assets found")
 
         // FNF opens on `NotStarted`; this frame is the initial "Loading 0/11".
         updateGraphics(0.0, 0.0)
         delay(16L)
 
         for (state in STEPS) {
+            KnfBootLog.mark("LoadingScene step ${state.name}")
             currentState = state
             runPreloadStep(state)
             val stepStart = now()
@@ -216,8 +225,10 @@ class LoadingScene : Scene() {
         }
 
         if (LoadingSceneTarget.toSong && SongRegistry.get(bootSongId()) != null) {
+            KnfBootLog.mark("LoadingScene -> PlayScene")
             launch { sceneContainer.changeTo<PlayScene>() }
         } else {
+            KnfBootLog.mark("LoadingScene -> TitleScene")
             launch { sceneContainer.changeTo<TitleScene>() }
         }
     }
