@@ -254,7 +254,7 @@ class TextureAtlas private constructor(
  * `CLAMP_TO_EDGE`, and the result stays inside the source rect (the FNF shader
  * never renders beyond its sprite quad).
  */
-private fun crossBlur(src: Bitmap32, amount: Double, brightness: Double): Bitmap32 {
+internal fun crossBlur(src: Bitmap32, amount: Double, brightness: Double = 1.0): Bitmap32 {
     val offsets = doubleArrayOf(
         2.823529411764706 * amount,
         6.588235294117647 * amount,

@@ -1,7 +1,6 @@
 package nightfunkin.ui
 
 import korlibs.image.bitmap.Bitmap32
-import korlibs.image.bitmap.effect.blur
 import korlibs.image.color.Colors
 import korlibs.image.color.RGBA
 import korlibs.image.font.TtfFont
@@ -66,10 +65,8 @@ internal class FreeplayCapsule(
      */
     private var songTextImage: Image? = null
     private var songGlowImage: Image? = null
-    private var songTightGlowImage: Image? = null
     private var songTextClip: ClipContainer? = null
     private var songGlowClip: ClipContainer? = null
-    private var songTightGlowClip: ClipContainer? = null
     private var clipWidth = 290.0
     private var tooLong = false
 
@@ -211,7 +208,9 @@ internal class FreeplayCapsule(
         val atlas = favHeartAtlas ?: return null
         val first = favFrames.firstOrNull() ?: return null
         return SparrowSprite(atlas, favFrames, fps = 24.0, loop = false).also {
-            it.setPixelArt(true)
+            // Like every other Freeplay sprite, the heart is antialiased by
+            // default (`FlxSprite.defaultAntialiasing = true`); it is scaled
+            // from 48x39 to 50x50, so it must not use nearest sampling.
             it.scaleX = FAV_ICON_SIZE / first.logicalWidth
             it.scaleY = FAV_ICON_SIZE / first.logicalHeight
             it.blendMode = BlendMode.ADD
@@ -224,31 +223,35 @@ internal class FreeplayCapsule(
         songGlowClip?.removeFromParent()
         songGlowClip = null
         songGlowImage = null
-        songTightGlowClip?.removeFromParent()
-        songTightGlowClip = null
-        songTightGlowImage = null
         songTextClip?.removeFromParent()
         songTextClip = null
         songTextImage = null
         val font = fiveBySeven ?: return
         val white = runCatching {
-            // Matches the `Text` view's layout: the bitmap's top-left is the
-            // text bounds' top-left, with the usual 1 px raster border.
+            // `CapsuleText.initText`: 5by7 at `Std.int(40 * realScaled)` = 32.
             font.renderTextToBitmap(32.0, value, paint = Colors.WHITE)
         }.getOrNull() ?: return
         val glowResult = runCatching {
             font.renderTextToBitmap(32.0, value, paint = CAPSULE_GLOW)
         }.getOrNull() ?: return
-        val textBmp = white.bmp.toBMP32IfRequired()
+        val textBmp = flxTextBitmap(white)
         // `CapsuleText` draws the same cyan title twice: a wide copy behind a
-        // `GaussianBlurShader(1)`, and the white text carrying a strong
-        // `GlowFilter(glowColor, 1, 5, 5, 210)`. Both are cyan ink, so the text
-        // is rasterized once and blurred at two radii: the wide copy is the
-        // selected-capsule backdrop, the tight one is the glow around the white
-        // glyphs (visible in both selection states).
-        val glowSource = glowResult.bmp.toBMP32IfRequired()
-        val wideGlowBmp = glowSource.blur(GLOW_WIDE_BLUR)
-        val tightGlowBmp = glowSource.blur(GLOW_TIGHT_BLUR)
+        // `GaussianBlurShader(1)` (selected capsules only), and the white text
+        // whose `GlowFilter(glowColor, 1, 5, 5, 210)` is baked into its graphic.
+        val glowSource = flxTextBitmap(glowResult)
+        val wideGlowBmp = shaderBlurredText(glowSource, GLOW_WIDE_AMOUNT)
+        val tightGlowBmp = glowFilter(
+            textBmp,
+            CAPSULE_GLOW,
+            blur = GLOW_FILTER_BLUR,
+            quality = GLOW_FILTER_QUALITY,
+            strength = GLOW_FILTER_STRENGTH,
+        )
+        // `FlxText`'s graphic is the glow *with the white glyphs baked on top*:
+        // the group alpha of `CapsuleText` then dims both together. Drawing
+        // them as two faded layers would let the cyan show through the glyphs
+        // and made unselected capsules glow noticeably more than FNF.
+        val titleBmp = bakeGlow(tightGlowBmp, textBmp)
 
         // The title bitmap is born under the capsule's CURRENT selection
         // state: `updateSelected` skips capsules whose state did not change,
@@ -260,16 +263,11 @@ internal class FreeplayCapsule(
         // `CapsuleText.new`: the blurred (glow) copies are added first, the white
         // copy above them. Every layer shares the same clipping window width,
         // so the marquee cuts the glow exactly where it cuts the white text.
-        addTextLayer(wideGlowBmp, GLOW_WIDE_BLUR, currentlySelected).also { (clip, img) ->
+        addTextLayer(wideGlowBmp, currentlySelected).also { (clip, img) ->
             songGlowClip = clip
             songGlowImage = img
         }
-        addTextLayer(tightGlowBmp, GLOW_TIGHT_BLUR, true).also { (clip, img) ->
-            songTightGlowClip = clip
-            songTightGlowImage = img
-            img.alpha = songTextAlpha
-        }
-        addTextLayer(textBmp, 0, true).also { (clip, img) ->
+        addTextLayer(titleBmp, true).also { (clip, img) ->
             songTextClip = clip
             songTextImage = img
             img.alpha = songTextAlpha
@@ -278,26 +276,19 @@ internal class FreeplayCapsule(
     }
 
     /**
-     * Adds one pre-rasterized text layer.
-     *
-     * Horizontally the window is always [clipWidth] wide and starts at the same
-     * column as the white text, so the marquee trims every layer identically —
-     * the old version gave the glow window a 2x blur margin on the right, which
-     * made the blur stop at a different column than the letters. Vertically the
-     * window is padded by [blur] so a blurred copy can breathe above and below
-     * the glyphs (`clip.y` is shifted by the same amount to keep the text
-     * baseline in place).
+     * Adds one pre-rasterized text layer inside the clipping window shared by
+     * every layer. Bitmaps come from [flxTextBitmap], so their origin already
+     * matches `FlxText`'s local `(0, 0)`.
      */
-    private fun addTextLayer(bmp: Bitmap32, blur: Int, visible: Boolean): Pair<ClipContainer, Image> {
+    private fun addTextLayer(bmp: Bitmap32, visible: Boolean): Pair<ClipContainer, Image> {
         val clip = clipContainer(Size(clipWidth, bmp.height.toDouble())).also {
             it.x = TEXT_X
-            it.y = TEXT_Y - blur
+            it.y = TEXT_Y
             it.visible = visible
             addChild(it)
         }
         val image = Image(bmp).also {
             it.smoothing = true
-            it.x = -blur.toDouble()
             clip.addChild(it)
         }
         return clip to image
@@ -550,14 +541,14 @@ internal class FreeplayCapsule(
             applyMarquee()
         }
         songTextAlpha = if (currentlySelected) 1.0 else 0.6
+        // The baked glow + white glyphs are one bitmap, so the group alpha dims
+        // them together exactly like `CapsuleText`.
         songTextImage?.alpha = songTextAlpha
-        songTightGlowImage?.alpha = songTextAlpha
         songGlowImage?.alpha = 1.0
         // Only the wide blurred copy follows the selection, like
         // `CapsuleText.updateSelected` toggling `blurredText.visible`.
         songGlowImage?.visible = currentlySelected
         songGlowClip?.visible = currentlySelected
-        songTightGlowClip?.visible = true
         val rankAlpha = if (currentlySelected) 1.0 else 0.7
         val rankTint = if (currentlySelected) Colors.WHITE else RGBA(0xAA, 0xAA, 0xAA)
         rankSprite?.alpha = rankAlpha
@@ -757,7 +748,10 @@ internal class FreeplayCapsule(
         // centre origin leaves a (1 - scale) / 2 inset on the left and top.
         val scale = (bitmap.width * 0.9).toInt().toDouble() / bitmap.width
         return Image(bitmap).also {
-            it.smoothing = false
+            // `InitState.hx` sets `FlxSprite.defaultAntialiasing = true`, so the
+            // labels are sampled bilinearly when scaled to 0.9; nearest
+            // sampling turned the glyphs into uneven, doubled-up stems.
+            it.smoothing = true
             it.x = x + bitmap.width * (1.0 - scale) / 2.0
             it.y = y + bitmap.height * (1.0 - scale) / 2.0
             it.scaleX = scale
@@ -784,7 +778,6 @@ internal class FreeplayCapsule(
         // the first glyph. Turning `clip` off keeps that halo intact.
         songTextClip?.also { it.width = clipWidth; it.clip = tooLong }
         songGlowClip?.also { it.width = clipWidth; it.clip = tooLong }
-        songTightGlowClip?.also { it.width = clipWidth; it.clip = tooLong }
         // `CapsuleText.resetText` + conditional `initMove` (applied by the
         // selection update below): drop the scroll back to the title start.
         marqueeOffset = 0.0
@@ -847,8 +840,7 @@ internal class FreeplayCapsule(
 
     private fun applyMarquee() {
         songTextImage?.x = -marqueeOffset
-        songGlowImage?.x = -GLOW_WIDE_BLUR - marqueeOffset
-        songTightGlowImage?.x = -GLOW_TIGHT_BLUR - marqueeOffset
+        songGlowImage?.x = -marqueeOffset
     }
 
     /**
@@ -882,7 +874,9 @@ internal class FreeplayCapsule(
         val scale = (zero.logicalWidth * 0.9).toInt().toDouble() / zero.logicalWidth
         return (0 until count).map { index ->
             val image = Image(atlas.slice(zero)).also {
-                it.smoothing = false
+                // Same `FlxSprite.defaultAntialiasing = true` as the labels:
+                // the 0.9 scale has to be filtered smoothly.
+                it.smoothing = true
                 it.x = x + index * step
                 it.y = y
                 it.scaleX = scale
@@ -949,19 +943,21 @@ internal class FreeplayCapsule(
         /** bf.json `capsuleTextColors` / `CapsuleText`'s glow filter. */
         val CAPSULE_GLOW = RGBA(0x00, 0xCC, 0xFF)
 
-        /**
-         * `GaussianBlurShader(1)` on the cyan copy. The shader's fixed taps land
-         * roughly at 2.8, 6.6 and 10.4 texels with falling weights, i.e. a
-         * Gaussian of about 4 px sigma; korlibs' `blur(r)` takes that sigma.
-         */
-        const val GLOW_WIDE_BLUR = 4
+        /** `blurredText.shader = new GaussianBlurShader(1)`. */
+        const val GLOW_WIDE_AMOUNT = 1.0
+
+        /** `GlowFilter(glowColor, 1, 5, 5, 210, BitmapFilterQuality.MEDIUM)`. */
+        const val GLOW_FILTER_BLUR = 5
+        const val GLOW_FILTER_QUALITY = 2
 
         /**
-         * `GlowFilter(glowColor, 1, 5, 5, 210)` around the white text. A Flash
-         * 5 px blur is roughly a 2.5 px sigma; the 210 strength saturates it,
-         * so 3 px keeps the halo fully opaque like the original.
+         * `GlowFilter.strength` is 210 in the original, but `FlxText` bakes its
+         * glow by drawing the `TextField` into a `BitmapData` on the Cairo
+         * renderer, which goes through `GlowFilter.__applyFilter` — and that
+         * path (Lime's `StackBlur`) never reads `strength`. The visible glow is
+         * therefore the plain blurred alpha.
          */
-        const val GLOW_TIGHT_BLUR = 3
+        const val GLOW_FILTER_STRENGTH = 1.0
 
         /**
          * Extra gain on the blurred rank badge. The FNF shader keeps only ~20%
