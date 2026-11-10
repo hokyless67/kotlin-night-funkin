@@ -1,5 +1,6 @@
 package nightfunkin.ui
 
+import korlibs.image.bitmap.Bitmap32
 import korlibs.image.bitmap.effect.blur
 import korlibs.image.color.Colors
 import korlibs.image.color.RGBA
@@ -65,8 +66,10 @@ internal class FreeplayCapsule(
      */
     private var songTextImage: Image? = null
     private var songGlowImage: Image? = null
+    private var songTightGlowImage: Image? = null
     private var songTextClip: ClipContainer? = null
     private var songGlowClip: ClipContainer? = null
+    private var songTightGlowClip: ClipContainer? = null
     private var clipWidth = 290.0
     private var tooLong = false
 
@@ -111,32 +114,51 @@ internal class FreeplayCapsule(
         step = 30.0,
     )
 
+    /** `SongMenuItem.blurredRanking`: the badge under the same blur shader. */
+    private val rankAtlasBlurred: TextureAtlas? =
+        rankAtlas?.shaderBlurred(brightness = RANK_BLUR_BRIGHTNESS)
+
     private val rankFrames: Map<String, List<TextureAtlas.AtlasFrame>> =
-        rankAtlas?.let { rankAtlas ->
-            mapOf(
-                "perfectGold" to rankAtlas.framesByPrefix("PERFECT rank GOLD"),
-                "perfect" to rankAtlas.framesByPrefix("PERFECT rank0"),
-                "excellent" to rankAtlas.framesByPrefix("EXCELLENT rank0"),
-                "great" to rankAtlas.framesByPrefix("GREAT rank0"),
-                "good" to rankAtlas.framesByPrefix("GOOD rank0"),
-                "loss" to rankAtlas.framesByPrefix("LOSS rank0"),
-            ).filterValues { it.isNotEmpty() }
-        }.orEmpty()
+        rankAtlas?.let(::collectRankFrames).orEmpty()
+
+    private val rankFramesBlurred: Map<String, List<TextureAtlas.AtlasFrame>> =
+        rankAtlasBlurred?.let(::collectRankFrames).orEmpty()
 
     private val rankSprite: SparrowSprite? =
-        rankFrames.values.firstOrNull()?.let { first ->
-            SparrowSprite(rankAtlas!!, first, fps = 24.0, loop = false).also {
-                it.setPixelArt(true)
-                it.x = 420.0
-                it.y = 41.0
-                it.scaleX = 0.9
-                it.scaleY = 0.9
-                // `FreeplayRank` uses additive blending so the badge glows.
-                it.blendMode = BlendMode.ADD
-                it.visible = false
-                addChild(it)
-            }
+        rankFrames.values.firstOrNull()?.let { first -> makeRankSprite(rankAtlas!!, first) }
+
+    private val rankBlurredSprite: SparrowSprite? =
+        rankFramesBlurred.values.firstOrNull()?.let { first ->
+            makeRankSprite(rankAtlasBlurred!!, first)
         }
+
+    private fun collectRankFrames(atlas: TextureAtlas): Map<String, List<TextureAtlas.AtlasFrame>> =
+        mapOf(
+            "perfectGold" to atlas.framesByPrefix("PERFECT rank GOLD"),
+            "perfect" to atlas.framesByPrefix("PERFECT rank0"),
+            "excellent" to atlas.framesByPrefix("EXCELLENT rank0"),
+            "great" to atlas.framesByPrefix("GREAT rank0"),
+            "good" to atlas.framesByPrefix("GOOD rank0"),
+            "loss" to atlas.framesByPrefix("LOSS rank0"),
+        ).filterValues { it.isNotEmpty() }
+
+    private fun makeRankSprite(
+        atlas: TextureAtlas,
+        frames: List<TextureAtlas.AtlasFrame>,
+    ): SparrowSprite = SparrowSprite(atlas, frames, fps = 24.0, loop = false).also {
+        // `InitState.hx` sets `FlxSprite.defaultAntialiasing = true`, and
+        // `FreeplayRank` never overrides it. Drawing these at 0.9 with nearest
+        // sampling turned the blurred copy into a hard, aliased halo — it has
+        // to stay smooth like the original.
+        it.x = 420.0
+        it.y = 41.0
+        it.scaleX = 0.9
+        it.scaleY = 0.9
+        // `FreeplayRank` uses additive blending so the badge glows.
+        it.blendMode = BlendMode.ADD
+        it.visible = false
+        addChild(it)
+    }
 
     private var currentlySelected = false
     private var appliedSelected: Boolean? = null
@@ -202,6 +224,9 @@ internal class FreeplayCapsule(
         songGlowClip?.removeFromParent()
         songGlowClip = null
         songGlowImage = null
+        songTightGlowClip?.removeFromParent()
+        songTightGlowClip = null
+        songTightGlowImage = null
         songTextClip?.removeFromParent()
         songTextClip = null
         songTextImage = null
@@ -215,43 +240,67 @@ internal class FreeplayCapsule(
             font.renderTextToBitmap(32.0, value, paint = CAPSULE_GLOW)
         }.getOrNull() ?: return
         val textBmp = white.bmp.toBMP32IfRequired()
-        val glowBmp = glowResult.bmp.toBMP32IfRequired().blur(GLOW_BLUR)
+        // `CapsuleText` draws the same cyan title twice: a wide copy behind a
+        // `GaussianBlurShader(1)`, and the white text carrying a strong
+        // `GlowFilter(glowColor, 1, 5, 5, 210)`. Both are cyan ink, so the text
+        // is rasterized once and blurred at two radii: the wide copy is the
+        // selected-capsule backdrop, the tight one is the glow around the white
+        // glyphs (visible in both selection states).
+        val glowSource = glowResult.bmp.toBMP32IfRequired()
+        val wideGlowBmp = glowSource.blur(GLOW_WIDE_BLUR)
+        val tightGlowBmp = glowSource.blur(GLOW_TIGHT_BLUR)
 
         // The title bitmap is born under the capsule's CURRENT selection
         // state: `updateSelected` skips capsules whose state did not change,
         // so a freshly rendered title must carry the right dimming itself.
-        // The alpha lives ONLY on the bitmap image — the clipping container
+        // The alpha lives ONLY on the bitmap images — the clipping container
         // stays at 1.0, otherwise the dimming would apply twice.
         songTextAlpha = if (currentlySelected) 1.0 else 0.6
 
-        // `CapsuleText.new`: the blurred (glow) copy is added first, the white
-        // copy above it. Each lives in its own clipping window so long titles
-        // can scroll inside `clipWidth` without spilling over the capsule.
-        songGlowClip = clipContainer(Size(clipWidth + GLOW_BLUR * 2.0, glowBmp.height)).also { clip ->
-            clip.x = 159.12
-            clip.y = 45.0
-            clip.visible = currentlySelected
-            songGlowImage = Image(glowBmp).also { img ->
-                img.smoothing = true
-                // The glow bitmap carries a GLOW_BLUR-wide margin around the
-                // text, so the text pixels line up shifted by -GLOW_BLUR.
-                img.x = -GLOW_BLUR.toDouble()
-                img.y = -GLOW_BLUR.toDouble()
-                clip.addChild(img)
-            }
-            addChild(clip)
+        // `CapsuleText.new`: the blurred (glow) copies are added first, the white
+        // copy above them. Every layer shares the same clipping window width,
+        // so the marquee cuts the glow exactly where it cuts the white text.
+        addTextLayer(wideGlowBmp, GLOW_WIDE_BLUR, currentlySelected).also { (clip, img) ->
+            songGlowClip = clip
+            songGlowImage = img
         }
-        songTextClip = clipContainer(Size(clipWidth, textBmp.height)).also { clip ->
-            clip.x = 159.12
-            clip.y = 45.0
-            songTextImage = Image(textBmp).also { img ->
-                img.smoothing = true
-                img.alpha = songTextAlpha
-                clip.addChild(img)
-            }
-            addChild(clip)
+        addTextLayer(tightGlowBmp, GLOW_TIGHT_BLUR, true).also { (clip, img) ->
+            songTightGlowClip = clip
+            songTightGlowImage = img
+            img.alpha = songTextAlpha
+        }
+        addTextLayer(textBmp, 0, true).also { (clip, img) ->
+            songTextClip = clip
+            songTextImage = img
+            img.alpha = songTextAlpha
         }
         checkClip()
+    }
+
+    /**
+     * Adds one pre-rasterized text layer.
+     *
+     * Horizontally the window is always [clipWidth] wide and starts at the same
+     * column as the white text, so the marquee trims every layer identically —
+     * the old version gave the glow window a 2x blur margin on the right, which
+     * made the blur stop at a different column than the letters. Vertically the
+     * window is padded by [blur] so a blurred copy can breathe above and below
+     * the glyphs (`clip.y` is shifted by the same amount to keep the text
+     * baseline in place).
+     */
+    private fun addTextLayer(bmp: Bitmap32, blur: Int, visible: Boolean): Pair<ClipContainer, Image> {
+        val clip = clipContainer(Size(clipWidth, bmp.height.toDouble())).also {
+            it.x = TEXT_X
+            it.y = TEXT_Y - blur
+            it.visible = visible
+            addChild(it)
+        }
+        val image = Image(bmp).also {
+            it.smoothing = true
+            it.x = -blur.toDouble()
+            clip.addChild(it)
+        }
+        return clip to image
     }
 
     /** Positions this capsule relative to the currently selected one. */
@@ -394,6 +443,7 @@ internal class FreeplayCapsule(
     fun update(dt: Double) {
         capsuleSprite?.update(dt)
         rankSprite?.update(dt)
+        rankBlurredSprite?.update(dt)
         pixelIconSprite?.update(dt)
         favIcon?.update(dt)
         favIconBlurred?.update(dt)
@@ -501,12 +551,22 @@ internal class FreeplayCapsule(
         }
         songTextAlpha = if (currentlySelected) 1.0 else 0.6
         songTextImage?.alpha = songTextAlpha
+        songTightGlowImage?.alpha = songTextAlpha
+        songGlowImage?.alpha = 1.0
+        // Only the wide blurred copy follows the selection, like
+        // `CapsuleText.updateSelected` toggling `blurredText.visible`.
         songGlowImage?.visible = currentlySelected
-        // The glow lives inside its own clipping window; a window created
-        // while the capsule was unselected stays invisible unless toggled.
         songGlowClip?.visible = currentlySelected
-        rankSprite?.alpha = if (currentlySelected) 1.0 else 0.7
-        rankSprite?.tint = if (currentlySelected) Colors.WHITE else RGBA(0xAA, 0xAA, 0xAA)
+        songTightGlowClip?.visible = true
+        val rankAlpha = if (currentlySelected) 1.0 else 0.7
+        val rankTint = if (currentlySelected) Colors.WHITE else RGBA(0xAA, 0xAA, 0xAA)
+        rankSprite?.alpha = rankAlpha
+        rankSprite?.tint = rankTint
+        // `blurredRanking` is a second copy of the same badge, so it has to dim
+        // with the sharp one; otherwise an unselected capsule still glows as
+        // brightly as the selected one.
+        rankBlurredSprite?.alpha = rankAlpha
+        rankBlurredSprite?.tint = rankTint
         favIcon?.alpha = if (currentlySelected) 1.0 else 0.6
         favIconBlurred?.alpha = if (currentlySelected) 1.0 else 0.0
     }
@@ -672,16 +732,22 @@ internal class FreeplayCapsule(
         val key = "${song.id}:$difficulty:$variation"
         val rank = Save.songRating(key)
         val frames = rank?.let { rankFrames[it] }
+        val blurredFrames = rank?.let { rankFramesBlurred[it] }
         if (rank == null || frames.isNullOrEmpty()) {
             sprite.visible = false
+            rankBlurredSprite?.visible = false
             appliedRankKey = null
             return
         }
 
         sprite.visible = true
+        rankBlurredSprite?.visible = !blurredFrames.isNullOrEmpty()
         if (appliedRankKey != rank) {
             appliedRankKey = rank
             sprite.play(frames, restart = true)
+            if (!blurredFrames.isNullOrEmpty()) {
+                rankBlurredSprite?.play(blurredFrames, restart = true)
+            }
         }
     }
 
@@ -712,9 +778,13 @@ internal class FreeplayCapsule(
         if (clipType == 2) clipSize = 210.0
         if (clipType == 1) clipSize = 245.0
         clipWidth = clipSize
-        songTextClip?.width = clipWidth
-        songGlowClip?.width = clipWidth + GLOW_BLUR * 2.0
         tooLong = (songTextImage?.bitmap?.width ?: 0) > clipWidth
+        // `CapsuleText.checkClipWidth` only sets `clipRect` for titles that do
+        // not fit; a short title draws its full glow, including the halo left of
+        // the first glyph. Turning `clip` off keeps that halo intact.
+        songTextClip?.also { it.width = clipWidth; it.clip = tooLong }
+        songGlowClip?.also { it.width = clipWidth; it.clip = tooLong }
+        songTightGlowClip?.also { it.width = clipWidth; it.clip = tooLong }
         // `CapsuleText.resetText` + conditional `initMove` (applied by the
         // selection update below): drop the scroll back to the title start.
         marqueeOffset = 0.0
@@ -777,7 +847,8 @@ internal class FreeplayCapsule(
 
     private fun applyMarquee() {
         songTextImage?.x = -marqueeOffset
-        songGlowImage?.x = -GLOW_BLUR - marqueeOffset
+        songGlowImage?.x = -GLOW_WIDE_BLUR - marqueeOffset
+        songTightGlowImage?.x = -GLOW_TIGHT_BLUR - marqueeOffset
     }
 
     /**
@@ -863,6 +934,10 @@ internal class FreeplayCapsule(
         const val FAV_ICON_X_WITH_RANK = 370.0
         const val FAV_ICON_Y = 40.0
 
+        /** `CapsuleText`'s group position: `capsule.width * 0.26`, y 45. */
+        const val TEXT_X = 159.12
+        const val TEXT_Y = 45.0
+
         /** `FlxTween` duration of each half of the favourite wiggle. */
         const val BOUNCE_HALF = 0.1
 
@@ -874,8 +949,27 @@ internal class FreeplayCapsule(
         /** bf.json `capsuleTextColors` / `CapsuleText`'s glow filter. */
         val CAPSULE_GLOW = RGBA(0x00, 0xCC, 0xFF)
 
-        /** `GaussianBlurShader(1)` + 5x5 GlowFilter: a small cyan halo. */
-        const val GLOW_BLUR = 3
+        /**
+         * `GaussianBlurShader(1)` on the cyan copy. The shader's fixed taps land
+         * roughly at 2.8, 6.6 and 10.4 texels with falling weights, i.e. a
+         * Gaussian of about 4 px sigma; korlibs' `blur(r)` takes that sigma.
+         */
+        const val GLOW_WIDE_BLUR = 4
+
+        /**
+         * `GlowFilter(glowColor, 1, 5, 5, 210)` around the white text. A Flash
+         * 5 px blur is roughly a 2.5 px sigma; the 210 strength saturates it,
+         * so 3 px keeps the halo fully opaque like the original.
+         */
+        const val GLOW_TIGHT_BLUR = 3
+
+        /**
+         * Extra gain on the blurred rank badge. The FNF shader keeps only ~20%
+         * of the source in the centre, which reads as a faint outline on a
+         * small 40x50 badge; the ADD copy needs a bit of a push to look like
+         * the neon glow in the original.
+         */
+        const val RANK_BLUR_BRIGHTNESS = 1.0
 
         val capsuleAtlas: TextureAtlas? by lazy {
             TextureAtlas.tryLoad(
