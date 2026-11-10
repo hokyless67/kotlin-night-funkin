@@ -1,10 +1,10 @@
 package nightfunkin.core
 
 import korlibs.image.bitmap.Bitmap
+import korlibs.image.bitmap.BitmapCoords
 import korlibs.image.bitmap.sliceWithSize
 import korlibs.korge.view.Container
 import korlibs.korge.view.Image
-import korlibs.korge.view.image
 import korlibs.math.geom.Anchor2D
 
 /**
@@ -97,6 +97,12 @@ class BitmapText(
 
     private var current = ""
 
+    /** Cached slice per glyph code; `sliceWithSize` would allocate one per rebuild. */
+    private val glyphSlices = HashMap<Int, BitmapCoords>()
+    /** Glyph views are pooled so a score change does not rebuild the whole run. */
+    private val outlineViews = ArrayList<Image>()
+    private val textViews = ArrayList<Image>()
+
     init {
         addChild(outlineLayer)
         addChild(textLayer)
@@ -122,32 +128,48 @@ class BitmapText(
         }
 
     private fun rebuild() {
-        outlineLayer.removeChildren()
-        textLayer.removeChildren()
+        var outlineIndex = 0
+        var textIndex = 0
 
         var pen = 0
         for (ch in current) {
             val glyph = font.glyphs[ch.code] ?: continue
             if (glyph.width > 0 && glyph.height > 0) {
-                val slice = page.sliceWithSize(glyph.x, glyph.y, glyph.width, glyph.height)
+                val slice = glyphSlices.getOrPut(ch.code) {
+                    page.sliceWithSize(glyph.x, glyph.y, glyph.width, glyph.height)
+                }
                 if (outline) {
                     for ((dx, dy) in OUTLINE_OFFSETS) {
-                        outlineLayer.image(slice).also {
+                        val img = outlineViews.getOrNull(outlineIndex) ?: Image(slice).also {
                             it.anchor = Anchor2D.TOP_LEFT
-                            it.x = (pen + glyph.xOffset + dx).toDouble()
-                            it.y = (glyph.yOffset + dy).toDouble()
                             it.tint = korlibs.image.color.Colors.BLACK
+                            outlineLayer.addChild(it)
+                            outlineViews.add(it)
                         }
+                        img.bitmap = slice
+                        img.x = (pen + glyph.xOffset + dx).toDouble()
+                        img.y = (glyph.yOffset + dy).toDouble()
+                        img.visible = true
+                        outlineIndex++
                     }
                 }
-                textLayer.image(slice).also {
+                val img = textViews.getOrNull(textIndex) ?: Image(slice).also {
                     it.anchor = Anchor2D.TOP_LEFT
-                    it.x = (pen + glyph.xOffset).toDouble()
-                    it.y = glyph.yOffset.toDouble()
+                    textLayer.addChild(it)
+                    textViews.add(it)
                 }
+                img.bitmap = slice
+                img.x = (pen + glyph.xOffset).toDouble()
+                img.y = glyph.yOffset.toDouble()
+                img.visible = true
+                textIndex++
             }
             pen += glyph.xAdvance + letterSpacing
         }
+
+        // Hide the slots left over from a longer previous string.
+        for (i in outlineIndex until outlineViews.size) outlineViews[i].visible = false
+        for (i in textIndex until textViews.size) textViews[i].visible = false
     }
 
     companion object {

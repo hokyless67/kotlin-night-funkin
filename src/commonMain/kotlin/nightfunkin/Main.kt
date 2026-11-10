@@ -9,10 +9,8 @@ import korlibs.korge.view.addUpdater
 import korlibs.korge.view.solidRect
 import korlibs.korge.view.text
 import korlibs.math.geom.Size
-import korlibs.time.seconds
 import kotlinx.coroutines.CancellationException
-import kotlin.math.pow
-import kotlin.math.tanh
+import kotlin.math.roundToInt
 import nightfunkin.core.Constants
 import nightfunkin.core.Knf
 import nightfunkin.core.KnfBootLog
@@ -97,9 +95,7 @@ suspend fun main() {
                 }
                 KnfBootLog.mark("scene change returned")
 
-                if (KnfEnv["KNF_WINDOW_BOP"] == "1") {
-                    stage.addUpdater { dt -> WindowBop.update(views, dt.seconds) }
-                }
+                WindowBop.enabled = KnfEnv["KNF_WINDOW_BOP"] == "1"
             } catch (t: Throwable) {
                 if (t is CancellationException) throw t
                 KnfBootLog.error(t)
@@ -125,45 +121,45 @@ suspend fun main() {
     KnfBootLog.mark("main() finished")
 }
 
+/**
+ * Desktop window "bop".
+ *
+ * FNF bumps `camHUD.zoom` on every bop step and decays it with
+ * `pow(0.95, elapsed * 60)`. The OS window is resized from that same value, so
+ * the window and the HUD breathe together: same beat gate, same curve, same
+ * amplitude.
+ *
+ * The previous version kept its own clock and stretched one beat over ten beat
+ * lengths (`SPEED = 0.1`), which is why the window pulse visibly lagged behind
+ * the HUD pulse.
+ */
 object WindowBop {
-    private const val BOP_MULTIPLY = 50.0
-    private const val INTENSITY_MULTIPLY = 1000.0
-    private const val DECAY_POWER = 5.0
-    private const val SPEED = 0.1
+    /** Set once from `KNF_WINDOW_BOP=1`; window resizing is desktop-only. */
+    var enabled: Boolean = false
 
-    var intensity = 0.0
-    private var elapsed = 0.0
-    private var duration = 0.0
-    private var active = false
+    private var lastWidth = Constants.GAME_WIDTH
+    private var lastHeight = Constants.GAME_HEIGHT
 
-    private fun bopAmount(intensity: Double): Double =
-        BOP_MULTIPLY * tanh(intensity * INTENSITY_MULTIPLY)
-
-    fun start(stepLengthMs: Double) {
-        duration = stepLengthMs / 1000.0
-        elapsed = 0.0
-        active = duration > 0.0
-        // println("KNF: beat, intensity = $intensity, \n bop = ${bopAmount(intensity)}")
-    }
-
-    fun update(views: Views, dtSeconds: Double) {
-        if (!active) return
-        elapsed += dtSeconds * SPEED
-        val t = (elapsed / duration).coerceIn(0.0, 1.0)
-
-        val k = (1.0 - t).pow(DECAY_POWER)
-        val extra = bopAmount(intensity) * k
-
-        val w = Constants.GAME_WIDTH + extra.toInt()
-        val h = Constants.GAME_HEIGHT + (extra * Constants.GAME_HEIGHT / Constants.GAME_WIDTH).toInt()
+    /** Mirrors the HUD camera zoom into the OS window size. */
+    fun apply(views: Views?, hudZoom: Double) {
+        if (!enabled || views == null) return
+        val w = (Constants.GAME_WIDTH * hudZoom).roundToInt()
+        val h = (Constants.GAME_HEIGHT * hudZoom).roundToInt()
+        if (w == lastWidth && h == lastHeight) return
+        lastWidth = w
+        lastHeight = h
         // Resizing the OS window is a desktop concept; mobile backends may not
         // support it, so never let the bop crash the frame.
         runCatching { views.gameWindow.setSize(w, h) }
+    }
 
-        if (t >= 1.0) {
-            active = false
-            intensity = 0.0
-            runCatching { views.gameWindow.setSize(Constants.GAME_WIDTH, Constants.GAME_HEIGHT) }
+    /** Restores the base size when the song scene goes away. */
+    fun reset(views: Views?) {
+        if (!enabled) return
+        lastWidth = Constants.GAME_WIDTH
+        lastHeight = Constants.GAME_HEIGHT
+        if (views != null) {
+            runCatching { views.gameWindow.setSize(lastWidth, lastHeight) }
         }
     }
 }

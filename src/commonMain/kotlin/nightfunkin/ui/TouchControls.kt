@@ -17,11 +17,11 @@ import kotlin.math.abs
  * On-screen touch controls, added by the scenes on top of everything else.
  *
  * Two modes:
- *  - **Gameplay** (`menuMode == false`): four thumb zones across the bottom
- *    part of the screen, one per note lane, full multi-touch, plus a pause
- *    button in the top-right corner. Presses feed [KnfTouch.lanes], which
- *    [nightfunkin.core.KnfInput] merges with the keyboard — receptors, hit
- *    logic and holds work unchanged.
+ *  - **Gameplay** (`menuMode == false`): four thumb zones at the bottom, split
+ *    into a pair under each thumb (lanes left/down on the left, up/right on the
+ *    right), full multi-touch, plus a pause button in the top-right corner.
+ *    Presses feed [KnfTouch.lanes], which [nightfunkin.core.KnfInput] merges
+ *    with the keyboard — receptors, hit logic and holds work unchanged.
  *  - **Menu** (`menuMode == true`): invisible full-screen gestures — tap =
  *    CONFIRM, vertical drag = UI up/down, horizontal drag = left/right (song
  *    difficulty in Freeplay), two-finger tap = BACK.
@@ -228,11 +228,22 @@ class TouchControls : Container() {
     // hit testing
     // ------------------------------------------------------------------
 
-    /** Lane for a gameplay zone press, -1 outside the zones. */
+    /**
+     * Lane for a gameplay zone press, -1 outside the zones.
+     *
+     * The zones sit in two pairs under the thumbs — left/down on the left edge,
+     * up/right on the right edge — so the middle of the screen stays free.
+     */
     private fun laneAt(x: Double, y: Double): Int {
         if (y < Constants.GAME_HEIGHT * ZONE_TOP_FRACTION) return -1
-        val column = (x / (Constants.GAME_WIDTH / 4.0)).toInt().coerceIn(0, 3)
-        return column
+        val zoneWidth = Constants.GAME_WIDTH * ZONE_WIDTH_FRACTION
+        val pairSpan = zoneWidth * 2.0
+        val rightStart = Constants.GAME_WIDTH - pairSpan
+        return when {
+            x < pairSpan -> (x / zoneWidth).toInt().coerceIn(0, 1)
+            x >= rightStart -> 2 + ((x - rightStart) / zoneWidth).toInt().coerceIn(0, 1)
+            else -> -1
+        }
     }
 
     private fun hitPauseButton(x: Double, y: Double): Boolean =
@@ -244,16 +255,19 @@ class TouchControls : Container() {
 
     private fun buildZones() {
         val height = Constants.GAME_HEIGHT * (1.0 - ZONE_TOP_FRACTION)
-        val width = Constants.GAME_WIDTH / 4.0
+        val width = Constants.GAME_WIDTH * ZONE_WIDTH_FRACTION
+        val rightStart = Constants.GAME_WIDTH - width * 2.0
+        val lefts = listOf(0.0, width, rightStart, rightStart + width)
+        val top = Constants.GAME_HEIGHT * ZONE_TOP_FRACTION
         zones = Container().also { zoneLayer ->
             for (lane in 0 until 4) {
                 zoneLayer.roundRect(
-                    Size(width - 12.0, height - 12.0),
+                    Size(width - ZONE_GAP, height - ZONE_GAP),
                     RectCorners(14.0, 14.0, 14.0, 14.0),
                     fill = Colors.WHITE,
                 ).also {
-                    it.x = lane * width + 6.0
-                    it.y = Constants.GAME_HEIGHT * ZONE_TOP_FRACTION + 6.0
+                    it.x = lefts[lane] + ZONE_GAP / 2.0
+                    it.y = top + ZONE_GAP / 2.0
                     it.alpha = 0.10
                 }
             }
@@ -299,6 +313,15 @@ class TouchControls : Container() {
 
         /** Gameplay zones cover the bottom part of the screen. */
         const val ZONE_TOP_FRACTION = 0.55
+
+        /**
+         * Width of one zone as a fraction of the stage width. Zones come in two
+         * pairs hugging the screen edges, so the middle stays clear.
+         */
+        const val ZONE_WIDTH_FRACTION = 0.20
+
+        /** Inset between neighbouring zone rects, in stage pixels. */
+        const val ZONE_GAP = 12.0
 
         /** A tap must stay within this distance of its start. */
         const val TAP_SLOP_PX = 12.0

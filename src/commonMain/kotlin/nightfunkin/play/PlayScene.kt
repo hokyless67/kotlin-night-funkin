@@ -2,6 +2,7 @@ package nightfunkin.play
 
 import korlibs.image.color.Colors
 import korlibs.image.bitmap.sliceWithSize
+import korlibs.korge.render.RenderContext
 import korlibs.korge.scene.Scene
 import korlibs.korge.view.Container
 import korlibs.korge.view.SContainer
@@ -469,6 +470,9 @@ class PlayScene : Scene() {
         // freeze the GL thread for half a second while the splash sheet
         // decoded on a mobile CPU.
         withContext(Dispatchers.Default) { noteStyle.warmup() }
+        // After `warmup` so the keeper never triggers a lazy atlas decode on
+        // the render thread. Keeps the textures on the GPU for the whole song.
+        addChild(NoteStyleTextureKeeper(noteStyle))
 
         // ---- audio -------------------------------------------------------
         val instPath = song.instrumentalPath(PlayRequest.variation)
@@ -530,7 +534,6 @@ class PlayScene : Scene() {
             // (`bopEvery = Constants.STEPS_PER_BEAT`), not on the hits.
             if (step % Constants.STEPS_PER_BEAT == 0) {
                 hud.bopIcons(conductor.stepLengthMs.toDouble())
-                WindowBop.start(conductor.stepLengthMs.toDouble())
             }
             // `danceEvery` counts beats and defaults to one, so everyone re-poses
             // on every quarter note.
@@ -636,6 +639,7 @@ class PlayScene : Scene() {
     }
 
     override suspend fun sceneDestroy() {
+        WindowBop.reset(views)
         cutscene?.destroy()
         cutscene = null
         blackScreen?.removeFromParent()
@@ -1078,6 +1082,9 @@ class PlayScene : Scene() {
         hudContainer.scaleY = hudZoom
         hudContainer.x = Constants.GAME_WIDTH / 2.0 * (1.0 - hudZoom)
         hudContainer.y = Constants.GAME_HEIGHT / 2.0 * (1.0 - hudZoom)
+        // The OS window bops on the very same value the HUD is scaled with, so
+        // both pulses have the same timing and shape (see `WindowBop`).
+        WindowBop.apply(views, hudZoom)
         for (layer in characterLayers) {
             layer.container.x = (1.0 - layer.scrollX) * camera.scrollX
             layer.container.y = (1.0 - layer.scrollY) * camera.scrollY
@@ -2520,4 +2527,23 @@ class PlayScene : Scene() {
 
     /** Picks the playable audio file for an extension-less stem. */
     private fun resolveSfx(stem: String): String = KnfFiles.resolveSound(stem) ?: "$stem.mp3"
+}
+
+/**
+ * Invisible view whose only job is to re-reference the note-style textures
+ * every frame.
+ *
+ * KorGE's `AgBitmapTextureManager` drops a texture that has not been drawn for
+ * 60 frames. The 2048x2048 note-splash atlas only appears while a splash lives,
+ * so it was evicted between Sick streaks and re-uploaded (16 MB) on the next
+ * Sick, freezing the GL thread for ~100 ms on mobile. Touching the textures in
+ * a render pass keeps them in the manager's referenced set.
+ */
+private class NoteStyleTextureKeeper(
+    private val noteStyle: NoteStyle,
+) : Container() {
+    override fun renderInternal(ctx: RenderContext) {
+        noteStyle.touchTextures(ctx)
+        super.renderInternal(ctx)
+    }
 }

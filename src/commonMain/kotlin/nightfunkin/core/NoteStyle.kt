@@ -10,6 +10,7 @@ import korlibs.image.bitmap.Bitmap
 import korlibs.image.bitmap.Bitmap32
 import korlibs.image.bitmap.sliceWithSize
 import korlibs.image.color.RGBA
+import korlibs.korge.render.RenderContext
 
 @Serializable
 private data class PrefixRef(val prefix: String = "")
@@ -74,6 +75,8 @@ class NoteStyle(val id: String) {
     private val bitmaps = HashMap<String, Bitmap>()
     private val sustainCache = HashMap<Int, Pair<AtlasSlice, AtlasSlice>>()
     private val colorFallbackCache = HashMap<Int, AtlasSlice>()
+    private val judgementCache = HashMap<String, JudgementAsset>()
+    private val splashVariantCache = HashMap<Int, List<List<TrimmedFrame>>>()
 
     private val arrowKeys = listOf("left", "down", "up", "right")
 
@@ -91,23 +94,48 @@ class NoteStyle(val id: String) {
     }
 
     /**
-     * Decodes every asset this style and its fallback chain can supply ahead
-     * of time. Called once before gameplay starts: lazily decoding the splash
-     * sheet on the first Sick hit froze the GL thread for half a second on
-     * mobile.
+     * Decodes every asset this style can supply ahead of time. Called once
+     * before gameplay starts: lazily decoding the splash sheet on the first
+     * Sick hit froze the GL thread for half a second on mobile.
      */
     fun warmup() {
-        var style: NoteStyle? = active
-        while (style != null) {
-            for (asset in style.data.assets.values) {
-                if (asset.assetPath.isEmpty()) continue
-                style.atlasFor(asset.assetPath)
-                style.bitmapFor(asset.assetPath)
-            }
-            for (direction in 0 until Constants.KEY_COUNT) style.splashVariants(direction)
-            style.holdNoteSheet()
-            style = style.declaredFallback
+        val style = active
+        for (asset in style.data.assets.values) {
+            if (asset.assetPath.isEmpty()) continue
+            // Assets with an XML atlas are drawn from the atlas bitmap. Decoding
+            // the same PNG a second time through [bitmapFor] would just waste
+            // RAM: the funkin splash sheet alone is 2048x2048 (16 MB).
+            if (style.atlasFor(asset.assetPath) == null) style.bitmapFor(asset.assetPath)
         }
+        for (direction in 0 until Constants.KEY_COUNT) {
+            style.splashVariants(direction)
+            // Hold covers keep their atlas path inside `data` rather than in
+            // `assetPath`, so the loop above misses them. Load + slice them here
+            // too: the first hold note must not decode a sheet mid-song.
+            style.sustainSlices(direction)
+            style.holdCover(direction)
+        }
+        style.holdNoteSheet()
+    }
+
+    /**
+     * Re-references every texture this style renders, keeping it resident in
+     * KorGE's GPU texture cache.
+     *
+     * `AgBitmapTextureManager` evicts any bitmap that was not drawn for
+     * `framesBetweenGC` frames (60). The 2048x2048 splash atlas is only drawn
+     * while a splash lives (~0.3 s), so after a short gap it was dropped from
+     * the GPU and the next Sick had to upload 16 MB again - a ~100 ms freeze on
+     * mobile. The manager's docs recommend exactly this: touch the textures
+     * every frame.
+     */
+    fun touchTextures(ctx: RenderContext) {
+        // Only the atlases: they are the big textures (the splash sheet alone is
+        // 2048x2048). The small standalone PNGs sit in `bitmaps`, which
+        // `judgementAsset` may still populate from the update thread, so walking
+        // it here could race with a HashMap resize.
+        val style = active
+        for (atlas in style.atlases.values) ctx.getTex(atlas.bitmap)
     }
 
     // ======================================================================
@@ -278,6 +306,7 @@ class NoteStyle(val id: String) {
      * frame instead leaves a big bright arrow parked on the lane.
      */
     fun splashVariants(direction: Int): List<List<TrimmedFrame>> {
+        splashVariantCache[direction]?.let { return it }
         val asset = active.data.assets["noteSplash"] ?: return emptyList()
         val atlas = atlasFor(asset.assetPath) ?: return emptyList()
         val key = when (direction) {
@@ -287,11 +316,13 @@ class NoteStyle(val id: String) {
             else -> "rightSplashes"
         }
         val arr = asset.data?.get(key) as? JsonArray ?: return emptyList()
-        return arr.mapNotNull { entry ->
+        val variants = arr.mapNotNull { entry ->
             val prefix = ((entry as? JsonObject)?.get("prefix") as? JsonPrimitive)?.content
                 ?: return@mapNotNull null
             atlas.framesByPrefix(prefix).map { TrimmedFrame(atlas.slice(it), it.frameX, it.frameY, it.frameWidth, it.frameHeight) }
         }.filter { it.isNotEmpty() }
+        splashVariantCache[direction] = variants
+        return variants
     }
 
     fun splashSlices(direction: Int): List<AtlasSlice> {
@@ -397,6 +428,7 @@ class NoteStyle(val id: String) {
     )
 
     private fun judgementAsset(name: String): JudgementAsset? {
+        judgementCache[name]?.let { return it }
         val style = active
         val asset = style.data.assets[name] ?: return null
         val bmp = style.bitmapFor(asset.assetPath) ?: return null
@@ -405,7 +437,7 @@ class NoteStyle(val id: String) {
             scale = asset.scale,
             isPixel = asset.isPixel,
             offsets = asset.offsets,
-        )
+        ).also { judgementCache[name] = it }
     }
 
     /** The popup for a judgement name: `sick`, `good`, `bad` or `shit`. */
