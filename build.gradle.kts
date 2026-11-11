@@ -1,5 +1,6 @@
 import korlibs.korge.gradle.Orientation
 import korlibs.korge.gradle.targets.ios.iosXcodegenExt
+import org.gradle.language.jvm.tasks.ProcessResources
 
 plugins {
     // The KorGE multiplatform plugin brings its own Kotlin (2.0.0), JVM/Android/iOS
@@ -65,6 +66,39 @@ korge {
 
     // Rhythm game — force landscape.
     orientation = Orientation.LANDSCAPE
+}
+
+/**
+ * Desktop window icon.
+ *
+ * `Korge(icon = "icon.png")` (Main.kt) loads the window icon from the game's
+ * resource VFS, which on the JVM is the classpath. The same root `icon.png` is
+ * what `KorgeExtension.icon` defaults to for the Android launcher mipmaps and
+ * the iOS `AppIcon` set, so add that one file to the JVM resources instead of
+ * keeping a duplicate under `src/jvmMain/resources`.
+ */
+tasks.named<ProcessResources>("jvmProcessResources") {
+    from(layout.projectDirectory.file("icon.png"))
+}
+
+/**
+ * `AndroidManifestXml.genAndroidManifestXml` hardcodes the system default
+ * (`@android:drawable/sym_def_app_icon`) as `android:roundIcon`, so launchers
+ * that request a round icon (Pixel, ...) show the green robot instead of the
+ * app icon. Rewrite it to the generated `@mipmap/icon` right after the plugin
+ * writes the manifest.
+ */
+tasks.matching { it.name == "createAndroidManifest" }.configureEach {
+    doLast {
+        val manifest = layout.buildDirectory.file("AndroidManifest.xml").get().asFile
+        if (!manifest.isFile) return@doLast
+        val text = manifest.readText()
+        val patched = text.replace(
+            "android:roundIcon=\"@android:drawable/sym_def_app_icon\"",
+            "android:roundIcon=\"@mipmap/icon\"",
+        )
+        if (patched != text) manifest.writeText(patched)
+    }
 }
 
 /**

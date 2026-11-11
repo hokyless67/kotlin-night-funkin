@@ -15,6 +15,7 @@ import nightfunkin.core.Constants
 import nightfunkin.core.Knf
 import nightfunkin.core.KnfBootLog
 import nightfunkin.platform.KnfEnv
+import nightfunkin.platform.KnfPlatform
 import nightfunkin.play.PlayRequest
 import nightfunkin.play.PlayScene
 import nightfunkin.play.ResultScene
@@ -34,6 +35,12 @@ suspend fun main() {
             virtualSize = Size(Constants.GAME_WIDTH.toDouble(), Constants.GAME_HEIGHT.toDouble()),
             title = Knf.NAME,
             backgroundColor = Colors["#000000"],
+            // Desktop window icon; bundled by `jvmProcessResources` from the
+            // root `icon.png` (the same file Korge uses for the Android/iOS
+            // launcher icons). Mobile windows have no OS-level icon, and their
+            // app bundles do not ship the JVM resources, so skip the lookup
+            // there instead of logging a missing-resource error at boot.
+            icon = if (KnfPlatform.isMobile) null else "icon.png",
         ) {
             // KorGE runs this block in its own coroutine (`views.launchImmediately`),
             // which is NOT covered by `GameWindow.entry`'s try/catch. On
