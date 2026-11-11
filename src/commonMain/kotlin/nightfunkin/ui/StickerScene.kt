@@ -5,6 +5,7 @@ import kotlinx.serialization.json.Json
 import korlibs.korge.view.Container
 import korlibs.korge.view.Image
 import korlibs.korge.view.addUpdater
+import korlibs.math.geom.Anchor2D
 import korlibs.math.geom.degrees
 import nightfunkin.audio.SfxPlayer
 import nightfunkin.core.Constants
@@ -37,18 +38,13 @@ class StickerOverlay(
     private val images = ArrayList<Image>()
     private var elapsed = 0.0
     private var covered = false
-    private var doneAt = Double.MAX_VALUE
 
     init {
         val packId = resolveStickerPackFor(playerCharacterId)
         val packStickers = loadPack(packId)
         val sounds = stickerSoundStems()
 
-        if (packStickers.isEmpty()) {
-            // Nothing to show — hand off on the first updater tick, right
-            // after this overlay has been attached to the scene.
-            doneAt = 0.0
-        } else {
+        if (packStickers.isNotEmpty()) {
             // `StickerSubState.regenStickers`: initialize stickers at each
             // point on the screen, then shuffle up the order they will pop.
             // This ensures stickers consistently cover the screen.
@@ -65,10 +61,16 @@ class StickerOverlay(
                     soundStem = sounds.randomOrNull(random).orEmpty(),
                 )
                 placements += placement
-                images += Image(bmp).also { img ->
+                images += Image(bmp, Anchor2D.CENTER).also { img ->
                     img.smoothing = true
-                    img.x = placement.x
-                    img.y = placement.y
+                    // `StickerSprite.updateHitbox()` centres the sprite's
+                    // origin, so it spins and pops around its middle. korlibs
+                    // anchors top-left by default; rotating around the corner
+                    // swings the artwork away from its grid slot and leaves
+                    // holes between the stickers (the screen stops being
+                    // covered). The top-left stays at the placement.
+                    img.x = placement.x + bmp.width / 2.0
+                    img.y = placement.y + bmp.height / 2.0
                     img.rotation = placement.angleDegrees.degrees
                     img.visible = false
                     addChild(img)
@@ -94,10 +96,12 @@ class StickerOverlay(
                 soundStem = sounds.randomOrNull(random).orEmpty(),
             )
             placements += last
-            images += Image(lastBmp).also { img ->
+            images += Image(lastBmp, Anchor2D.CENTER).also { img ->
                 img.smoothing = true
-                img.x = last.x
-                img.y = last.y
+                // `lastSticker.screenCenter()` centres the frame; with the
+                // centre origin the rotated/scaled artwork stays centred too.
+                img.x = last.x + lastBmp.width / 2.0
+                img.y = last.y + lastBmp.height / 2.0
                 img.visible = false
                 addChild(img)
             }
@@ -107,10 +111,18 @@ class StickerOverlay(
                 placement.appearAt = 0.9 * index / placements.size
                 placement.popAt = placement.appearAt + (1.0 / 24.0) * placement.frameDelay
             }
-            doneAt = placements.last().popAt
         }
 
         addUpdater { dt ->
+            // An empty/missing pack must not stall the transition (the
+            // original always has `default`); hand off right away.
+            if (placements.isEmpty()) {
+                if (!covered) {
+                    covered = true
+                    onCovered()
+                }
+                return@addUpdater
+            }
             elapsed += dt.secondsDouble()
             for ((index, img) in images.withIndex()) {
                 val placement = placements[index]

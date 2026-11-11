@@ -484,7 +484,7 @@ class ResultScene : Scene() {
         // The intro (when it exists) hands over to the looping track.
         if (introStarted && time - introStartedAt > 0.05) {
             val ended = !introMusic.playing ||
-                (introMusic.totalMs > 0.0 && introMusic.positionMs >= introMusic.totalMs - 50.0)
+                (introMusic.totalMs > 0.0 && introMusic.audiblePositionMs >= introMusic.totalMs - 50.0)
             if (ended) {
                 introStarted = false
                 introMusic.stop()

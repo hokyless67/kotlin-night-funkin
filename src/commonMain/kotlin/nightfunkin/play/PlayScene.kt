@@ -36,6 +36,7 @@ import nightfunkin.data.SongEntry
 import nightfunkin.data.SongEventData
 import nightfunkin.data.SongRegistry
 import nightfunkin.platform.KnfEnv
+import nightfunkin.platform.KnfPlatform
 import nightfunkin.timing.Conductor
 import nightfunkin.ui.SongSelectScene
 import nightfunkin.ui.StickerOverlay
@@ -110,6 +111,12 @@ class PlayScene : Scene() {
 
     /** On-screen controls on touch devices; null on desktop without `KNF_TOUCH`. */
     private var touchControls: TouchControls? = null
+
+    /**
+     * Touch targets for the mobile "Arrows" scheme, in stage coordinates.
+     * Empty on the desktop layout (the overlay then uses its default zones).
+     */
+    private var touchZones: List<TouchControls.LaneZone> = emptyList()
 
     // ---- gameplay state -------------------------------------------------
     private var score = 0
@@ -253,8 +260,13 @@ class PlayScene : Scene() {
     /**
      * FNF's desktop default is upscroll (`Preferences.downscroll == false`),
      * with the receptors one `STRUMLINE_Y_OFFSET` below the top edge.
+     *
+     * The touch "Arrows" control scheme forces downscroll
+     * (`Strumline.isDownscroll`), because the enlarged player lane lives at the
+     * bottom of the screen.
      */
-    private val downscroll = false
+    private val touchLayout = KnfPlatform.isMobile
+    private val downscroll = touchLayout
 
     /** Stage-space data for the current stage: props, character slots, zoom. */
     private lateinit var stageFile: StageDataFile
@@ -448,6 +460,7 @@ class PlayScene : Scene() {
             isPlayer = true,
             initialScrollSpeed = chart.scrollSpeed,
             downscroll = downscroll,
+            arrowsScheme = touchLayout,
         )
         opponentStrumline = Strumline(
             container = opponentLane,
@@ -632,6 +645,7 @@ class PlayScene : Scene() {
         // frame, so runtime overlays like the pause menu stay below it.
         if (KnfTouch.enabled) {
             val touch = TouchControls()
+            touch.laneZones = touchZones
             touch.menuMode = false
             addChild(touch)
             touchControls = touch
@@ -679,12 +693,20 @@ class PlayScene : Scene() {
     }
 
     /**
-     * Strumline placement, from `PlayState.initStrumlines`.
+     * Strumline placement, from `PlayState.initStrumlines` /
+     * `PlayState.initNoteHitbox`.
      *
      * For upscroll FNF simply parks the lane `STRUMLINE_Y_OFFSET` from the top;
-     * downscroll lifts it by the lane's own height instead.
+     * downscroll lifts it by the lane's own height instead. On touch devices
+     * the "Arrows" scheme replaces that with the mobile layout: a large,
+     * spread-out player lane at the bottom and a mini opponent lane in the
+     * top-left corner.
      */
     private fun layoutStrumlines() {
+        if (touchLayout) {
+            layoutTouchStrumlines()
+            return
+        }
         // FNF:
         //   cutoutSize = FullScreenScaleMode.gameCutoutSize.x / 2.5
         //   player.x = FlxG.width / 2 + STRUMLINE_X_OFFSET + cutoutSize / 2
@@ -709,6 +731,56 @@ class PlayScene : Scene() {
             strum.container.y = strumY
             // Notes are children of the lane, so their y must stay lane-local.
             strum.strumlineY = 0f
+        }
+    }
+
+    /**
+     * `PlayState.initNoteHitbox`: the touch "Arrows" scheme.
+     *
+     * The player's lane is scaled to `1.95 * height / width` with a
+     * `2.8 * height / width` pitch, which turns the four receptors into the
+     * on-screen buttons; the opponent's lane collapses to `0.4` and its notes
+     * are hidden (`Strumline.enterMiniMode`).
+     *
+     * `amplification` maps FNF's `(width / height) / (initialWidth /
+     * initialHeight)` onto KNF's fixed 16:9 virtual stage, where it is 1.
+     */
+    private fun layoutTouchStrumlines() {
+        val amplification = 1.0
+        val laneScale = (Constants.GAME_HEIGHT.toDouble() / Constants.GAME_WIDTH) * 1.95 * amplification
+        val spacing = (Constants.GAME_HEIGHT.toDouble() / Constants.GAME_WIDTH) * 2.8 * amplification
+
+        playerStrumline.configureLanes(laneScale.toFloat(), spacing.toFloat())
+        opponentStrumline.enterMiniMode((0.4 * amplification).toFloat())
+
+        val playerX = (Constants.GAME_WIDTH - playerStrumline.laneWidth) / 2.0 +
+            Constants.STRUMLINE_X_OFFSET
+        var playerY = (Constants.GAME_HEIGHT - playerStrumline.receptorHeight()) * 0.95 -
+            Constants.STRUMLINE_Y_OFFSET
+        if (noteStyle.isPixel) {
+            playerY -= 10.0
+        } else if (KnfPlatform.isAndroid) {
+            playerY += 10.0
+        }
+
+        playerStrumline.container.x = playerX
+        playerStrumline.container.y = playerY
+        playerStrumline.strumlineY = 0f
+
+        opponentStrumline.container.x = Constants.STRUMLINE_X_OFFSET - 30.0
+        opponentStrumline.container.y = Constants.STRUMLINE_Y_OFFSET * 0.3
+        opponentStrumline.strumlineY = 0f
+
+        // `FunkinHitbox`'s transparent note hints are invisible in FNF
+        // (`hint.alpha = 0`); only their rectangles drive touch input.
+        touchZones = playerStrumline.touchHints().map { hint ->
+            TouchControls.LaneZone(
+                lane = hint.lane,
+                x = playerStrumline.container.x + hint.x,
+                y = playerStrumline.container.y + hint.y,
+                width = hint.width,
+                height = hint.height,
+            )
         }
     }
 
@@ -971,8 +1043,9 @@ class PlayScene : Scene() {
         wallClock = realNowMs()
         gameInput.update()
         // While an overlay owns the screen the touch overlay switches to
-        // menu gestures (tap = accept, drags = navigation).
-        touchControls?.menuMode = pauseMenu != null || gameOverActive
+        // menu gestures (tap = accept, drags = navigation). `PlayState.endSong`
+        // also hides the mobile buttons while the results transition runs.
+        touchControls?.menuMode = pauseMenu != null || gameOverActive || ending
 
         // While the substate is open, only it is updated: PlayState freezes
         // gameplay, the stage and the conductor until it closes.
@@ -1443,11 +1516,21 @@ class PlayScene : Scene() {
 
     private fun checkSongEnd() {
         val length = music.totalMs
-        val reachedEnd = (length > 0 && music.positionMs >= length - 120) ||
-            (forcedSongEndMs != null && music.positionMs >= forcedSongEndMs)
+        // `positionMs` is the *generated* position: it counts the samples
+        // handed to the platform output. The audible position lags by
+        // `outputLeadMs` and freezes at `total - outputLeadMs` once the
+        // channel runs out of samples, so it never reaches `length` - that
+        // stopped every song from ever reaching the results screen.
+        //
+        // Ending on the generated position does not cut the tail: the last
+        // `outputLeadMs` of samples are already queued in the device and keep
+        // playing after `endSong` mutes the mixer.
+        val generated = music.positionMs
+        val reachedEnd = (length > 0 && generated >= length - 120) ||
+            (forcedSongEndMs != null && generated >= forcedSongEndMs)
         if (reachedEnd) {
-            if (forcedSongEndMs != null && length > 0 && music.positionMs < length - 120) {
-                println("KNF: forced song end at ${music.positionMs.toInt()}ms (KNF_END_AT_MS)")
+            if (forcedSongEndMs != null && length > 0 && generated < length - 120) {
+                println("KNF: forced song end at ${generated.toInt()}ms (KNF_END_AT_MS)")
             }
             songEnded = true
 
@@ -1580,13 +1663,16 @@ class PlayScene : Scene() {
         clockSampleTimer = 0.0
         val wall = songClockMs
         val audio = music.positionMs
+        val heard = music.audiblePositionMs
         val lead = playerStrumline.notes.minOfOrNull { it.strumTime.toDouble() } ?: -1.0
         val playerVoice = if (vocals.playing) vocals.positionMs - audio else 0.0
         val opponentVoice = if (opponentVocals.playing) opponentVocals.positionMs - audio else 0.0
         println(
             "KNF: CLOCK wall=" + KnfFmt.decimals(wall, 0) +
                 "ms audio=" + KnfFmt.decimals(audio, 0) +
-                "ms drift=" + KnfFmt.decimals(audio - wall, 0) +
+                "ms heard=" + KnfFmt.decimals(heard, 0) +
+                "ms lead=" + KnfFmt.decimals(music.outputLeadMs, 0) +
+                "ms drift=" + KnfFmt.decimals(heard - wall, 0) +
                 "ms cond=" + KnfFmt.decimals(conductor.songPosition.toDouble(), 0) +
                 "ms nextNote=" + KnfFmt.decimals(lead, 0) +
                 "ms ahead=" + KnfFmt.decimals(lead - conductor.songPosition.toDouble(), 0) +
@@ -1703,7 +1789,7 @@ class PlayScene : Scene() {
 
         if (avsyncDebug && !startingSong) {
             // Audio clock at the exact moment the note's strum time was reached.
-            val audioNow = music.positionMs.toFloat() + conductor.combinedOffset
+            val audioNow = music.audiblePositionMs.toFloat() + conductor.combinedOffset
             avsum += (audioNow - note.strumTime - timingError).toDouble()
             avcount++
         }

@@ -237,6 +237,9 @@ object KnfFiles {
      * types KorGE does not implement.
      */
     private fun decodeImage(data: ByteArray): Bitmap {
+        // Android's BitmapFactory is orders of magnitude faster than the pure
+        // Kotlin decoders for the big sheets (a 4096x4096 PNG took ~16 s).
+        knfDecodeImageNative(data)?.let { return it }
         val raw =
             if (KnfPng.needsOwnDecoder(data)) KnfPng.decode(data) else RegisteredImageFormats.decode(data)
         return premultiply(raw)

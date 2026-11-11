@@ -33,4 +33,6 @@ actual object KnfPlatform {
      * locations stay desktop, so you can test with your local asset tree.
      */
     actual val isMobile: Boolean get() = KnfEnv["KNF_MOBILE"] == "1"
+
+    actual val isAndroid: Boolean get() = false
 }

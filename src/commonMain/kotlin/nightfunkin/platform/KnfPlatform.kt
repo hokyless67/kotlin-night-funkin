@@ -29,4 +29,10 @@ expect object KnfPlatform {
 
     /** True on the touch-first mobile targets (Android/iOS). */
     val isMobile: Boolean
+
+    /**
+     * True only on Android. `PlayState.initNoteHitbox` nudges the touch
+     * strumline down by 10 px there (and by -10 px for the pixel skin).
+     */
+    val isAndroid: Boolean
 }

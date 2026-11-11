@@ -209,7 +209,9 @@ class VideoPlayback(private val videoPath: String) {
         val now = PerformanceCounter.nanoseconds
 
         val raw = if (audioPlayer.exists) {
-            val position = audioPlayer.positionMs
+            // The audible position: the movie must be shown in step with what
+            // is heard, and KNF's outputs queue several blocks ahead.
+            val position = audioPlayer.audiblePositionMs
             if (position > lastAudioMs) {
                 lastAudioMs = position
                 lastAudioWallNanos = now

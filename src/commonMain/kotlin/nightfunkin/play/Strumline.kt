@@ -29,6 +29,23 @@ class Strumline(
     val isPlayer: Boolean,
     initialScrollSpeed: Float,
     val downscroll: Boolean,
+    /**
+     * FNF's `Strumline.strumlineScale`: a multiplier on the note style's own
+     * receptor scale. The touch "Arrows" scheme blows the player's lane up to
+     * `1.95 * height / width`, so the receptors double as the on-screen buttons.
+     */
+    private var laneScale: Float = 1f,
+    /**
+     * FNF's `Strumline.noteSpacingScale`: the lane pitch multiplier. Set from
+     * `PlayState.initNoteHitbox` on the touch layout.
+     */
+    private var noteSpacingScale: Float = 1f,
+    /**
+     * FNF's `inArrowControlSchemeMode && isPlayer`: shifts the first/second and
+     * third/fourth lanes apart so the four touch buttons can share the bottom
+     * of the screen (`Strumline.getXPos`).
+     */
+    private val arrowsScheme: Boolean = false,
 ) {
     // ---- public state ---------------------------------------------------
     var scrollSpeed: Float = initialScrollSpeed
@@ -45,6 +62,18 @@ class Strumline(
 
     private val receptors = arrayOfNulls<Receptor>(Constants.KEY_COUNT)
     private val splashLayers = arrayOfNulls<Container>(Constants.KEY_COUNT)
+
+    /**
+     * Everything that is not a receptor: notes, hold tails, covers and
+     * splashes. FNF's `Strumline.enterMiniMode` hides all of it except the
+     * arrows, so the opponent lane on the touch layout is just a row of
+     * bouncing mini arrows.
+     */
+    private val noteEffects = Container()
+
+    /** FNF's `Strumline.get_width()`, in pixels. */
+    val laneWidth: Double
+        get() = Constants.KEY_COUNT.toDouble() * Constants.NOTE_SPACING * noteSpacingScale * laneScale
 
     /**
      * Which lanes are currently held down.
@@ -84,6 +113,11 @@ class Strumline(
 
     init {
         buildReceptors()
+        // Added after the receptors so notes, tails and splashes draw over them.
+        // The z-index mirrors FNF's `notes` group and keeps that true on a
+        // container that sorts by z-index.
+        noteEffects.zIndex = 30.0
+        container.addChild(noteEffects)
     }
 
     // ======================================================================
@@ -91,48 +125,154 @@ class Strumline(
     // ======================================================================
 
     private fun buildReceptors() {
+        for (i in 0 until Constants.KEY_COUNT) {
+            receptors[i] = Receptor(container, i, noteStyle, isPlayer).also {
+                // FNF: `this.strumlineNotes.zIndex = 10;`
+                it.container.zIndex = 10.0
+            }
+        }
+        placeReceptors()
+        for (i in 0 until Constants.KEY_COUNT) {
+            // FNF's `fadeInArrows`: y -= 10, alpha = 0, then each arrow tweens
+            // back over 1s after a staggered 0.5s delay.
+            receptors[i]?.startIntro(i)
+        }
+    }
+
+    /** Our lane pitch in pixels (`getXPos` multiplier). */
+    private val lanePitch: Double
+        get() = Constants.NOTE_SPACING.toDouble() * noteSpacingScale * laneScale
+
+    /**
+     * Lays the receptors out at their current scale/spacing.
+     *
+     * FNF's `Strumline.setNoteSpacing` does the same thing whenever
+     * `strumlineScale` changes.
+     */
+    private fun placeReceptors() {
         val offsets = noteStyle.strumlineOffsets
         val offsetX = offsets.getOrElse(0) { 0.0 }
         val offsetY = offsets.getOrElse(1) { 0.0 }
         for (i in 0 until Constants.KEY_COUNT) {
-            receptors[i] = Receptor(container, i, noteStyle, isPlayer).also {
-                // Receptor, note head and tail all sit on the same lane centre.
-                // FNF spreads them by a few pixels (`INITIAL_OFFSET` on the
-                // receptor, `STRUMLINE_SIZE / 2` on the tail), which leaves the
-                // hold tail visibly off to the right of its arrow.
-                // FNF: child.x = getXPos(dir) + INITIAL_OFFSET; child.y = 0; - the receptors
-                // are children of the strumline, so the lane offset is added here.
-                // `applyStrumlineOffsets` then shifts only the receptor, which is
-                // why note heads and hold trails use the unshifted lane centre.
-                it.container.x = xPos(i) + Constants.INITIAL_OFFSET + offsetX
-                it.container.y = offsetY
-                // FNF: `this.strumlineNotes.zIndex = 10;`
-                it.container.zIndex = 10.0
-                // FNF's `fadeInArrows`: y -= 10, alpha = 0, then each arrow
-                // tweens back over 1s after a staggered 0.5s delay.
-                it.startIntro(i)
-            }
+            val receptor = receptors[i] ?: continue
+            // FNF: child.x = getXPos(dir) + INITIAL_OFFSET; child.y = 0; - the
+            // receptors are children of the strumline, so the lane offset is
+            // added here. `applyStrumlineOffsets` then shifts only the
+            // receptor, which is why note heads and hold trails use the
+            // unshifted lane centre.
+            receptor.container.x = xPos(i) + Constants.INITIAL_OFFSET + offsetX
+            receptor.container.y = offsetY
+            receptor.setLaneScale(laneScale)
         }
     }
 
+    /**
+     * FNF's `PlayState.initNoteHitbox` lane setup: rescale the lane and change
+     * its pitch. Used by the touch "Arrows" scheme.
+     */
+    fun configureLanes(scale: Float, spacing: Float = noteSpacingScale) {
+        laneScale = scale
+        noteSpacingScale = spacing
+        placeReceptors()
+    }
+
+    /**
+     * FNF's `Strumline.enterMiniMode`: hide the lane's notes and turn it into
+     * a row of small arrows. The opponent lane gets this on touch devices.
+     */
+    fun enterMiniMode(scale: Float) {
+        noteEffects.visible = false
+        configureLanes(scale)
+    }
+
+    /**
+     * FNF's `Strumline.constructNoteSprite` on the touch scheme:
+     * `noteSprite.scale.scale(strumlineScale - (height / width) * 0.2)`, which
+     * leaves the note heads a hair smaller than the enlarged receptors.
+     */
+    private val noteScaleMultiplier: Double
+        get() = if (arrowsScheme) {
+            laneScale - (Constants.GAME_HEIGHT.toDouble() / Constants.GAME_WIDTH) * 0.2
+        } else {
+            1.0
+        }
+
     /** Displayed height of a receptor sprite; FNF uses this to place the lane. */
     fun receptorHeight(): Double {
-        var h = 0.0
-        for (i in 0 until Constants.KEY_COUNT) {
-            val slice = noteStyle.strumSlice(i, "Static") ?: continue
-            h = maxOf(h, slice.height.toDouble() * noteStyle.scale.toDouble())
+        // `Strumline.height` comes from the receptors' fixed setup hitbox,
+        // which keeps the note style scale even after `strumlineScale` changes.
+        val base = noteStyle.strumlineBaseSize()?.second ?: Constants.STRUMLINE_SIZE
+        return base * noteStyle.strumlineScale.toDouble()
+    }
+
+    /** One invisible touch target, in lane-local coordinates. */
+    data class TouchHint(
+        val lane: Int,
+        val x: Double,
+        val y: Double,
+        val width: Double,
+        val height: Double,
+    )
+
+    /**
+     * `FunkinHitbox.createHintTransparentNote` + `FunkinHint.follow`: the
+     * player lane's touch targets are the note arrows scaled to roughly the
+     * receptor, widened 1.35x and stretched 8x vertically.
+     *
+     * The hint sprites themselves have `alpha = 0` in FNF - what you actually
+     * see is the player's strumline - so only the rectangles matter here.
+     *
+     * `initNoteHitbox`'s `for (strum in playerStrumline) strum.width *= 2`
+     * iterates the *group's members* (background, note groups...), and
+     * `FlxSpriteGroup.set_width` is a no-op, so the receptor width the hint
+     * follows is the fixed setup hitbox, i.e. plain
+     * `noteStyle.strumlineScale * frameWidth`.
+     */
+    fun touchHints(): List<TouchHint> {
+        val base = noteStyle.strumlineBaseSize()
+            ?: (Constants.STRUMLINE_SIZE to Constants.STRUMLINE_SIZE)
+        val offsets = noteStyle.strumlineOffsets
+        val offsetX = offsets.getOrElse(0) { 0.0 }
+        val offsetY = offsets.getOrElse(1) { 0.0 }
+        // `StrumlineNote.width`/`height` stay at the note style's own scale
+        // (`strumlineScaleCallback` never calls `updateHitbox`).
+        val styleScale = noteStyle.strumlineScale.toDouble()
+        return (0 until Constants.KEY_COUNT).map { direction ->
+            val targetX = xPos(direction) + Constants.INITIAL_OFFSET + offsetX
+            val targetWidth = base.first * styleScale
+            val targetHeight = base.second * styleScale
+            TouchHint(
+                lane = direction,
+                x = targetX - targetWidth * 0.175,
+                y = offsetY - 220.0,
+                width = targetWidth * 1.35,
+                height = targetHeight * 8.0,
+            )
         }
-        return if (h <= 0.0) Constants.STRUMLINE_SIZE.toDouble() else h
     }
 
     /**
      * Lane-local x of a direction, matching `Strumline.getXPos`.
      *
-     * Note the lanes are `NOTE_SPACING` apart *regardless of the skin scale* —
+     * Note the lanes are `NOTE_SPACING` apart *regardless of the skin scale* -
      * FNF scales the arrow sprites themselves, not the lane pitch, which is why
-     * lanes stay put when you switch to the pixel skin.
+     * lanes stay put when you switch to the pixel skin. The touch "Arrows"
+     * scheme additionally pushes the outer lanes apart by `pos`, so the four
+     * receptors can be tapped with two thumbs.
      */
-    fun xPos(direction: Int): Double = direction.toDouble() * Constants.NOTE_SPACING
+    fun xPos(direction: Int): Double {
+        // FNF: `pos = 35 * (FlxG.width / FlxG.height) / (FlxG.initialWidth / FlxG.initialHeight)`.
+        // KNF's virtual stage is a fixed 16:9 canvas, so the ratio is 1.
+        val pos = if (arrowsScheme && isPlayer) 35.0 else 0.0
+        val pitch = lanePitch
+        return when (direction) {
+            0 -> -pos * 2
+            1 -> -pos * 2 + pitch
+            2 -> pos + pitch * 2
+            3 -> pos + pitch * 3
+            else -> -pos * 2
+        }
+    }
 
     fun setNoteData(data: List<SongNoteData>) {
         clean()
@@ -226,7 +366,7 @@ class Strumline(
     private fun spawn(nd: SongNoteData) {
         val dir = nd.direction
         val note = freeNotes.removeLastOrNull()?.also { it.setDirection(dir, noteStyle.noteSlice(dir)) }
-            ?: NoteSprite(container, dir, noteStyle, noteStyle.noteSlice(dir))
+            ?: NoteSprite(noteEffects, dir, noteStyle, noteStyle.noteSlice(dir), noteScaleMultiplier)
 
         note.strumTime = nd.time
         note.fullSustainLength = nd.length
@@ -382,8 +522,8 @@ class Strumline(
     fun playNoteHoldCover(direction: Int) {
         val asset = noteStyle.holdCover(direction) ?: return
         // FNF: `this.noteHoldCovers.zIndex = 40;`
-        val cover = HoldCover(container, direction, asset, noteStyle).also {
-            container.addChild(it)
+        val cover = HoldCover(noteEffects, direction, asset, noteStyle).also {
+            noteEffects.addChild(it)
             it.zIndex = 40.0
         }
         cover.setPosition(xPos(direction), strumlineY.toDouble())
@@ -437,7 +577,7 @@ class Strumline(
 
         val layer = splashLayers[direction] ?: Container().also {
             it.y = 0.0
-            container.addChild(it)
+            noteEffects.addChild(it)
             it.zIndex = 50.0
             splashLayers[direction] = it
         }
@@ -534,6 +674,7 @@ class Strumline(
         splashLayers.forEach { it?.removeFromParent() }
         receptors.fill(null)
         splashLayers.fill(null)
+        noteEffects.removeFromParent()
     }
 }
 
@@ -615,7 +756,15 @@ private class Receptor(
         redraw()
     }
 
-    private val receptorScale: Double = noteStyle.strumlineScale.toDouble()
+    /**
+     * FNF's `strumlineScale` for this arrow. The touch layout rescales the
+     * whole lane after construction (`enterMiniMode` / `initNoteHitbox`), so
+     * this cannot be a `val`.
+     */
+    private var laneScale: Double = 1.0
+
+    private val receptorScale: Double
+        get() = noteStyle.strumlineScale.toDouble() * laneScale
 
     /**
      * Where every animation frame's *logical* centre lands, in the container's
@@ -629,14 +778,31 @@ private class Receptor(
      * *every* state. The container already carries `xPos(dir) + INITIAL_OFFSET`,
      * so the centre within it is simply half of that fixed hitbox.
      *
+     * Crucially, `strumlineScaleCallback` only changes `scale`; `width` and
+     * `offset` stay at the values from setup, i.e. based on the note style's
+     * own scale. That is why the mini opponent lane (`enterMiniMode(0.4)` in
+     * `PlayState.initNoteHitbox`) draws its arrows inset by ~49 px instead of
+     * hugging the corner: the hitbox is still 0.7-scaled while the artwork is
+     * drawn at 0.28.
+     *
      * `StrumlineNote.fixOffsets` exists in the sources but is never called in
      * 0.8.6, so the confirm glow is *not* nudged.
      */
     private val baseSize: Pair<Int, Int> =
         noteStyle.strumlineBaseSize() ?: (Constants.STRUMLINE_SIZE to Constants.STRUMLINE_SIZE)
 
-    private val centreX: Double = baseSize.first * receptorScale / 2.0
-    private val centreY: Double = baseSize.second * receptorScale / 2.0
+    /** `getStrumlineScale()`: the hitbox is fixed at this scale for life. */
+    private val styleScale: Double = noteStyle.strumlineScale.toDouble()
+
+    private val centreX: Double get() = baseSize.first * styleScale / 2.0
+    private val centreY: Double get() = baseSize.second * styleScale / 2.0
+
+    /** Rescales this arrow to the lane's `strumlineScale` and redraws it. */
+    fun setLaneScale(scale: Float) {
+        if (laneScale == scale.toDouble()) return
+        laneScale = scale.toDouble()
+        redraw()
+    }
 
     init {
         // The static pose has to be drawn up front, otherwise the receptor only

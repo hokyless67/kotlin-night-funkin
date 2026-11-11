@@ -5,6 +5,7 @@ import korlibs.audio.sound.AudioData
 import korlibs.audio.sound.AudioSample
 import korlibs.audio.sound.PlaybackTimes
 import korlibs.audio.sound.Sound
+import korlibs.audio.sound.SoundAudioData
 import korlibs.audio.sound.SoundChannel
 import korlibs.audio.sound.nativeSoundProvider
 import korlibs.audio.sound.readSound
@@ -54,6 +55,12 @@ class MusicPlayer {
     private var paused = false
     private var analyzer: SpectrumAnalyzer? = null
 
+    /** True when playback runs on [knfMusicSoundProvider]'s deep-buffer output. */
+    private var usesKnfOutput = false
+
+    /** Sample rate of the loaded track; `SoundChannel` does not expose it. */
+    private var sampleRate = 44100
+
     /**
      * KorGE's `SoundAudioData` registers its `onCancel` stop hook on the
      * coroutine context it was decoded in. Loading a persistent track while a
@@ -92,6 +99,26 @@ class MusicPlayer {
 
     val positionMs: Double
         get() = channel?.current?.toMsDouble() ?: stoppedAtMs
+
+    /**
+     * How far [positionMs] runs ahead of the speaker.
+     *
+     * `SoundChannel.current` counts samples *generated* into the output queue.
+     * Our platform outputs keep [knfMusicLeadBlocks] device blocks queued, so
+     * the newest `outputLeadMs` of those samples have not been heard yet. The
+     * korlibs backends buffer too, but there the Conductor is anchored on the
+     * wall clock instead (see `PlayScene.updateClock`), so this reports 0.
+     */
+    val outputLeadMs: Double
+        get() = if (usesKnfOutput) {
+            knfMusicLeadBlocks * KNF_AUDIO_BLOCK_FRAMES * 1000.0 / sampleRate
+        } else {
+            0.0
+        }
+
+    /** Position the listener is hearing right now. */
+    val audiblePositionMs: Double
+        get() = (positionMs - outputLeadMs).coerceAtLeast(0.0)
 
     val playing: Boolean get() = channel?.state?.playing == true
 
@@ -160,12 +187,25 @@ class MusicPlayer {
             // covers a song's worth on mobile, desktop has 2 GB.
             val loadedSound = bytes.readSound(streaming = streaming)
 
+            // Fully decoded tracks are played back through KNF's own platform
+            // output (see `KnfAudioOutput`): korlibs' default output is only one
+            // `AudioTrack` block deep on Android, so a late producer wake-up
+            // under rendering load leaves an audible gap at every block seam.
+            val musicOutput = knfMusicSoundProvider
+            if (!streaming && musicOutput != null) {
+                (loadedSound as? SoundAudioData)?.soundProvider = musicOutput
+            }
+
             // Sound.length is zero for KorGE's non-streaming SoundAudioData,
             // but its decoded AudioData still knows the real duration.
             // Streaming sounds report it from the MP3 header; fall back to a
             // cheap metadata probe when the header did not carry one. Freeplay
             // needs this before playback starts to compute the preview window.
-            val audio = if (analyze && !streaming) runCatching { loadedSound.decode() }.getOrNull() else null
+            val audio = if (!streaming && (analyze || musicOutput != null)) {
+                runCatching { loadedSound.decode() }.getOrNull()
+            } else {
+                null
+            }
             val lengthMs = audio?.totalTime?.toMsDouble()
                 ?: loadedSound.length.toMsDouble().takeIf { it > 0.0 }
                 ?: (runCatching { probeDurationMs(bytes) }.getOrNull() ?: 0.0)
@@ -184,7 +224,9 @@ class MusicPlayer {
         val (s, lengthMs, audio) = loaded
         s.volume = volume
         sound = s
-        analyzer = audio?.let { runCatching { SpectrumAnalyzer(it) }.getOrNull() }
+        analyzer = if (analyze) audio?.let { runCatching { SpectrumAnalyzer(it) }.getOrNull() } else null
+        usesKnfOutput = s is SoundAudioData && s.soundProvider === knfMusicSoundProvider
+        sampleRate = audio?.rate ?: 44100
         this.volume = volume
         loadedPath = key
         stoppedAtMs = 0.0
@@ -223,7 +265,10 @@ class MusicPlayer {
 
     fun pause() {
         val ch = channel ?: return
-        stoppedAtMs = ch.current.toMsDouble()
+        // `current` is the generated position: resuming from it would replay
+        // the samples that were still queued (up to `outputLeadMs`) and skip
+        // that much audio. Store what the listener actually heard.
+        stoppedAtMs = (ch.current.toMsDouble() - outputLeadMs).coerceAtLeast(0.0)
         ch.stop()
         channel = null
         paused = true
@@ -328,6 +373,10 @@ class SfxPlayer {
         // Decode the PCM once for the software mixer (small files: clicks etc).
         runCatching { s.decode() }.getOrNull()?.also { audioCache[path] = it }
         cache[path] = s
+        // Open the shared output here, on the loading coroutine: the device is
+        // created synchronously and the first click or countdown blip must not
+        // pay for it in the middle of a frame.
+        ensureMixer()
         return s
     }
 
@@ -384,8 +433,10 @@ class SfxPlayer {
         if (mixerStarted) return
         mixerStarted = true
         // The gen callback runs on the platform audio thread; `mixLock` guards
-        // the voice list against plays/late loads on other threads.
-        nativeSoundProvider.createNewPlatformAudioOutput(2, 44100) { buffer ->
+        // the voice list against plays/late loads on other threads. The mixer
+        // goes through the same dedicated-thread output, but with a single
+        // device block: a click must not trail the finger.
+        (knfSfxSoundProvider ?: nativeSoundProvider).createNewPlatformAudioOutput(2, 44100) { buffer ->
             mixLock {                for (ch in 0 until buffer.channels) {
                     for (n in 0 until buffer.totalSamples) buffer[ch, n] = AudioSample.ZERO
                 }

@@ -1,30 +1,32 @@
 package nightfunkin.ui
 
 import korlibs.event.MouseButton
-import korlibs.image.color.Colors
 import korlibs.korge.view.Container
-import korlibs.korge.view.View
 import korlibs.korge.view.addUpdater
-import korlibs.korge.view.roundRect
-import korlibs.korge.view.text
-import korlibs.math.geom.RectCorners
-import korlibs.math.geom.Size
+import korlibs.korge.view.image
+import korlibs.math.geom.Anchor2D
 import nightfunkin.core.Constants
+import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfTouch
+import nightfunkin.core.TextureAtlas
 import kotlin.math.abs
 
 /**
  * On-screen touch controls, added by the scenes on top of everything else.
  *
- * Two modes:
- *  - **Gameplay** (`menuMode == false`): four thumb zones at the bottom, split
- *    into a pair under each thumb (lanes left/down on the left, up/right on the
- *    right), full multi-touch, plus a pause button in the top-right corner.
- *    Presses feed [KnfTouch.lanes], which [nightfunkin.core.KnfInput] merges
- *    with the keyboard — receptors, hit logic and holds work unchanged.
- *  - **Menu** (`menuMode == true`): invisible full-screen gestures — tap =
- *    CONFIRM, vertical drag = UI up/down, horizontal drag = left/right (song
- *    difficulty in Freeplay), two-finger tap = BACK.
+ * Gameplay is ported from FNF's mobile "Arrows" scheme:
+ *
+ *  - The visible buttons are the player's own strumline receptors, which the
+ *    mobile layout enlarges and spreads across the bottom of the screen
+ *    (`PlayScene.layoutTouchStrumlines`). FNF's `FunkinHitbox` hints are
+ *    `alpha = 0`, so only their rectangles are used here, via [laneZones].
+ *  - The pause button is FNF's `pauseButton` / `pauseCircle` pair in the
+ *    top-right corner. Like `TouchUtil.pressAction`, it triggers on release
+ *    inside the button.
+ *
+ * Menu mode is unchanged: invisible full-screen gestures — tap = CONFIRM,
+ * vertical drag = UI up/down, horizontal drag = left/right (song difficulty in
+ * Freeplay), two-finger tap = BACK.
  *
  * Coordinates are virtual 1280x720 stage space, like every other view in the
  * game. On desktop (`KNF_TOUCH=1`, or full mobile mode via `KNF_MOBILE=1`) the
@@ -34,16 +36,37 @@ import kotlin.math.abs
 class TouchControls : Container() {
 
     /**
+     * One gameplay touch target in stage coordinates, taken from the
+     * `FunkinHitbox` transparent hint of a lane.
+     */
+    class LaneZone(
+        val lane: Int,
+        val x: Double,
+        val y: Double,
+        val width: Double,
+        val height: Double,
+    ) {
+        fun contains(px: Double, py: Double): Boolean =
+            px >= x && px < x + width && py >= y && py < y + height
+    }
+
+    /**
      * Menu gesture mode. PlayScene flips this while the pause menu or the game
      * over screen is up; the menu scenes keep it on all the time.
      */
     var menuMode: Boolean = true
         set(value) {
+            if (field == value) return
             field = value
-            zones?.visible = !value
             pauseButton?.visible = !value
             if (value) releaseAll()
         }
+
+    /**
+     * Gameplay touch targets. Empty on the desktop layout, which falls back to
+     * the two thumb pairs in [laneAt].
+     */
+    var laneZones: List<LaneZone> = emptyList()
 
     /** One tracked finger (or the emulated mouse pointer). */
     private class Pointer(
@@ -63,14 +86,22 @@ class TouchControls : Container() {
 
         /** Gesture already handled (two-finger back, pause button). */
         var consumed: Boolean = false
+
+        /** The press started on the pause button. */
+        var pause: Boolean = false
     }
 
     private val pointers = HashMap<Int, Pointer>()
-    private var zones: Container? = null
-    private var pauseButton: View? = null
+    private var pauseButton: Container? = null
+
+    // FNF's `pauseButton` hitbox: 123x113 frame at scale 0.8, 35 px from the
+    // top-right corner. Kept as defaults so input still works without the art.
+    private var pauseX = Constants.GAME_WIDTH - 123.0 * PAUSE_SCALE - PAUSE_MARGIN
+    private var pauseY = PAUSE_MARGIN
+    private var pauseW = 123.0 * PAUSE_SCALE
+    private var pauseH = 113.0 * PAUSE_SCALE
 
     init {
-        buildZones()
         buildPauseButton()
         addUpdater { poll() }
     }
@@ -85,17 +116,7 @@ class TouchControls : Container() {
         // after this clear within the same poll.
         KnfTouch.clearFrameActions()
         pollPointers()
-        if (++debugFrames % 120 == 1) {
-            val input = stage?.views?.input
-            println(
-                "KNF: touchPoll f=$debugFrames stage=${stage != null} " +
-                    "activeTouches=${input?.activeTouches?.size} " +
-                    "mouseButtons=${input?.mouseButtons} mousePos=${input?.mousePos} menuMode=$menuMode"
-            )
-        }
     }
-
-    private var debugFrames = 0
 
     private fun pollPointers() {
         // Views access goes through the stage: plain views do not carry a
@@ -138,7 +159,6 @@ class TouchControls : Container() {
     // ------------------------------------------------------------------
 
     private fun onPointerDown(id: Int, x: Double, y: Double) {
-        println("KNF: touchDown id=$id x=$x y=$y menuMode=$menuMode")
         val pointer = Pointer(x, y, x, y)
         pointers[id] = pointer
 
@@ -153,8 +173,10 @@ class TouchControls : Container() {
         }
 
         if (hitPauseButton(x, y)) {
+            // FNF's `TouchUtil.pressAction` fires on release, so only remember
+            // the press here.
+            pointer.pause = true
             pointer.consumed = true
-            KnfTouch.pauseDown = true
             return
         }
         val lane = laneAt(x, y)
@@ -171,6 +193,21 @@ class TouchControls : Container() {
         pointer.x = x
         pointer.y = y
         if (abs(dx) > TAP_SLOP_PX || abs(dy) > TAP_SLOP_PX) pointer.moved = true
+        if (!menuMode && !pointer.consumed) {
+            if (pointer.lane >= 0 && !laneContains(pointer.lane, x, y)) {
+                // `FunkinButton.limitToBounds`: sliding off the button releases it.
+                releaseLane(pointer)
+            }
+            if (pointer.lane < 0) {
+                // A finger dragged onto another hint presses it, like Flixel's
+                // buttons do when an already-down touch enters them.
+                val lane = laneAt(x, y)
+                if (lane >= 0) {
+                    pointer.lane = lane
+                    KnfTouch.lanes[lane] = true
+                }
+            }
+        }
         if (!menuMode || pointer.consumed) return
 
         // Lock onto the first direction the drag crosses; hold the matching
@@ -193,14 +230,8 @@ class TouchControls : Container() {
     }
 
     private fun onPointerEnd(id: Int) {
-        println("KNF: touchEnd id=$id")
         val pointer = pointers.remove(id) ?: return
-        if (pointer.lane >= 0) {
-            // Only release when no other finger still covers that lane.
-            val stillHeld = pointers.values.any { it.lane == pointer.lane }
-            if (!stillHeld) KnfTouch.lanes[pointer.lane] = false
-            pointer.lane = -1
-        }
+        releaseLane(pointer)
         when (pointer.navAxis) {
             NAV_VERTICAL -> {
                 KnfTouch.lanes[1] = false
@@ -210,6 +241,12 @@ class TouchControls : Container() {
                 KnfTouch.lanes[0] = false
                 KnfTouch.lanes[3] = false
             }
+        }
+        if (pointer.pause) {
+            // `TouchUtil.pressAction`: `justReleased && overlaps`.
+            if (hitPauseButton(pointer.x, pointer.y)) KnfTouch.pauseDown = true
+            pointer.pause = false
+            return
         }
         if (menuMode && !pointer.consumed && !pointer.moved && pointers.isEmpty()) {
             KnfTouch.acceptDown = true
@@ -224,17 +261,57 @@ class TouchControls : Container() {
         }
     }
 
+    /** Releases [pointer]'s lane unless another finger still covers it. */
+    private fun releaseLane(pointer: Pointer) {
+        if (pointer.lane < 0) return
+        val stillHeld = pointers.values.any { it !== pointer && it.lane == pointer.lane }
+        if (!stillHeld) KnfTouch.lanes[pointer.lane] = false
+        pointer.lane = -1
+    }
+
+    /**
+     * Whether [x], [y] is still inside the touch target of [lane].
+     *
+     * FNF's hint rectangles (`setSize(width * 1.35, height * 8)`) overlap a
+     * little, so holding a note survives a sideways slide; the fallback
+     * desktop zones tile the screen and keep the old hold-until-release
+     * behaviour.
+     */
+    private fun laneContains(lane: Int, x: Double, y: Double): Boolean {
+        if (laneZones.isEmpty()) return true
+        return laneZones.any { it.lane == lane && it.contains(x, y) }
+    }
+
     // ------------------------------------------------------------------
     // hit testing
     // ------------------------------------------------------------------
 
     /**
-     * Lane for a gameplay zone press, -1 outside the zones.
+     * Lane for a gameplay press, -1 outside the touch targets.
      *
-     * The zones sit in two pairs under the thumbs — left/down on the left edge,
-     * up/right on the right edge — so the middle of the screen stays free.
+     * On the mobile "Arrows" layout the targets come from FNF's transparent
+     * hints; neighbouring hints overlap by a few dozen pixels, so a press goes
+     * to the nearest lane centre - FNF itself lets one touch press every
+     * overlapping hint, which would strike several lanes at once.
      */
     private fun laneAt(x: Double, y: Double): Int {
+        if (laneZones.isNotEmpty()) {
+            var lane = -1
+            var distance = Double.MAX_VALUE
+            for (zone in laneZones) {
+                if (x < zone.x || x >= zone.x + zone.width) continue
+                if (y < zone.y || y >= zone.y + zone.height) continue
+                val d = abs(x - (zone.x + zone.width / 2.0))
+                if (d < distance) {
+                    distance = d
+                    lane = zone.lane
+                }
+            }
+            return lane
+        }
+
+        // Desktop fallback: two pairs under the thumbs - left/down on the left
+        // edge, up/right on the right edge - so the middle stays free.
         if (y < Constants.GAME_HEIGHT * ZONE_TOP_FRACTION) return -1
         val zoneWidth = Constants.GAME_WIDTH * ZONE_WIDTH_FRACTION
         val pairSpan = zoneWidth * 2.0
@@ -247,52 +324,58 @@ class TouchControls : Container() {
     }
 
     private fun hitPauseButton(x: Double, y: Double): Boolean =
-        x >= Constants.GAME_WIDTH - PAUSE_HIT_W && y <= PAUSE_HIT_H
+        x >= pauseX && x < pauseX + pauseW && y >= pauseY && y < pauseY + pauseH
 
     // ------------------------------------------------------------------
     // visuals
     // ------------------------------------------------------------------
 
-    private fun buildZones() {
-        val height = Constants.GAME_HEIGHT * (1.0 - ZONE_TOP_FRACTION)
-        val width = Constants.GAME_WIDTH * ZONE_WIDTH_FRACTION
-        val rightStart = Constants.GAME_WIDTH - width * 2.0
-        val lefts = listOf(0.0, width, rightStart, rightStart + width)
-        val top = Constants.GAME_HEIGHT * ZONE_TOP_FRACTION
-        zones = Container().also { zoneLayer ->
-            for (lane in 0 until 4) {
-                zoneLayer.roundRect(
-                    Size(width - ZONE_GAP, height - ZONE_GAP),
-                    RectCorners(14.0, 14.0, 14.0, 14.0),
-                    fill = Colors.WHITE,
-                ).also {
-                    it.x = lefts[lane] + ZONE_GAP / 2.0
-                    it.y = top + ZONE_GAP / 2.0
-                    it.alpha = 0.10
+    /**
+     * `PlayState.initPauseSprites`: the `pauseButton` sparrow's first frame at
+     * scale 0.8, 35 px from the top-right corner, over `pauseCircle` at alpha
+     * 0.1.
+     */
+    private fun buildPauseButton() {
+        val button = Container()
+        val atlas = KnfFiles.resolve("pauseButton", ".xml")?.let { TextureAtlas.tryLoad(it) }
+        val frame = atlas?.frame("pause0000") ?: atlas?.firstFrame()
+
+        if (atlas != null && frame != null) {
+            pauseW = frame.logicalWidth * PAUSE_SCALE
+            pauseH = frame.logicalHeight * PAUSE_SCALE
+            pauseX = Constants.GAME_WIDTH - pauseW - PAUSE_MARGIN
+            pauseY = PAUSE_MARGIN
+
+            // `pauseCircle` is centred on the button and draws behind it.
+            KnfFiles.resolve("pauseCircle", ".png")?.let { path ->
+                KnfFiles.bitmapOrNull(path)?.let { bmp ->
+                    button.image(bmp).also { img ->
+                        img.anchor = Anchor2D.TOP_LEFT
+                        img.scaleX = PAUSE_CIRCLE_SCALE_X
+                        img.scaleY = PAUSE_CIRCLE_SCALE_Y
+                        img.smoothing = true
+                        img.alpha = PAUSE_CIRCLE_ALPHA
+                        img.x = pauseX + pauseW / 2.0 - bmp.width * PAUSE_CIRCLE_SCALE_X / 2.0
+                        img.y = pauseY + pauseH / 2.0 - bmp.height * PAUSE_CIRCLE_SCALE_Y / 2.0
+                    }
                 }
             }
-            zoneLayer.visible = !menuMode
-            addChild(zoneLayer)
-        }
-    }
 
-    private fun buildPauseButton() {
-        pauseButton = Container().also { button ->
-            button.roundRect(
-                Size(56.0, 40.0),
-                RectCorners(8.0, 8.0, 8.0, 8.0),
-                fill = Colors.WHITE,
-            ).also { it.alpha = 0.22 }
-            button.text("II", textSize = 20.0, color = Colors.WHITE).also {
-                it.x = 28.0 - it.width / 2.0
-                it.y = 20.0 - it.height / 2.0
+            // The atlas frame is trimmed: its logical box starts at (x, y) and
+            // the artwork is inset by -frameX / -frameY.
+            button.image(atlas.slice(frame)).also { img ->
+                img.anchor = Anchor2D.TOP_LEFT
+                img.scaleX = PAUSE_SCALE
+                img.scaleY = PAUSE_SCALE
+                img.smoothing = true
+                img.x = pauseX - frame.frameX * PAUSE_SCALE
+                img.y = pauseY - frame.frameY * PAUSE_SCALE
             }
-            button.x = Constants.GAME_WIDTH - 64.0
-            button.y = 12.0
-            button.alpha = 0.7
-            button.visible = !menuMode
-            addChild(button)
         }
+
+        button.visible = !menuMode
+        pauseButton = button
+        addChild(button)
     }
 
     // ------------------------------------------------------------------
@@ -311,17 +394,14 @@ class TouchControls : Container() {
         const val NAV_VERTICAL = -1
         const val NAV_HORIZONTAL = 1
 
-        /** Gameplay zones cover the bottom part of the screen. */
+        /** Desktop fallback zones cover the bottom part of the screen. */
         const val ZONE_TOP_FRACTION = 0.55
 
         /**
-         * Width of one zone as a fraction of the stage width. Zones come in two
-         * pairs hugging the screen edges, so the middle stays clear.
+         * Width of one fallback zone as a fraction of the stage width. Zones
+         * come in two pairs hugging the screen edges, so the middle stays clear.
          */
         const val ZONE_WIDTH_FRACTION = 0.20
-
-        /** Inset between neighbouring zone rects, in stage pixels. */
-        const val ZONE_GAP = 12.0
 
         /** A tap must stay within this distance of its start. */
         const val TAP_SLOP_PX = 12.0
@@ -329,8 +409,11 @@ class TouchControls : Container() {
         /** Drag distance that locks the gesture onto a navigation axis. */
         const val DRAG_NAV_PX = 40.0
 
-        /** Pause button hit area: top-right corner. */
-        const val PAUSE_HIT_W = 76.0
-        const val PAUSE_HIT_H = 68.0
+        /** `pauseButton.setPosition((FlxG.width - width) - 35, 35)` + scale 0.8. */
+        const val PAUSE_SCALE = 0.8
+        const val PAUSE_MARGIN = 35.0
+        const val PAUSE_CIRCLE_SCALE_X = 0.84
+        const val PAUSE_CIRCLE_SCALE_Y = 0.8
+        const val PAUSE_CIRCLE_ALPHA = 0.1
     }
 }

@@ -91,4 +91,6 @@ actual object KnfPlatform {
     }
 
     actual val isMobile: Boolean get() = true
+
+    actual val isAndroid: Boolean get() = true
 }

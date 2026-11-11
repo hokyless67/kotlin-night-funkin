@@ -1736,10 +1736,14 @@ class SongSelectScene : Scene() {
         val overlay = Container()
         root.addChild(overlay)
         val images = reveal.placements.map { placement ->
-            Image(KnfFiles.bitmap("shared/images/${placement.path}.png")).also { img ->
+            val bmp = KnfFiles.bitmap("shared/images/${placement.path}.png")
+            Image(bmp, Anchor2D.CENTER).also { img ->
                 img.smoothing = true
-                img.x = placement.x
-                img.y = placement.y
+                // `StickerSprite` uses the centred origin, so the peel-off
+                // copies have to spin/pop around their middle too - otherwise
+                // the rotated artwork drifts away from where it covered.
+                img.x = placement.x + bmp.width / 2.0
+                img.y = placement.y + bmp.height / 2.0
                 img.rotation = placement.angleDegrees.degrees
                 img.scaleX = placement.popScale
                 img.scaleY = placement.popScale

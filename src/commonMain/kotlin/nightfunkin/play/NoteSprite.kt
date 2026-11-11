@@ -262,6 +262,11 @@ class NoteSprite(
     directionIndex: Int,
     private val noteStyle: NoteStyle,
     slice: AtlasSlice?,
+    /**
+     * FNF's touch "Arrows" scheme shrinks note heads a little relative to the
+     * enlarged receptors (`noteSprite.scale.scale(trueScale)`); 1 elsewhere.
+     */
+    private val scaleMultiplier: Double = 1.0,
 ) : Container() {
 
     var directionIndex: Int = directionIndex
@@ -309,8 +314,8 @@ class NoteSprite(
                 // (`centerOffsets` + `centerOrigin` cancel out), so the note head
                 // is anchored the same way as the receptor it has to land on.
                 it.anchor = Anchor2D.TOP_LEFT
-                it.scaleX = noteStyle.scale.toDouble()
-                it.scaleY = noteStyle.scale.toDouble()
+                it.scaleX = noteStyle.scale.toDouble() * scaleMultiplier
+                it.scaleY = noteStyle.scale.toDouble() * scaleMultiplier
                 it.setPixelArt(noteStyle.isPixel)
             }
         }
@@ -329,15 +334,15 @@ class NoteSprite(
         val img = head
         if (img != null && slice != null) {
             img.bitmap = slice
-            img.scaleX = noteStyle.scale.toDouble()
-            img.scaleY = noteStyle.scale.toDouble()
+            img.scaleX = noteStyle.scale.toDouble() * scaleMultiplier
+            img.scaleY = noteStyle.scale.toDouble() * scaleMultiplier
         }
     }
 
     /** Displayed width of the note head, which FNF uses to centre it on the lane. */
     fun displayWidth(): Double {
         val slice = noteStyle.noteSlice(directionIndex) ?: return Constants.STRUMLINE_SIZE.toDouble()
-        return slice.width.toDouble() * noteStyle.scale.toDouble()
+        return slice.width.toDouble() * noteStyle.scale.toDouble() * scaleMultiplier
     }
 
     /** Lazily attaches (or refreshes) the sustain tail. */
