@@ -1,6 +1,12 @@
 import korlibs.korge.gradle.Orientation
 import korlibs.korge.gradle.targets.ios.iosXcodegenExt
+import korlibs.korge.gradle.targets.windows.ICO2
 import org.gradle.language.jvm.tasks.ProcessResources
+import java.awt.RenderingHints
+import java.awt.image.BufferedImage
+import java.io.File
+import java.util.jar.JarFile
+import javax.imageio.ImageIO
 
 plugins {
     // The KorGE multiplatform plugin brings its own Kotlin (2.0.0), JVM/Android/iOS
@@ -98,6 +104,102 @@ tasks.matching { it.name == "createAndroidManifest" }.configureEach {
             "android:roundIcon=\"@mipmap/icon\"",
         )
         if (patched != text) manifest.writeText(patched)
+    }
+}
+
+/**
+ * Native desktop app image built with `jpackage` (part of the JDK).
+ *
+ * While the game runs through `gradlew runJvm`, the OS process list shows the
+ * Java launcher ("OpenJDK Platform binary" / `javaw.exe`): Windows Task
+ * Manager takes that label from the executable's version information, so it
+ * cannot be changed from inside the game. `jpackage` produces a launcher with
+ * our own name, description and icon instead, which is what Task Manager,
+ * Activity Monitor and the Dock display.
+ *
+ * Output (app image, no installer/WiX needed):
+ *   build/jpackage/Kotlin Night Funkin/Kotlin Night Funkin.exe   (Windows)
+ *   build/jpackage/Kotlin Night Funkin.app                      (macOS)
+ *
+ * The game still reads the FNF `assets` tree from the working directory (or
+ * `KNF_ASSETS`). `KnfPlatform.jvm` also walks up a few parents, so the app
+ * image under `build/jpackage/<name>/` finds the repository's
+ * `Funkin-0.8.6-Source/assets` even when launched by double-clicking.
+ */
+val knfDesktopAppName = "Kotlin Night Funkin"
+
+tasks.register<Exec>("knfDesktopApp") {
+    group = "korge package"
+    description = "Builds a native desktop app image named '$knfDesktopAppName' (icon + Task Manager name) via jpackage."
+
+    dependsOn("packageJvmFatJar")
+
+    doFirst {
+        val buildDir = layout.buildDirectory.get().asFile
+        // `packageJvmFatJar` is created by the Korge plugin with its own
+        // (deprecated) task type, so read its archive from the task outputs
+        // instead of casting to a specific Jar class.
+        val fatJar = tasks.named("packageJvmFatJar").get().outputs.files
+            .firstOrNull { it.extension == "jar" }
+            ?: error("KNF: packageJvmFatJar produced no jar")
+
+        // jpackage copies the whole --input directory into the app image.
+        val inputDir = File(buildDir, "jpackage-input").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        fatJar.copyTo(File(inputDir, "app.jar"), overwrite = true)
+
+        // jpackage wants a .ico on Windows (other platforms use their own
+        // formats and would reject it). The format allows a PNG payload for
+        // the 256x256 entry, which the Korge plugin's ICO writer emits.
+        val isWindows = System.getProperty("os.name").orEmpty().startsWith("Windows", ignoreCase = true)
+        val icoFile = File(buildDir, "jpackage-assets/icon.ico").apply { parentFile.mkdirs() }
+        if (isWindows) {
+            val source = ImageIO.read(layout.projectDirectory.file("icon.png").asFile)
+            val size = 256
+            val scaled = BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB)
+            scaled.createGraphics().apply {
+                setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR)
+                setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY)
+                drawImage(source, 0, 0, size, size, null)
+                dispose()
+            }
+            icoFile.writeBytes(ICO2.encode(listOf(scaled)))
+        }
+
+        // `java -jar` reads `Add-Opens` from the jar manifest; the jpackage
+        // launcher does not, so forward the same flags explicitly.
+        val addOpens = runCatching {
+            JarFile(fatJar).use { it.manifest?.mainAttributes?.getValue("Add-Opens") }
+        }.getOrNull()?.split(Regex("\\s+"))?.filter { it.isNotBlank() }.orEmpty()
+
+        val outputDir = File(buildDir, "jpackage")
+        File(outputDir, knfDesktopAppName).deleteRecursively()
+
+        val binDir = File(System.getProperty("java.home"), "bin")
+        val jpackage = listOf("jpackage.exe", "jpackage")
+            .map { File(binDir, it) }
+            .firstOrNull { it.isFile }
+            ?: error("KNF: jpackage not found in $binDir (a JDK 14+ is required)")
+
+        val command = mutableListOf(
+            "--type", "app-image",
+            "--name", knfDesktopAppName,
+            "--app-version", version.toString(),
+            "--description", knfDesktopAppName,
+            "--vendor", "nightfunkin",
+            "--input", inputDir.path,
+            "--main-jar", "app.jar",
+            "--main-class", "nightfunkin.MainKt",
+            "--dest", outputDir.path,
+            "--java-options", "-Xmx3g",
+        )
+        if (isWindows) command += listOf("--icon", icoFile.path)
+        for (open in addOpens) command += listOf("--java-options", "--add-opens=$open")
+
+        executable = jpackage.path
+        setArgs(command)
     }
 }
 
