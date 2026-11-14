@@ -129,8 +129,12 @@ actual object KnfPlatform {
      * Lime window fills it, so ask for the same explicitly.
      */
     actual fun prepareWindow(window: Any?) {
+        // The window owns the activity; keep it for the video overlay, whose
+        // `TextureView` has to be attached to the activity's content view.
+        val activity = (window as? AndroidGameWindow)?.activity
+        if (activity != null) AndroidContextHolder.rememberActivity(activity)
         if (cutoutModeApplied || Build.VERSION.SDK_INT < 28) return
-        val activity = (window as? AndroidGameWindow)?.activity ?: return
+        if (activity == null) return
         cutoutModeApplied = true
         runCatching {
             activity.runOnUiThread {

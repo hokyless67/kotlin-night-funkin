@@ -57,6 +57,13 @@ interface SongCutscene {
     /** Freezes cutscene-owned audio while the pause menu is open. */
     fun pause() {}
 
+    /**
+     * Ticks every frame while the pause menu is open. [update] is frozen there,
+     * so this is where a cutscene can finish work that has to happen anyway
+     * (a native video player hands its frozen frame back to the scene).
+     */
+    fun updatePaused() {}
+
     /** Resumes cutscene-owned audio after the pause menu closes. */
     fun resume() {}
 

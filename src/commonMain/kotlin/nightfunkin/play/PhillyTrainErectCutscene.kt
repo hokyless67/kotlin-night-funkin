@@ -9,6 +9,7 @@ import korlibs.io.resources.Resourceable
 import korlibs.korge.view.Container
 import korlibs.korge.view.Text
 import korlibs.korge.view.addUpdater
+import korlibs.korge.view.filter.filter
 import nightfunkin.audio.MusicPlayer
 import nightfunkin.core.AnimateAtlas
 import nightfunkin.core.AnimateSpriteView
@@ -121,6 +122,13 @@ class PhillyTrainErectCutscene(private val host: CutsceneHost) : SongCutscene {
         picoOpponent.x = dad.first - 333.0
         picoOpponent.y = dad.second - 144.5
         this.picoOpponent = picoOpponent
+
+        // `phillyTrainErect.hxc`: the cutscene doppelgangers, the blood pool and
+        // the train share the stage's `colorShader` (-5 / -26 / 0 / -16).
+        val cutsceneTint = AdjustColorFilter(-5.0, -26.0, 0.0, -16.0)
+        blood.filter = cutsceneTint
+        picoPlayer.filter = cutsceneTint
+        picoOpponent.filter = cutsceneTint
 
         val cigarette = loadCigarette()
         this.cigarette = cigarette

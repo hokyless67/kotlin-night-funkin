@@ -6,6 +6,7 @@ import korlibs.image.bitmap.sliceWithSize
 import korlibs.korge.render.RenderContext
 import korlibs.korge.scene.Scene
 import korlibs.korge.view.Container
+import korlibs.korge.view.FixedSizeContainer
 import korlibs.korge.view.SContainer
 import korlibs.korge.view.SolidRect
 import korlibs.korge.view.View
@@ -18,6 +19,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import korlibs.math.geom.Size
 import nightfunkin.audio.MusicPlayer
 import nightfunkin.audio.SfxChannel
 import nightfunkin.audio.SfxPlayer
@@ -293,11 +295,24 @@ class PlayScene : Scene() {
 
     // ---- stage layout (screen coordinates, inside the camera layer) -------
     private lateinit var stageLayer: Container
+    /**
+     * Screen-sized host for [cameraLayer].
+     *
+     * Philly Streets' rain is a `FlxG.camera` filter in FNF, so it has to run
+     * on a texture that is exactly the game viewport. KorGE sizes a filter's
+     * render target from the view's *local bounds*, and the world layer's
+     * bounds span the whole stage, so the camera goes inside a fixed-size
+     * container and the filter is attached there.
+     */
+    private lateinit var worldHost: FixedSizeContainer
     private lateinit var opponent: Character
     /** FNF only creates a GF when the song names one; the Tutorial has none. */
     private var girlfriend: Character? = null
     private lateinit var player: Character
     private var stageProps: Stage? = null
+
+    /** Per-stage shaders (wiggle, rain, traffic lights, tinted props). */
+    private var stageEffects: StageEffects? = null
 
     /** Nene/Otis' A-Bot speaker rigs, kept in sync with their character. */
     private val speakerSupports = ArrayList<SpeakerSupport>()
@@ -434,7 +449,11 @@ class PlayScene : Scene() {
         buildStageBackdrop(this)
 
         cameraLayer = Container()
-        addChild(cameraLayer)
+        worldHost = FixedSizeContainer(
+            Size(Constants.GAME_WIDTH.toDouble(), Constants.GAME_HEIGHT.toDouble()),
+        )
+        worldHost.addChild(cameraLayer)
+        addChild(worldHost)
 
         camera = GameplayCamera(cameraLayer, Constants.GAME_WIDTH.toDouble(), Constants.GAME_HEIGHT.toDouble())
         conductor.update(prePosition, false)
@@ -522,6 +541,19 @@ class PlayScene : Scene() {
         camera.setFocusImmediate(focusX, focusY)
         camera.stageZoom = stageFile.cameraZoom
         camera.setZoomImmediate(stageFile.cameraZoom)
+
+        // Stage-script shaders. Built after the props and the camera exist;
+        // the rain needs the viewport rect, the rest just needs `getNamedProp`.
+        stageEffects = stageProps?.let { stageObj ->
+            StageEffects(
+                stageId = chart.stage,
+                songId = song.id,
+                stage = stageObj,
+                world = worldHost,
+                camera = camera,
+                songLengthMs = { music.totalMs.takeIf { it > 0.0 } ?: fallbackSongLengthMs() },
+            )
+        }
 
         val hudContainer = Container()
         addChild(hudContainer)
@@ -631,7 +663,10 @@ class PlayScene : Scene() {
             }
             // `danceEvery` counts beats and defaults to one, so everyone re-poses
             // on every quarter note.
-            if (step % 4 == 0) onBeat()
+            if (step % 4 == 0) {
+                onBeat()
+                stageEffects?.onBeat(conductor.currentBeat)
+            }
         }
 
         nextEventIndex = 0
@@ -736,7 +771,32 @@ class PlayScene : Scene() {
             // masks are painted over the character's *atlas*, so the filter
             // needs the atlas rect of every frame the character draws.
             if (rim.usesAltMask) character.bindRimMask(rim)
+            return
         }
+
+        // Plain `AdjustColorShader`, shared by every character of these stages.
+        val tint = stageCharacterTint(slot) ?: return
+        tint.filtering = !character.isPixel
+        layer.filter = tint
+    }
+
+    /**
+     * `addCharacter` in the stages that tint everyone with an
+     * `AdjustColorShader` (Week 1/5/6/7 Erect, Week 2 Christmas).
+     */
+    private fun stageCharacterTint(slot: String): AdjustColorFilter? = when (stageFile.id) {
+        "mainStageErect" -> when (slot) {
+            // colorShaderBf / colorShaderGf / colorShaderDad.
+            "bf" -> AdjustColorFilter(-23.0, 12.0, 7.0, 0.0)
+            "gf" -> AdjustColorFilter(-30.0, -9.0, -4.0, 0.0)
+            "dad" -> AdjustColorFilter(-33.0, -32.0, -23.0, 0.0)
+            else -> null
+        }
+        "mallXmasErect" -> AdjustColorFilter(0.0, 5.0, 0.0, 20.0)
+        "limoRideErect" -> AdjustColorFilter(-30.0, -30.0, 0.0, -20.0)
+        "phillyStreetsErect" -> AdjustColorFilter(-20.0, -5.0, -25.0, -40.0)
+        "phillyTrainErect" -> AdjustColorFilter(-5.0, -26.0, 0.0, -16.0)
+        else -> null
     }
 
     /** `tankmanBattlefieldErect.hxc`'s `addCharacter` (Week 7 Erect). */
@@ -1215,8 +1275,15 @@ class PlayScene : Scene() {
         }
 
         override fun addCutsceneView(view: View) {
-            // Added after the black screen, so it is the topmost layer.
-            sceneRoot.addChild(view)
+            // Added after the black screen, so it is the topmost layer. A view
+            // added while the pause menu is open (the frozen frame of a native
+            // video player) belongs right below the menu instead of covering it.
+            val menu = pauseMenu
+            if (menu != null && menu.parent === sceneRoot) {
+                sceneRoot.addChildAt(view, menu.index)
+            } else {
+                sceneRoot.addChild(view)
+            }
         }
 
         override fun removeCutsceneView(view: View) {
@@ -1381,7 +1448,12 @@ class PlayScene : Scene() {
 
         handleOffsetKeys()
 
-        if (paused) return
+        if (paused) {
+            // A cutscene's `update` is frozen while the menu is open, but a
+            // native video still has to move its paused picture into the scene.
+            cutscene?.updatePaused()
+            return
+        }
 
         // `GameOverSubState` over a frozen PlayState: the death camera, the
         // dying pose and the retry/quit inputs, while everything else waits.
@@ -1482,6 +1554,11 @@ class PlayScene : Scene() {
 
         val tStage = realNowMs()
         stageProps?.update(dt, camera.scrollX, camera.scrollY)
+        stageEffects?.update(
+            dt,
+            conductor.songPosition.toDouble(),
+            conductor.beatLengthMs.toDouble(),
+        )
         phaseStageMs = realNowMs() - tStage
 
         if (avsyncDebug && !startingSong) measureAvSync()
@@ -2217,6 +2294,7 @@ class PlayScene : Scene() {
 
     private fun goodNoteHit(note: NoteSprite) {
         val hitStart = realNowMs()
+        stageEffects?.onNoteHit()
         val timingError = conductor.songPosition - note.strumTime
         val absError = abs(timingError)
 
@@ -2481,6 +2559,9 @@ class PlayScene : Scene() {
         deathQuoteChannel = null
         deathMusicTargetVolume = 1.0
         tankmanRimFilter = null
+        // `phillyStreets*.hxc` / `phillyBlazin.hxc` clear the camera filters
+        // on game over so the rain does not draw over the death screen.
+        stageEffects?.onGameOver()
 
         val overlay = sceneRoot.solidRect(
             Constants.GAME_WIDTH * 2.0,

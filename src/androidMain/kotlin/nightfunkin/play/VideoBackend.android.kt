@@ -1,10 +1,15 @@
 package nightfunkin.play
 
 /**
- * Android has no out-of-the-box way to pipe an MP4 into raw RGBA frames at
- * gameplay framerate (MediaCodec + ImageReader is a whole pipeline of its
- * own), so video cutscenes are skipped gracefully on mobile. A native decoder
- * can be dropped in here later without touching the cutscene code.
+ * Android does not use the frame pipeline: there is no out-of-the-box way to
+ * pipe an MP4 into raw RGBA frames at gameplay framerate (MediaCodec +
+ * ImageReader is a whole pipeline of its own), so video cutscenes play through
+ * [AndroidVideoController], which drives ExoPlayer and a `TextureView` above
+ * the game surface (see [createNativeVideoController]).
+ *
+ * Keeping this backend unsupported means [VideoPlayback] is never built on
+ * Android, so a missing native player degrades to "cutscene skipped", exactly
+ * as it did before.
  */
 actual val videoBackend: VideoBackend = object : VideoBackend {
     override val isSupported: Boolean get() = false

@@ -1,5 +1,7 @@
 package nightfunkin.core
 
+import korlibs.korge.view.RectBase
+import korlibs.korge.view.Text
 import korlibs.korge.view.View
 import korlibs.korge.view.filter.IdentityFilter
 import korlibs.korge.view.filter.filter
@@ -21,10 +23,27 @@ import korlibs.korge.view.filter.filter
  * result.pixelPerfectPosition = isPixel;
  * ```
  *
- * KorGE 6 has no `antialiasing` flag; sampling is chosen by the view's `filter`,
- * where [IdentityFilter.Nearest] is the non-interpolating path - the same pair
- * `Scene` uses for its own `sceneSmoothing`.
+ * `antialiasing = false` is only a texture-sampling mode in FNF. KorGE's
+ * `Image`/`Text` expose exactly that as `smoothing`, so use it directly:
+ * a `filter` here would wrap every pixel sprite in a render-to-texture pass.
+ * On a pixel week that is dozens of full off-screen passes per frame (notes,
+ * holds, receptors, judgements, combo digits, props, characters), which is
+ * what made those levels crawl on mobile.
+ *
+ * Views without a sampling flag (custom containers) keep the nearest filter
+ * as a fallback.
  */
 fun View.setPixelArt(isPixel: Boolean) {
-    filter = if (isPixel) IdentityFilter.Nearest else null
+    when (this) {
+        is RectBase -> {
+            smoothing = !isPixel
+            // Clear a Nearest filter left by the old implementation; never
+            // touch a real shader filter (rim lights, stage effects).
+            if (!isPixel && filter is IdentityFilter) filter = null
+        }
+
+        is Text -> smoothing = !isPixel
+
+        else -> filter = if (isPixel) IdentityFilter.Nearest else null
+    }
 }

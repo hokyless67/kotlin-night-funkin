@@ -1,15 +1,23 @@
 package nightfunkin.play
 
+import korlibs.korge.view.Image
+import korlibs.math.geom.Anchor2D
 import nightfunkin.core.KnfFmt
 import nightfunkin.platform.KnfEnv
 
 /**
  * FNF's `VideoCutscene` for a single movie file.
  *
- * Decoding happens on the platform [videoBackend] (the system `ffmpeg` on
- * desktop, nothing on mobile — those platforms skip the cutscene gracefully).
- * The movie's audio plays through [MusicPlayer]; its playback clock drives
- * which video frame is displayed, so the two do not drift.
+ * Two playback paths exist, picked by the platform:
+ *
+ *  - a native controller ([createNativeVideoController]) that plays the movie
+ *    itself - Android's ExoPlayer into a `TextureView` above the game surface.
+ *    The movie owns its own audio and clock, so the game only starts it and
+ *    waits for it to end;
+ *  - [VideoPlayback], which decodes frames on the desktop [videoBackend] (the
+ *    system `ffmpeg`), plays the extracted audio on [MusicPlayer] and paces the
+ *    picture from the wall clock corrected against the audio.
+ *
  * `ffmpeg`/`ffprobe` can be overridden with `KNF_FFMPEG`/`KNF_FFPROBE` or
  * `-Dknf.ffmpeg=...`/`-Dknf.ffprobe=...` on desktop.
  */
@@ -21,7 +29,9 @@ class VideoSongCutscene(
     private val initialCameraZoom: Double? = null,
 ) : SongCutscene {
 
-    private val player = VideoPlayback(videoPath)
+    private val native = createNativeVideoController(videoPath)
+    private val player: VideoPlayback? = if (native == null) VideoPlayback(videoPath) else null
+
     private var prepared = false
     private var started = false
     private var fading = false
@@ -32,8 +42,13 @@ class VideoSongCutscene(
     private var maxElapsedMs = 0.0
     private var lastDebugMs = -1.0
 
+    /** Frozen picture drawn by the game while the pause menu covers the video. */
+    private var stillView: Image? = null
+
+    private val error: String? get() = native?.error ?: player?.error
+
     /** True when the movie is prepared and can be shown after a scripted prelude. */
-    val ready: Boolean get() = prepared && !done && player.error == null
+    val ready: Boolean get() = prepared && !done && error == null
 
     /**
      * `VideoCutscene.hideVideo()`: the movie keeps decoding and its audio keeps
@@ -42,14 +57,16 @@ class VideoSongCutscene(
      * camera/character sequence.
      */
     fun hideForPrelude() {
-        player.image?.visible = false
+        native?.setVisible(false)
+        player?.image?.visible = false
         host.setBlackScreenAlpha(0.0)
     }
 
     /** `VideoCutscene.showVideo()` after the scripted prelude. */
     fun showFromPrelude() {
         host.setBlackScreenAlpha(1.0)
-        player.image?.visible = true
+        native?.setVisible(true)
+        player?.image?.visible = true
     }
 
     override suspend fun start() {
@@ -58,6 +75,24 @@ class VideoSongCutscene(
         host.showBlackScreen()
         host.setBlackScreenAlpha(1.0)
 
+        val native = this.native
+        if (native != null) {
+            prepared = native.prepare()
+            if (!prepared) {
+                println("KNF: video cutscene skipped ($videoPath): ${native.error ?: "unknown error"}")
+                host.hideBlackScreen()
+                host.setHudVisible(true)
+                done = true
+                return
+            }
+            println(
+                "KNF: video cutscene '$videoPath' " +
+                    "(native, ${KnfFmt.decimals(native.durationMs / 1000.0, 2)}s)"
+            )
+            return
+        }
+
+        val player = player ?: return
         prepared = player.prepare()
         if (!prepared) {
             println("KNF: video cutscene skipped ($videoPath): ${player.error ?: "unknown error"}")
@@ -81,12 +116,32 @@ class VideoSongCutscene(
 
     /** `VideoCutscene.pauseVideo()`. */
     override fun pause() {
-        player.pauseAudio()
+        val native = this.native
+        if (native != null) native.pauseForMenu() else player?.pauseAudio()
+    }
+
+    /**
+     * A native player draws above the game, so while the pause menu is open its
+     * frozen frame has to be moved into the scene: FNF pauses the movie but
+     * keeps it visible behind the menu's dark backdrop.
+     */
+    override fun updatePaused() {
+        val native = this.native ?: return
+        if (!prepared || done) return
+        native.takeStill()?.let { addStill(it) }
     }
 
     /** `VideoCutscene.resumeVideo()`. */
     override fun resume() {
-        player.resumeAudio()
+        val native = this.native
+        if (native != null) {
+            // Show the surface first: it carries the very same picture as the
+            // still, so the swap cannot flash black for a frame.
+            native.resume()
+            clearStill()
+        } else {
+            player?.resumeAudio()
+        }
     }
 
     /** `VideoCutscene.finishVideo()`: remove the video and start the 0.5 s fade. */
@@ -102,7 +157,13 @@ class VideoSongCutscene(
         maxElapsedMs = 0.0
         lastDebugMs = -1.0
         host.setHudVisible(false)
-        player.restart()
+        val native = this.native
+        if (native != null) {
+            native.restart()
+            clearStill()
+        } else {
+            player?.restart()
+        }
         started = true
         println("KNF: video cutscene restarted ($videoPath)")
     }
@@ -126,6 +187,32 @@ class VideoSongCutscene(
             return false
         }
 
+        val native = this.native
+        if (native != null) {
+            if (!started) {
+                started = true
+                native.play()
+            }
+            val position = native.positionMs
+            if (position > maxElapsedMs) maxElapsedMs = position
+            if (DEBUG && maxElapsedMs - lastDebugMs >= 1000.0) {
+                lastDebugMs = maxElapsedMs
+                println("KNF: video ${native.debugState()}")
+            }
+            val decodeError = native.error
+            if (decodeError != null) {
+                println("KNF: video cutscene decode error ($videoPath): $decodeError")
+                beginFade()
+            } else if (native.ended ||
+                (native.durationMs > 0.0 && position >= native.durationMs - END_EPSILON_MS)
+            ) {
+                // `FunkinVideoSprite.bitmap.onEndReached` -> `finishVideo(0.5)`.
+                beginFade()
+            }
+            return false
+        }
+
+        val player = player ?: return false
         if (!started) {
             started = true
             player.playAudio()
@@ -160,22 +247,49 @@ class VideoSongCutscene(
         fadeStartZoom = host.cameraZoom
 
         // `vid.stop(); remove(vid); camHUD.visible = true;`
-        player.stopPlayback()
+        clearStill()
+        val native = this.native
+        if (native != null) native.stop() else player?.stopPlayback()
         if (DEBUG) println("KNF: video playback stopped")
-        player.image?.let { host.removeCutsceneView(it) }
+        player?.image?.let { host.removeCutsceneView(it) }
         host.setHudVisible(true)
     }
 
     override fun destroy() {
-        // Remove the view before close() clears the player's reference.
-        player.image?.let { host.removeCutsceneView(it) }
-        player.close()
+        // Remove the views before close() clears the player's references.
+        clearStill()
+        player?.image?.let { host.removeCutsceneView(it) }
+        native?.close()
+        player?.close()
         host.hideBlackScreen()
+    }
+
+    /** Draws a captured native frame at the same place the movie surface had. */
+    private fun addStill(still: NativeVideoStill) {
+        if (stillView != null) return
+        val view = Image(still.bitmap, Anchor2D.CENTER, smoothing = true)
+        view.x = still.x
+        view.y = still.y
+        if (still.width > 0.0 && still.height > 0.0) {
+            view.scaleX = still.width / still.bitmap.width
+            view.scaleY = still.height / still.bitmap.height
+        }
+        stillView = view
+        host.addCutsceneView(view)
+    }
+
+    private fun clearStill() {
+        val view = stillView ?: return
+        stillView = null
+        host.removeCutsceneView(view)
     }
 
     private companion object {
         /** `finishVideo(0.5)`. */
         const val FADE_SECONDS = 0.5
+
+        /** End tolerance for players that report a position instead of `ended`. */
+        const val END_EPSILON_MS = 100.0
 
         val DEBUG = KnfEnv["KNF_DEBUG_VIDEO"] == "1"
 
@@ -234,6 +348,7 @@ class TwoHotEndingCutscene(private val host: CutsceneHost) : SongCutscene {
 
     override val pauseMode: CutscenePauseMode get() = video.pauseMode
     override fun pause() = video.pause()
+    override fun updatePaused() = video.updatePaused()
     override fun resume() = video.resume()
     override fun skip() = video.skip()
 

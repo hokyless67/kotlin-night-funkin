@@ -387,4 +387,11 @@ dependencies {
     // Common (all targets) libraries. KorGE itself and korlibs come from the plugin.
     add("commonMainImplementation", "org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     add("commonMainImplementation", "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+
+    // Android video cutscenes play through the framework media stack instead
+    // of the desktop `ffmpeg` pipeline: ExoPlayer decodes H.264/AAC (`.mp4`)
+    // and H.264/Vorbis in Matroska (`.mkv`) with hardware acceleration and
+    // exposes the picture as a `TextureView` above the game surface. 1.1.1 is
+    // the newest line that still builds against `compileSdk 33`.
+    add("androidMainImplementation", "androidx.media3:media3-exoplayer:1.1.1")
 }

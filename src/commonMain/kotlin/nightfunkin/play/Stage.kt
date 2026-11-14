@@ -157,6 +157,9 @@ class Stage(id: String) : Container() {
     /** Props addressable by their JSON `name`, like FNF's `getNamedProp`. */
     private val namedProps = LinkedHashMap<String, Container>()
 
+    /** `StagePropData.isPixel` for each named prop (FNF's `antialiasing`). */
+    private val propIsPixel = HashMap<String, Boolean>()
+
     /** Per-prop transform state used to emulate Flixel scroll factors. */
     private class PlacedProp(
         val container: Container,
@@ -219,6 +222,7 @@ class Stage(id: String) : Container() {
             if (prop.name.isNotEmpty()) {
                 namedProps[prop.name] = img
                 placedByName[prop.name] = placed
+                propIsPixel[prop.name] = prop.isPixel
             }
         }
 
@@ -265,6 +269,15 @@ class Stage(id: String) : Container() {
         prop.container.x = x + (1.0 - prop.scrollX) * lastScrollX
         prop.container.y = y + (1.0 - prop.scrollY) * lastScrollY
     }
+
+    /** FNF's `getNamedProp(name)`, used by the per-stage shader setup. */
+    fun namedProp(name: String): Container? = namedProps[name]
+
+    /** Every `name` addressable through [namedProp]. */
+    val namedPropNames: Set<String> get() = namedProps.keys
+
+    /** `StagePropData.isPixel`: FNF draws these with `antialiasing = false`. */
+    fun namedPropIsPixel(name: String): Boolean = propIsPixel[name] ?: false
 
     /**
      * Adds a stage-script sprite at Flixel's global `zIndex`, exactly like

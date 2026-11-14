@@ -41,13 +41,15 @@ interface VideoFrames {
 }
 
 /**
- * Platform video support behind video cutscenes.
+ * Platform video support behind [VideoPlayback]'s frame pipeline.
  *
  *  - Desktop (JVM): the system `ffmpeg`/`ffprobe` binaries, piped as raw RGBA
  *    frames (see `VideoBackend.jvm.kt`).
- *  - Mobile: no decoder — [isSupported] is false and video cutscenes are
- *    skipped gracefully. A native pipeline (MediaCodec / AVAssetReader) can
- *    slot in here later without touching the cutscene code.
+ *  - Android: no frame pipeline - [isSupported] is false because the cutscene
+ *    plays through [createNativeVideoController] (ExoPlayer + `TextureView`)
+ *    instead. [VideoPlayback] is not even constructed there.
+ *  - iOS: no decoder yet, so [isSupported] is false and video cutscenes are
+ *    skipped gracefully. `AVPlayer` can slot in behind the same controller.
  */
 interface VideoBackend {
     val isSupported: Boolean

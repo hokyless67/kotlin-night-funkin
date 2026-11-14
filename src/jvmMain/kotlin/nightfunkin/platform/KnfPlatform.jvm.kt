@@ -49,9 +49,10 @@ actual object KnfPlatform {
 
     /**
      * `KNF_MOBILE=1` turns the desktop build into a mobile emulator: the
-     * on-screen touch overlay appears (the mouse emulates a finger) and the
-     * video backend behaves like mobile, skipping cutscenes. Asset and save
-     * locations stay desktop, so you can test with your local asset tree.
+     * on-screen touch overlay appears (the mouse emulates a finger) and video
+     * cutscenes are skipped (mobile uses Android's own player, which is not
+     * part of the desktop build). Asset and save locations stay desktop, so you
+     * can test with your local asset tree.
      */
     actual val isMobile: Boolean get() = KnfEnv["KNF_MOBILE"] == "1"
 
