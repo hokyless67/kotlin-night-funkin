@@ -257,6 +257,17 @@ class SongSelectScene : Scene() {
     private var transitioning = false
     private var leaving = false
 
+    /**
+     * `capsuleOnConfirmDefault`'s start sequence: after the confirm pose the
+     * state waits `styleData.getStartDelay()` (1.0 s in `bf.json`) and then
+     * fades the camera to black over 0.2 s before the song loads.
+     */
+    private enum class StartPhase { NONE, DELAY, FADE, DONE }
+
+    private var startPhase = StartPhase.NONE
+    private var startElapsed = 0.0
+    private var startFadeOverlay: SolidRect? = null
+
     /** One `FreeplayState.exitMovers` entry: a layer sliding to [targetX]/[targetY]. */
     private class ExitMover(
         val view: View,
@@ -372,6 +383,18 @@ class SongSelectScene : Scene() {
             addChild(it)
         }
         buildTopUi()
+
+        // `funnyCam.fade(FlxColor.BLACK, 0.2, false, ...)`: the black sheet the
+        // confirm sequence fades in while the song loads. It is created last so
+        // it covers every other layer.
+        startFadeOverlay = solidRect(
+            Constants.GAME_WIDTH.toDouble(),
+            Constants.GAME_HEIGHT.toDouble(),
+            Colors.BLACK,
+        ).also {
+            it.alpha = 0.0
+            it.visible = false
+        }
 
         // If the DJ atlas could not be loaded, do not leave the rest of the UI
         // hidden forever.
@@ -1915,6 +1938,20 @@ class SongSelectScene : Scene() {
         confirmSound?.let { sfx.play(it, 0.7) }
         dj?.let { if (hasDjLabel("Confirm")) it.play("Confirm", loop = false) }
 
+        // `capsuleOnConfirmDefault`: snap the capsule to its resting spot, let
+        // it play the confirm pose (the icon's `confirm`/`confirm-hold`
+        // animation plus the title squash), fade the difficulty dots, then
+        // hold the state for `styleData.getStartDelay()` before switching.
+        val capsule = viewCapsules.getOrNull(selected)
+        capsule?.forcePosition()
+        capsule?.confirm()
+        fadeDots()
+        touchControls?.visible = false
+        startPhase = StartPhase.DELAY
+        startElapsed = 0.0
+        startFadeOverlay?.alpha = 0.0
+        startFadeOverlay?.visible = false
+
         PlayRequest.songId = entry.song.id
         PlayRequest.difficulty = currentDifficulty
         PlayRequest.variation = variation
@@ -1929,7 +1966,6 @@ class SongSelectScene : Scene() {
         // The menu frame is only kept for the entry backdrop and the exit
         // reveal; a song never shows it again.
         dropMenuBackdrop()
-        launch { sceneContainer.changeTo<PlayScene>() }
     }
 
     private fun backToMenu() {
@@ -2309,6 +2345,29 @@ class SongSelectScene : Scene() {
                 }
             }
 
+            when (startPhase) {
+                StartPhase.DELAY -> {
+                    startElapsed += d
+                    if (startElapsed >= START_DELAY_SECONDS) {
+                        startElapsed = 0.0
+                        startPhase = StartPhase.FADE
+                        startFadeOverlay?.visible = true
+                    }
+                }
+
+                StartPhase.FADE -> {
+                    startElapsed += d
+                    val t = (startElapsed / START_FADE_SECONDS).coerceIn(0.0, 1.0)
+                    startFadeOverlay?.alpha = t
+                    if (t >= 1.0) {
+                        startPhase = StartPhase.DONE
+                        launch { sceneContainer.changeTo<PlayScene>() }
+                    }
+                }
+
+                else -> {}
+            }
+
             if (!transitioning && !leaving && !revealActive) {
                 handleInputs(knfInput, d)
             }
@@ -2640,6 +2699,16 @@ class SongSelectScene : Scene() {
     private companion object {
         /** `FreeplayState.goBack`'s longest exit mover (the DJ flies for 0.5 s). */
         private const val EXIT_TIME = 0.5
+
+        /**
+         * `FreeplayStyle.getStartDelay()`: `bf.json` sets `startDelay: 1.0`.
+         * (The pico style's 1.45 s only applies inside the Character Select
+         * substate, which KNF does not run yet.)
+         */
+        private const val START_DELAY_SECONDS = 1.0
+
+        /** `funnyCam.fade(FlxColor.BLACK, 0.2, false, ...)` before the load. */
+        private const val START_FADE_SECONDS = 0.2
 
         /** How long the card's marquees/YEAH!! collage take to fade on exit. */
         private const val CARD_TEXT_FADE = 0.45

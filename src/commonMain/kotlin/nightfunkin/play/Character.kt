@@ -645,18 +645,44 @@ class Character(val id: String) : Container() {
         val order = sprites.keys.toList()
         // `multisparrow` sub-atlas sprites are stored under their asset path,
         // so strip that back off before matching the animation's prefix.
-        fun spriteName(key: String): String {
+        fun ownerOf(key: String): String? {
             for (sub in legacySubAtlases) {
-                if (key.startsWith(sub.prefix)) return key.removePrefix(sub.prefix)
+                if (key.startsWith(sub.prefix)) return sub.prefix
             }
-            return key
+            return null
         }
+
+        fun spriteName(key: String): String {
+            val owner = ownerOf(key) ?: return key
+            return key.removePrefix(owner)
+        }
+
+        // A `multisparrow` animation is built from *one* sheet: the one its
+        // `assetPath` names, or the character's own sheet when it names none.
+        // `FlxSprite.animation.addByPrefix` only ever scans the graphic that is
+        // currently loaded, so it can never see the other sheets.
+        //
+        // This matters because the frames are named identically across them:
+        // `bfChristmas` and the death sheet `BOYFRIEND` both ship
+        // `BF idle dance0000..0013`. Merging every sheet into one name lookup
+        // made Christmas BF's `idle` run 14 jacket frames followed by 14
+        // ordinary ones - the character appeared to alternate outfit on every
+        // beat and the renderer swapped between two 4096x2048 atlases per
+        // frame, which is what caused the stutter.
+        val wantedOwner = def.assetPath
+            ?.takeIf { it.isNotEmpty() }
+            ?.substringAfter(':')
+            ?.let { "$it/" }
+
         // FNF uses `FlxSprite.animation.addByIndices(name, prefix, indices)`,
         // so the indices are relative to the frames matching `prefix`, not to
         // the whole sheet. gfTankmen puts all "GF Crying" frames before the
         // "GF Dancing" ones; treating 30 as a sheet index made every dance
         // pose play a crying frame.
-        val matching = order.indices.filter { spriteName(order[it]).startsWith(def.prefix) }
+        val matching = order.indices.filter { index ->
+            val key = order[index]
+            ownerOf(key) == wantedOwner && spriteName(key).startsWith(def.prefix)
+        }
         if (def.frameIndices.isNullOrEmpty()) return matching
         return def.frameIndices.mapNotNull { matching.getOrNull(it) }
     }

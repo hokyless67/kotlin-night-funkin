@@ -167,6 +167,25 @@ internal class FreeplayCapsule(
     private var pixelIconSprite: SparrowSprite? = null
     private var pixelIconChar: String? = null
 
+    /**
+     * `PixelatedIcon`'s animations.
+     *
+     * Every shipped freeplay icon has a single `idle` frame, so the only
+     * visible icon animation is the confirm pose: `confirm` plays once and
+     * then `confirm-hold` loops, exactly like the `onFinish` hook in
+     * `PixelatedIcon.setCharacter`.
+     */
+    private var iconConfirmFrames: List<TextureAtlas.AtlasFrame> = emptyList()
+    private var iconConfirmHoldFrames: List<TextureAtlas.AtlasFrame> = emptyList()
+    private var iconConfirming = false
+
+    /**
+     * `SongMenuItem.textAppear`: the title squashes `1.7 x 0.2 -> 0.4 x 1.4 ->
+     * 1 x 1` over three 1/24 s frames. Runs on confirm, and in FNF also when
+     * the capsule group becomes visible after the jump-in.
+     */
+    private var textAppearElapsed = -1.0
+
     /** `favHeart` frames; the pop animation parks on the full heart. */
     private val favFrames: List<TextureAtlas.AtlasFrame> =
         favHeartAtlas?.framesByPrefix("favorite heart").orEmpty().sortedBy { it.name }
@@ -342,6 +361,69 @@ internal class FreeplayCapsule(
         bounceActive = false
     }
 
+    /**
+     * `SongMenuItem.forcePosition()`: the capsule is already in place when the
+     * player confirms, so the jump tweens stop and the graphic snaps back to
+     * its resting squash frame before [confirm] runs.
+     */
+    fun forcePosition() {
+        jumpInActive = false
+        jumpOutActive = false
+        lerpEnabled = true
+        bounceActive = false
+        x = targetX
+        y = targetY
+        applySquash(X_FRAMES.lastIndex)
+    }
+
+    /**
+     * `SongMenuItem.confirm()`: the character icon plays its `confirm` pose
+     * (then holds `confirm-hold`) and the title does the `textAppear` squash.
+     * `capsuleOnConfirmDefault` calls this right before the start delay.
+     */
+    fun confirm() {
+        textAppear()
+        val icon = pixelIconSprite ?: return
+        if (iconConfirmFrames.isEmpty()) return
+        iconConfirming = true
+        icon.loop = false
+        icon.play(iconConfirmFrames, restart = true)
+    }
+
+    /** `SongMenuItem.textAppear`: squash the title back to its normal size. */
+    private fun textAppear() {
+        textAppearElapsed = 0.0
+        setTextScale(1.7, 0.2)
+    }
+
+    /**
+     * `CapsuleText.scale` is set on the whole group, so every title layer
+     * (white text and its wide glow) squashes together around the text's
+     * top-left corner.
+     */
+    private fun setTextScale(sx: Double, sy: Double) {
+        songTextClip?.also {
+            it.scaleX = sx
+            it.scaleY = sy
+        }
+        songGlowClip?.also {
+            it.scaleX = sx
+            it.scaleY = sy
+        }
+    }
+
+    private fun updateTextAppear(dt: Double) {
+        if (textAppearElapsed < 0.0) return
+        textAppearElapsed += dt
+        when {
+            textAppearElapsed >= 3.0 / 24.0 -> {
+                textAppearElapsed = -1.0
+                setTextScale(1.0, 1.0)
+            }
+            textAppearElapsed >= 1.0 / 24.0 -> setTextScale(0.4, 1.4)
+        }
+    }
+
     fun setSelected(value: Boolean) {
         if (currentlySelected == value) {
             return
@@ -460,10 +542,22 @@ internal class FreeplayCapsule(
         capsuleSprite?.update(dt)
         rankSprite?.update(dt)
         rankBlurredSprite?.update(dt)
-        pixelIconSprite?.update(dt)
+        pixelIconSprite?.let { icon ->
+            icon.update(dt)
+            // `PixelatedIcon`'s `onFinish`: after the confirm pose, loop the
+            // held frame for the rest of the start delay.
+            if (iconConfirming && icon.finished) {
+                iconConfirming = false
+                if (iconConfirmHoldFrames.isNotEmpty()) {
+                    icon.loop = true
+                    icon.play(iconConfirmHoldFrames, restart = true)
+                }
+            }
+        }
         favIcon?.update(dt)
         favIconBlurred?.update(dt)
         updateMarquee(dt)
+        updateTextAppear(dt)
         // Text bounds are only known after the first render.
         layoutWeekText()
 
@@ -705,6 +799,9 @@ internal class FreeplayCapsule(
         pixelIcon = null
         pixelIconSprite = null
         pixelIconChar = character
+        iconConfirmFrames = emptyList()
+        iconConfirmHoldFrames = emptyList()
+        iconConfirming = false
 
         val xmlPath = "$PIXEL_ICON_DIR/${base}pixel.xml"
         val pngPath = "$PIXEL_ICON_DIR/${base}pixel.png"
@@ -717,6 +814,8 @@ internal class FreeplayCapsule(
         val wrapper = Container().also { addChild(it) }
         val atlas = if (KnfFiles.exists(xmlPath)) TextureAtlas.tryLoad(xmlPath) else null
         val idleFrames = atlas?.framesByPrefix("idle0").orEmpty()
+        iconConfirmFrames = atlas?.framesByPrefix("confirm0").orEmpty()
+        iconConfirmHoldFrames = atlas?.framesByPrefix("confirm-hold0").orEmpty()
         if (atlas != null && idleFrames.isNotEmpty()) {
             val frame = idleFrames.first()
             val sprite = SparrowSprite(atlas, idleFrames, fps = 10.0, loop = true).also {
