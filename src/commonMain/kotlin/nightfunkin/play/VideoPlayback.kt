@@ -11,6 +11,7 @@ import nightfunkin.core.Constants
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfFmt
 import nightfunkin.platform.KnfEnv
+import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -49,6 +50,12 @@ class VideoPlayback(private val videoPath: String) {
 
     private var pendingFrame: VideoFrame? = null
     private var recycleBuffer: IntArray? = null
+    /**
+     * Frames that were decoded but superseded before they could be drawn (the
+     * game stalled, or several frames became due at once). Their pixel arrays go
+     * back to the decoder one per poll.
+     */
+    private val spareBuffers = ArrayDeque<IntArray>()
     private var currentFrameIndex = -1
 
     private var videoAbsPath: String? = null
@@ -60,8 +67,11 @@ class VideoPlayback(private val videoPath: String) {
     private var audioPausedByMenu = false
     private var pauseStartedNanos = 0.0
     private var wallStartNanos = 0.0
-    private var lastAudioMs = 0.0
-    private var lastAudioWallNanos = 0.0
+    /**
+     * Correction applied on top of the wall clock so the picture follows the
+     * audio without inheriting its block-quantised steps (see [elapsedMs]).
+     */
+    private var clockOffsetMs = 0.0
     private var maxElapsedMs = 0.0
 
     suspend fun prepare(): Boolean {
@@ -109,6 +119,16 @@ class VideoPlayback(private val videoPath: String) {
             view.y = Constants.GAME_HEIGHT / 2.0
             image = view
 
+            // Start the frame decoder before the audio extraction: ffmpeg
+            // decodes into the (small) frame queue in the background, so the
+            // first picture is already waiting while the WAV track is being
+            // produced.
+            source = withContext(Dispatchers.Default) { backend.openFrames(absPath, outWidth, outHeight) }
+            if (source == null) {
+                if (error == null) error = "could not start the video decoder"
+                return false
+            }
+
             if (hasAudio) {
                 val wav = withContext(Dispatchers.Default) { backend.extractAudioWavBytes(absPath) }
                 if (wav != null) {
@@ -117,12 +137,6 @@ class VideoPlayback(private val videoPath: String) {
                         println("KNF: video cutscene could not decode audio for '$videoPath'; video will run silently")
                     }
                 }
-            }
-
-            source = withContext(Dispatchers.Default) { backend.openFrames(absPath, outWidth, outHeight) }
-            if (source == null) {
-                if (error == null) error = "could not start the video decoder"
-                return false
             }
             awaitFirstFrame()
             return error == null
@@ -142,7 +156,7 @@ class VideoPlayback(private val videoPath: String) {
         paused = false
         audioPausedByMenu = false
         wallStartNanos = PerformanceCounter.nanoseconds
-        lastAudioWallNanos = wallStartNanos
+        clockOffsetMs = 0.0
         if (audioPlayer.exists) audioPlayer.play(0.0)
     }
 
@@ -159,18 +173,14 @@ class VideoPlayback(private val videoPath: String) {
         if (!paused) return
         paused = false
         val now = PerformanceCounter.nanoseconds
+        // The wall clock must not count the time the menu was open.
+        wallStartNanos += now - pauseStartedNanos
         if (audioPausedByMenu && audioPlayer.exists) {
             val at = audioPlayer.pausedAtMs
             audioPlayer.play(at)
-            lastAudioMs = at
-            lastAudioWallNanos = now
+            // Put the movie clock exactly on the sample playback resumes from.
+            clockOffsetMs = at - (now - wallStartNanos) / 1_000_000.0
             if (at > maxElapsedMs) maxElapsedMs = at
-        } else {
-            // Silent movie, or the audio ended just before the menu opened:
-            // keep the wall clock from counting the menu time.
-            val pausedNanos = now - pauseStartedNanos
-            wallStartNanos += pausedNanos
-            lastAudioWallNanos += pausedNanos
         }
         audioPausedByMenu = false
     }
@@ -186,14 +196,14 @@ class VideoPlayback(private val videoPath: String) {
         source = null
         pendingFrame = null
         recycleBuffer = null
+        spareBuffers.clear()
         currentFrameIndex = -1
         audioStarted = false
         paused = false
         audioPausedByMenu = false
         error = null
         maxElapsedMs = 0.0
-        lastAudioMs = 0.0
-        lastAudioWallNanos = 0.0
+        clockOffsetMs = 0.0
         wallStartNanos = 0.0
         source = videoBackend.openFrames(absPath, outputWidth, outputHeight)
         if (source == null) {
@@ -203,35 +213,38 @@ class VideoPlayback(private val videoPath: String) {
         playAudio()
     }
 
+    /**
+     * Movie position in milliseconds.
+     *
+     * The picture is paced by the wall clock, not by the audio position. KNF's
+     * decoded outputs report `SoundChannel.current` once per 2048-frame device
+     * block, so `audiblePositionMs` advances in ~46 ms steps; stepping the
+     * frame index on that value turns 24/30 fps video into visible judder. The
+     * audio position is still authoritative: whenever it drifts more than
+     * [MAX_DRIFT_MS] away from the wall clock, the offset is corrected, so the
+     * two stay in step without inheriting the quantisation.
+     *
+     * A silent movie (or one whose audio finished first) simply keeps running
+     * on the wall clock.
+     */
     fun elapsedMs(): Double {
         if (!audioStarted) return 0.0
         if (paused) return maxElapsedMs
         val now = PerformanceCounter.nanoseconds
-
-        val raw = if (audioPlayer.exists) {
-            // The audible position: the movie must be shown in step with what
-            // is heard, and KNF's outputs queue several blocks ahead.
-            val position = audioPlayer.audiblePositionMs
-            if (position > lastAudioMs) {
-                lastAudioMs = position
-                lastAudioWallNanos = now
+        var wall = (now - wallStartNanos) / 1_000_000.0 + clockOffsetMs
+        if (audioPlayer.exists && audioPlayer.playing) {
+            val audio = audioPlayer.audiblePositionMs
+            // Ignore the device-open / queue-fill window, where the audio has
+            // not produced anything audible yet and `audio` is still 0.
+            if (audio > 0.0) {
+                val drift = audio - wall
+                if (abs(drift) > MAX_DRIFT_MS) {
+                    clockOffsetMs += drift
+                    wall += drift
+                }
             }
-            if (audioPlayer.playing) {
-                position
-            } else {
-                // The extracted audio can be a little shorter than the movie
-                // (or stop at the last decoded sample). Keep the video clock
-                // moving from the last audio position so the final frames and
-                // finishVideo() are not stranded.
-                val wallSinceAudio = lastAudioMs +
-                    (now - lastAudioWallNanos) / 1_000_000.0
-                maxOf(position, wallSinceAudio)
-            }
-        } else {
-            (now - wallStartNanos) / 1_000_000.0
         }
-
-        if (raw > maxElapsedMs) maxElapsedMs = raw
+        if (wall > maxElapsedMs) maxElapsedMs = wall
         return maxElapsedMs
     }
 
@@ -247,14 +260,28 @@ class VideoPlayback(private val videoPath: String) {
         var latest: VideoFrame? = null
 
         while (true) {
-            val frame = pendingFrame ?: source.nextFrame(recycleBuffer, 0) ?: break
+            var frame = pendingFrame
+            if (frame == null) {
+                // `nextFrame` hands the array to the decoder, so it must be
+                // cleared: offering the same buffer on every poll put duplicate
+                // entries into the decoder's free list, two queued frames ended
+                // up sharing one array, and decoding the later frame overwrote
+                // the earlier one before it was shown (visible as skipped,
+                // jerky frames).
+                val spare = spareBuffers.removeFirstOrNull()
+                val offered = spare ?: recycleBuffer
+                if (spare == null) recycleBuffer = null
+                frame = source.nextFrame(offered, 0)
+                if (frame == null) break
+            }
             pendingFrame = null
             if (frame.index > target) {
                 pendingFrame = frame
                 break
             }
-            // Only the newest due frame is drawn in this tick; recycle the rest.
-            latest?.let { recycleBuffer = it.pixels }
+            // Only the newest due frame is drawn in this tick; hand the others
+            // back to the decoder on the next polls instead of leaking them.
+            latest?.let { older -> if (spareBuffers.size < SPARE_BUFFERS) spareBuffers.addLast(older.pixels) }
             latest = frame
         }
 
@@ -274,6 +301,8 @@ class VideoPlayback(private val videoPath: String) {
         source?.close()
         source = null
         pendingFrame = null
+        recycleBuffer = null
+        spareBuffers.clear()
         if (DEBUG_VIDEO) println("KNF: video decoder shutdown")
     }
 
@@ -310,6 +339,13 @@ class VideoPlayback(private val videoPath: String) {
     private companion object {
         const val FIRST_FRAME_TIMEOUT_MS = 5_000.0
         const val FIRST_FRAME_POLL_MS = 100L
+
+        /** How far the audio may drift from the wall clock before it is corrected. */
+        const val MAX_DRIFT_MS = 100.0
+
+        /** Buffers kept aside for frames that are dropped on a catch-up tick. */
+        const val SPARE_BUFFERS = 8
+
         val DEBUG_VIDEO = KnfEnv["KNF_DEBUG_VIDEO"] == "1"
     }
 }

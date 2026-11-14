@@ -7,6 +7,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import nightfunkin.platform.KnfPlatform
 import java.io.File
 import java.io.InputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
@@ -15,7 +17,7 @@ import kotlin.concurrent.thread
  * Desktop video backend: the system `ffmpeg`/`ffprobe` binaries.
  *
  * The decoder pipes raw RGBA frames from ffmpeg through a tiny blocking queue
- * (four frames): ffmpeg blocks on the stdout pipe once it is full, which gives
+ * (6 frames): ffmpeg blocks on the stdout pipe once it is full, which gives
  * natural backpressure and prevents it from decoding the entire movie ahead of
  * the game. Consumed pixel buffers are recycled through [FfmpegFrames.nextFrame].
  */
@@ -83,6 +85,11 @@ private object FfmpegVideoBackend : VideoBackend {
 
     override fun extractAudioWavBytes(videoPath: String): ByteArray? {
         val ffmpeg = FfmpegTool.ffmpeg ?: return null
+        val wav = runCatching { extractPipedWav(ffmpeg, videoPath) }.getOrNull() ?: return null
+        return patchPipedWavSizes(wav)
+    }
+
+    private fun extractPipedWav(ffmpeg: String, videoPath: String): ByteArray? {
         val p = try {
             ProcessBuilder(
                 listOf(
@@ -122,6 +129,37 @@ private object FfmpegVideoBackend : VideoBackend {
         } finally {
             stderrDrainer.interrupt()
         }
+    }
+
+    /**
+     * Rewrites the sizes ffmpeg cannot know when it writes a WAV to a pipe.
+     *
+     * A WAV header stores the total RIFF length and the `data` chunk length, and
+     * ffmpeg needs to seek back to fill them once it is done. On a pipe it
+     * cannot, so both stay at `0xFFFFFFFF`. KorGE's parser reads the RIFF size
+     * first and uses it as the chunk-list bound; with `-1` the list is treated as
+     * already finished, no chunk (not even `fmt `) is ever parsed, and the whole
+     * track fails to decode - the cutscene then plays in silence. The bytes are
+     * fully in memory here, so the real sizes are known and get patched in.
+     */
+    private fun patchPipedWavSizes(bytes: ByteArray): ByteArray {
+        if (bytes.size < 12) return bytes
+        if (!bytes.matchAscii(0, "RIFF") || !bytes.matchAscii(8, "WAVE")) return bytes
+        bytes.writeLe32(4, bytes.size - 8)
+        var pos = 12
+        while (pos + 8 <= bytes.size) {
+            val size = bytes.readLe32(pos + 4)
+            val remaining = bytes.size - pos - 8
+            // ffmpeg only leaves the *last* chunk unsized (`data`); a negative
+            // or oversized length therefore means "runs to the end of the file".
+            if (size < 0 || size > remaining) {
+                bytes.writeLe32(pos + 4, remaining)
+                break
+            }
+            // Chunks are word aligned.
+            pos += 8 + size + (size and 1)
+        }
+        return bytes
     }
 
     private data class ProcessResult(val exitCode: Int, val output: String)
@@ -204,21 +242,20 @@ private class FfmpegFrames private constructor(
         readerThread = thread(name = "knf-video-reader", isDaemon = true) {
             val input = process.inputStream.buffered(1 shl 20)
             val bytes = ByteArray(frameBytes)
+            // `Bitmap32` ints are 0xAABBGGRR, i.e. the bytes R,G,B,A in memory.
+            // ffmpeg emits exactly RGBA, so reinterpreting the buffer as ints on
+            // a little-endian machine copies a frame in one bulk operation
+            // instead of running a per-pixel Kotlin loop over ~1M samples.
+            val ints = ByteBuffer.wrap(bytes)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .asIntBuffer()
             var index = 0
             try {
                 while (!closed) {
                     if (!readFrame(input, bytes)) break
                     val pixels = freeBuffers.poll() ?: IntArray(pixelCount)
-                    var b = 0
-                    for (i in pixels.indices) {
-                        val r = bytes[b].toInt() and 0xFF
-                        val g = bytes[b + 1].toInt() and 0xFF
-                        val bl = bytes[b + 2].toInt() and 0xFF
-                        val a = bytes[b + 3].toInt() and 0xFF
-                        // Bitmap32 stores 0xAABBGGRR.
-                        pixels[i] = (a shl 24) or (bl shl 16) or (g shl 8) or r
-                        b += 4
-                    }
+                    ints.rewind()
+                    ints.get(pixels)
                     val frame = VideoFrame(index++, pixels)
                     if (!offer(frame)) {
                         freeBuffers.offer(pixels)
@@ -255,7 +292,7 @@ private class FfmpegFrames private constructor(
     }
 
     companion object {
-        const val QUEUE_CAPACITY = 4
+        const val QUEUE_CAPACITY = 6
 
         fun open(videoPath: String, outWidth: Int, outHeight: Int): FfmpegFrames? {
             val ffmpeg = FfmpegTool.ffmpeg ?: run {
@@ -338,4 +375,30 @@ private object FfmpegTool {
     }
 
     private val isWindows: Boolean = System.getProperty("os.name").startsWith("Windows", ignoreCase = true)
+}
+
+/**
+ * Chunk helpers for the WAV size patch in the ffmpeg backend: the WAV container
+ * is little-endian whatever the host is, so the 32-bit fields are read and
+ * written byte by byte.
+ */
+private fun ByteArray.matchAscii(offset: Int, text: String): Boolean {
+    if (offset + text.length > size) return false
+    for (i in text.indices) {
+        if (this[offset + i] != text[i].code.toByte()) return false
+    }
+    return true
+}
+
+private fun ByteArray.readLe32(offset: Int): Int =
+    (this[offset].toInt() and 0xFF) or
+        ((this[offset + 1].toInt() and 0xFF) shl 8) or
+        ((this[offset + 2].toInt() and 0xFF) shl 16) or
+        ((this[offset + 3].toInt() and 0xFF) shl 24)
+
+private fun ByteArray.writeLe32(offset: Int, value: Int) {
+    this[offset] = value.toByte()
+    this[offset + 1] = (value ushr 8).toByte()
+    this[offset + 2] = (value ushr 16).toByte()
+    this[offset + 3] = (value ushr 24).toByte()
 }
