@@ -30,6 +30,11 @@ class SparrowSprite(
 
     private val image: Image = Image(atlas.slice(frames.first())).also {
         it.anchor = Anchor2D.TOP_LEFT
+        // A sheet bigger than the GPU's texture limit is decoded pre-shrunk;
+        // frame offsets below stay in source pixels, so grow the image back to
+        // the authored size.
+        it.scaleX = atlas.inverseTextureScaleX
+        it.scaleY = atlas.inverseTextureScaleY
         addChild(it)
     }
 

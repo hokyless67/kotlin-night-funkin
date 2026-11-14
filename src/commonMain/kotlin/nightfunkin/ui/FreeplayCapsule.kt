@@ -13,12 +13,14 @@ import korlibs.korge.view.clipContainer
 import korlibs.math.geom.Size
 import nightfunkin.core.Constants
 import nightfunkin.core.KnfFiles
+import nightfunkin.core.KnfMemory
 import nightfunkin.core.Save
 import nightfunkin.core.SparrowSprite
 import nightfunkin.core.TextureAtlas
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.min
 import kotlin.math.pow
 
 /**
@@ -194,6 +196,15 @@ internal class FreeplayCapsule(
     private var jumpInFrame = 0
     private var jumpInTicker = 0.0
 
+    // `doJumpOut`: the same squash frames, but the container hops out to the
+    // right along `xPosOutLerpLol` (FreeplayState exits this way).
+    private var jumpOutActive = false
+    private var jumpOutFrame = 0
+    private var jumpOutTicker = 0.0
+
+    /** `SongMenuItem.doLerp`: off during the exit so the jump drives x. */
+    private var lerpEnabled = true
+
     init {
         setTitle(if (entry == null) "Random" else entry.song.name)
         // Capsules that are filtered out of the first list keep their normal
@@ -314,6 +325,20 @@ internal class FreeplayCapsule(
         x = Constants.GAME_WIDTH.toDouble()
         y = startY
         alpha = 1.0
+        bounceActive = false
+    }
+
+    /**
+     * `SongMenuItem`'s doJumpOut: `FreeplayState.goBack` stops the lerp and
+     * sets this, so each capsule squashes through `xFrames` while hopping out
+     * to the right along `xPosOutLerpLol`, one step per 1/24 s.
+     */
+    fun jumpOut() {
+        jumpInActive = false
+        jumpOutActive = true
+        jumpOutFrame = 0
+        jumpOutTicker = 0.0
+        lerpEnabled = false
         bounceActive = false
     }
 
@@ -463,6 +488,27 @@ internal class FreeplayCapsule(
             if (jumpInFrame >= X_FRAMES.size) {
                 jumpInActive = false
             }
+        }
+
+        // `SongMenuItem.update`'s doJumpOut block: the exit hops each capsule
+        // out to the right while squashing through the same `xFrames`.
+        if (jumpOutActive) {
+            jumpOutTicker += dt
+            while (jumpOutTicker >= 1.0 / 24.0 && jumpOutFrame < X_FRAMES.size) {
+                jumpOutTicker -= 1.0 / 24.0
+                applySquash(jumpOutFrame)
+                x = Constants.GAME_WIDTH *
+                    X_POS_OUT_LERP[min(jumpOutFrame, X_POS_OUT_LERP.lastIndex)]
+                jumpOutFrame++
+            }
+            if (jumpOutFrame >= X_FRAMES.size) {
+                jumpOutActive = false
+            }
+        }
+
+        if (!lerpEnabled) {
+            // `doLerp = false` during the exit: the jump owns x, and y stays.
+            return
         }
 
         if (bounceActive) {
@@ -938,6 +984,9 @@ internal class FreeplayCapsule(
         /** `SongMenuItem.xFrames`: the jump-in squash keyframes, 1/24 s apart. */
         val X_FRAMES = doubleArrayOf(1.7, 1.8, 0.85, 0.85, 0.97, 0.97, 1.0)
 
+        /** `SongMenuItem.xPosOutLerpLol`: the exit's hop-out positions. */
+        val X_POS_OUT_LERP = doubleArrayOf(0.245, 0.75, 0.98, 0.98, 1.2)
+
         const val PIXEL_ICON_DIR = "preload/images/freeplay/icons"
 
         /** bf.json `capsuleTextColors` / `CapsuleText`'s glow filter. */
@@ -967,38 +1016,99 @@ internal class FreeplayCapsule(
          */
         const val RANK_BLUR_BRIGHTNESS = 1.0
 
-        val capsuleAtlas: TextureAtlas? by lazy {
-            TextureAtlas.tryLoad(
-                "preload/images/freeplay/freeplayCapsule/capsule/freeplayCapsule.xml",
-            )
+        init {
+            // `FunkinMemory.clearFreeplay()`: leaving Freeplay drops the
+            // `freeplay*` graphics so a song's stage/character sheets are not
+            // loaded on top of them. Live capsules keep their own references,
+            // and the next visit reloads these lazily.
+            KnfMemory.registerArtCache { invalidateArtCaches() }
         }
 
-        val smallNumbersAtlas: TextureAtlas? by lazy {
-            TextureAtlas.tryLoad(
-                "preload/images/freeplay/freeplayCapsule/smallnumbers.xml",
-            )
-        }
+        private var capsuleAtlasSlot: TextureAtlas? = null
+        private var capsuleAtlasLoaded = false
+        val capsuleAtlas: TextureAtlas?
+            get() {
+                if (!capsuleAtlasLoaded) {
+                    capsuleAtlasLoaded = true
+                    capsuleAtlasSlot = TextureAtlas.tryLoad(
+                        "preload/images/freeplay/freeplayCapsule/capsule/freeplayCapsule.xml",
+                    )
+                }
+                return capsuleAtlasSlot
+            }
 
-        val bigNumbersAtlas: TextureAtlas? by lazy {
-            TextureAtlas.tryLoad(
-                "preload/images/freeplay/freeplayCapsule/bignumbers.xml",
-            )
-        }
+        private var smallNumbersAtlasSlot: TextureAtlas? = null
+        private var smallNumbersAtlasLoaded = false
+        val smallNumbersAtlas: TextureAtlas?
+            get() {
+                if (!smallNumbersAtlasLoaded) {
+                    smallNumbersAtlasLoaded = true
+                    smallNumbersAtlasSlot = TextureAtlas.tryLoad(
+                        "preload/images/freeplay/freeplayCapsule/smallnumbers.xml",
+                    )
+                }
+                return smallNumbersAtlasSlot
+            }
 
-        val rankAtlas: TextureAtlas? by lazy {
-            TextureAtlas.tryLoad("preload/images/freeplay/rankbadges.xml")
-        }
+        private var bigNumbersAtlasSlot: TextureAtlas? = null
+        private var bigNumbersAtlasLoaded = false
+        val bigNumbersAtlas: TextureAtlas?
+            get() {
+                if (!bigNumbersAtlasLoaded) {
+                    bigNumbersAtlasLoaded = true
+                    bigNumbersAtlasSlot = TextureAtlas.tryLoad(
+                        "preload/images/freeplay/freeplayCapsule/bignumbers.xml",
+                    )
+                }
+                return bigNumbersAtlasSlot
+            }
 
-        val favHeartAtlas: TextureAtlas? by lazy {
-            TextureAtlas.tryLoad("preload/images/freeplay/favHeart.xml")
-        }
+        private var rankAtlasSlot: TextureAtlas? = null
+        private var rankAtlasLoaded = false
+        val rankAtlas: TextureAtlas?
+            get() {
+                if (!rankAtlasLoaded) {
+                    rankAtlasLoaded = true
+                    rankAtlasSlot = TextureAtlas.tryLoad("preload/images/freeplay/rankbadges.xml")
+                }
+                return rankAtlasSlot
+            }
 
-        val smallNumberFrames: Map<Int, TextureAtlas.AtlasFrame> by lazy {
-            digitFrames(smallNumbersAtlas)
-        }
+        private var favHeartAtlasSlot: TextureAtlas? = null
+        private var favHeartAtlasLoaded = false
+        val favHeartAtlas: TextureAtlas?
+            get() {
+                if (!favHeartAtlasLoaded) {
+                    favHeartAtlasLoaded = true
+                    favHeartAtlasSlot = TextureAtlas.tryLoad("preload/images/freeplay/favHeart.xml")
+                }
+                return favHeartAtlasSlot
+            }
 
-        val bigNumberFrames: Map<Int, TextureAtlas.AtlasFrame> by lazy {
-            digitFrames(bigNumbersAtlas)
+        private var smallNumberFramesCache: Map<Int, TextureAtlas.AtlasFrame>? = null
+        val smallNumberFrames: Map<Int, TextureAtlas.AtlasFrame>
+            get() = smallNumberFramesCache
+                ?: digitFrames(smallNumbersAtlas).also { smallNumberFramesCache = it }
+
+        private var bigNumberFramesCache: Map<Int, TextureAtlas.AtlasFrame>? = null
+        val bigNumberFrames: Map<Int, TextureAtlas.AtlasFrame>
+            get() = bigNumberFramesCache
+                ?: digitFrames(bigNumbersAtlas).also { bigNumberFramesCache = it }
+
+        /** Drops every Freeplay-only sheet (`FunkinMemory.clearFreeplay`). */
+        private fun invalidateArtCaches() {
+            capsuleAtlasLoaded = false
+            capsuleAtlasSlot = null
+            smallNumbersAtlasLoaded = false
+            smallNumbersAtlasSlot = null
+            bigNumbersAtlasLoaded = false
+            bigNumbersAtlasSlot = null
+            rankAtlasLoaded = false
+            rankAtlasSlot = null
+            favHeartAtlasLoaded = false
+            favHeartAtlasSlot = null
+            smallNumberFramesCache = null
+            bigNumberFramesCache = null
         }
 
         private val DIGIT_NAMES = listOf(

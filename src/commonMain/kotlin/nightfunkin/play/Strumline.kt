@@ -564,6 +564,41 @@ class Strumline(
     }
 
     /**
+     * Creates everything the first judged hit touches, while the game is still
+     * loading: the four splash layers (they used to be created lazily), one
+     * hidden splash image per direction so its texture binding and draw are not
+     * first-time work during a hit, and the receptor Press/Confirm frames.
+     *
+     * The images sit far off-screen at an invisible alpha; they are never
+     * removed, so the hit path allocates nothing new.
+     */
+    fun prewarmHitEffects() {
+        if (!isPlayer) return
+        for (direction in 0 until Constants.KEY_COUNT) {
+            receptors[direction]?.prewarmStates()
+        }
+        if (!noteStyle.splashEnabled) return
+        val scale = noteStyle.splashScale.toDouble()
+        for (direction in 0 until Constants.KEY_COUNT) {
+            val layer = splashLayers[direction] ?: Container().also {
+                it.y = 0.0
+                noteEffects.addChild(it)
+                it.zIndex = 50.0
+                splashLayers[direction] = it
+            }
+            val frame = noteStyle.splashVariants(direction).firstOrNull()?.firstOrNull() ?: continue
+            val img = layer.image(frame.slice)
+            img.anchor = Anchor2D.TOP_LEFT
+            img.x = -4000.0
+            img.y = -4000.0
+            img.scaleX = scale
+            img.scaleY = scale
+            img.alpha = 0.004
+            img.setPixelArt(noteStyle.isPixel)
+        }
+    }
+
+    /**
      * `Strumline.playNoteSplash`.
      *
      * FNF plays a short 24 fps animation and kills the sprite when it ends, so
@@ -918,6 +953,17 @@ private class Receptor(
         confirmWaitFinish = false
         confirmTimer = -1.0
         setState("Static")
+    }
+
+    /**
+     * Resolves and draws every receptor animation once, during loading.
+     *
+     * `setState` builds the frame list the first time a state is shown; doing
+     * that from the first judged hit put that work on the GL thread mid-song.
+     * Ends on the idle pose, which is what is on screen before the song starts.
+     */
+    fun prewarmStates() {
+        for (state in listOf("Press", "Confirm", "ConfirmHold", "Static")) setState(state)
     }
 
     fun update(dt: Double, keyHeld: Boolean = false) {

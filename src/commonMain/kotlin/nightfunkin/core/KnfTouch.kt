@@ -21,13 +21,23 @@ object KnfTouch {
     /** Lane held state; menu drags reuse these lanes as UI navigation. */
     val lanes = BooleanArray(4)
 
-    /** CONFIRM, held for one frame per tap. */
+    /**
+     * Lane presses seen since the last [KnfInput] update.
+     *
+     * A tap can start and end between two frames (the song runs at ~7 fps while
+     * it streams), so the held [lanes] flags would already be `false` by the
+     * time input is polled. These sticky pulses make sure the press still
+     * reaches gameplay.
+     */
+    val pressed = BooleanArray(4)
+
+    /** CONFIRM, held until the next [KnfInput] update reads it. */
     var acceptDown: Boolean = false
 
-    /** BACK, held for one frame per two-finger tap. */
+    /** BACK, held until the next [KnfInput] update reads it. */
     var backDown: Boolean = false
 
-    /** PAUSE, held for one frame per pause-button press. */
+    /** PAUSE, held until the next [KnfInput] update reads it. */
     var pauseDown: Boolean = false
 
     fun clearFrameActions() {
@@ -38,6 +48,7 @@ object KnfTouch {
 
     fun reset() {
         lanes.fill(false)
+        pressed.fill(false)
         clearFrameActions()
     }
 }

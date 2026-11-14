@@ -222,10 +222,47 @@ object KnfFiles {
 
     // ---- typed loaders --------------------------------------------------
 
-    fun bitmap(path: String): Bitmap = decodeImage(bytes(path))
+    /**
+     * Largest side a texture handed to the GPU may have.
+     *
+     * Mobile drivers commonly cap `GL_MAX_TEXTURE_SIZE` at 4096, and even a
+     * legal 8192-wide texture costs 128 MB of GPU memory - a single
+     * `BOYFRIEND.png` is enough for the driver to refuse the upload, which the
+     * player sees as a black rectangle. Desktop GPUs handle 16384 comfortably.
+     */
+    val maxTextureDimension: Int get() = if (KnfPlatform.isMobile) 4096 else 16384
 
-    fun bitmapOrNull(path: String): Bitmap? =
-        bytesOrNull(path)?.let { runCatching { decodeImage(it) }.getOrNull() }
+    /**
+     * Largest side for *background* art (stage props, album art).
+     *
+     * FNF's mobile builds ship ASTC-compressed sheets, which is how the original
+     * fits a week's stage into a phone's GL memory. KNF cannot compress at
+     * decode time, so the scenery - which is drawn at 1280x720 behind the
+     * characters and animated with blurs/smoke - is decoded at half the
+     * character limit instead. Week 7 alone spends ~100 MB on two 4096-wide
+     * smoke sheets; at 2048 those cost a quarter of that.
+     */
+    val backdropTextureDimension: Int get() = if (KnfPlatform.isMobile) 2048 else 16384
+
+    fun bitmap(path: String): Bitmap = decodeImage(bytes(path)).bitmap
+
+    fun bitmapOrNull(path: String, limit: Int = maxTextureDimension): Bitmap? =
+        bytesOrNull(path)?.let { runCatching { decodeImage(it, limit).bitmap }.getOrNull() }
+
+    /**
+     * Like [bitmapOrNull], but keeps the factor the source was shrunk by.
+     *
+     * Atlases store frame rectangles in *source* pixels, so they need the
+     * factor to map them onto the (possibly smaller) decoded bitmap.
+     */
+    internal fun decodedImageOrNull(
+        path: String,
+        limit: Int = maxTextureDimension,
+    ): KnfDecodedImage? =
+        bytesOrNull(path)?.let { runCatching { decodeImage(it, limit) }.getOrNull() }
+
+    internal fun decodedImage(path: String, limit: Int = maxTextureDimension): KnfDecodedImage =
+        decodeImage(bytes(path), limit)
 
     /**
      * PNG decoding, with two workarounds.
@@ -236,13 +273,14 @@ object KnfFiles {
      * black bitmap. Those go through [KnfPng], KNF's own decoder for the colour
      * types KorGE does not implement.
      */
-    private fun decodeImage(data: ByteArray): Bitmap {
+    private fun decodeImage(data: ByteArray, limit: Int = maxTextureDimension): KnfDecodedImage {
         // Android's BitmapFactory is orders of magnitude faster than the pure
-        // Kotlin decoders for the big sheets (a 4096x4096 PNG took ~16 s).
-        knfDecodeImageNative(data)?.let { return it }
+        // Kotlin decoders for the big sheets (a 4096x4096 PNG took ~16 s) and
+        // can pre-shrink them while decoding.
+        knfDecodeImageNative(data, limit)?.let { return it }
         val raw =
             if (KnfPng.needsOwnDecoder(data)) KnfPng.decode(data) else RegisteredImageFormats.decode(data)
-        return premultiply(raw)
+        return knfShrinkToLimit(premultiply(raw), limit)
     }
 
     /**

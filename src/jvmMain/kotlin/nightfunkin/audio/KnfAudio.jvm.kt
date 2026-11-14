@@ -7,6 +7,7 @@ import korlibs.audio.sound.backend.FFIJVMWaveOutNativeSoundProvider
 import nightfunkin.platform.KnfEnv
 import javax.sound.sampled.AudioFormat
 import javax.sound.sampled.AudioSystem
+import javax.sound.sampled.DataLine
 import javax.sound.sampled.SourceDataLine
 
 /**
@@ -37,8 +38,21 @@ private class DataLineSink(channels: Int, rate: Int, blocks: Int) : KnfAudioSink
             bytes[target++] = sample.toByte()
             bytes[target++] = (sample shr 8).toByte()
         }
-        val written = line.write(bytes, 0, target)
-        if (written <= 0) error("SourceDataLine.write returned $written")
+        // `SourceDataLine.write` only promises to write *some* bytes; anything
+        // it does not take would be lost audio (JavaSound returns short counts
+        // when the mixer's queue is busy or the line was just started).
+        var offset = 0
+        var stalls = 0
+        while (offset < target) {
+            val written = line.write(bytes, offset, target - offset)
+            if (written <= 0) {
+                if (++stalls > 8) error("SourceDataLine.write returned $written")
+                Thread.yield()
+                continue
+            }
+            stalls = 0
+            offset += written
+        }
     }
 
     override fun start() {
@@ -66,9 +80,24 @@ private class KnfJvmSoundProvider(private val blocks: Int, private val threadNam
         gen: AudioPlatformOutputGen,
     ): AudioPlatformOutput {
         // Machines without a usable JavaSound mixer keep the old WinMM path.
-        val sink = runCatching { DataLineSink(channels, frequency, blocks) }.getOrNull()
-            ?: return FFIJVMWaveOutNativeSoundProvider.createNewPlatformAudioOutput(channels, frequency, gen)
-        return knfBlockPumpOutput(this, channels, frequency, gen, sink, threadName)
+        // `isLineSupported` answers that without opening the device; the sink
+        // itself is opened on the pump thread (`createNewPlatformAudioOutput`
+        // runs on the GL thread when a stem starts).
+        val format = AudioFormat(frequency.toFloat(), 16, channels, true, false)
+        val supported = runCatching {
+            AudioSystem.isLineSupported(DataLine.Info(SourceDataLine::class.java, format))
+        }.getOrDefault(false)
+        if (!supported) {
+            return FFIJVMWaveOutNativeSoundProvider.createNewPlatformAudioOutput(channels, frequency, gen)
+        }
+        return knfBlockPumpOutput(
+            this,
+            channels,
+            frequency,
+            gen,
+            { DataLineSink(channels, frequency, blocks) },
+            threadName,
+        )
     }
 }
 
@@ -78,7 +107,17 @@ private val useKnfOutput = KnfEnv["KNF_AUDIO_LEGACY"] != "1"
 internal actual val knfMusicSoundProvider: NativeSoundProvider? =
     if (useKnfOutput) KnfJvmSoundProvider(MUSIC_BLOCKS, "KNF-Music") else null
 
+/** Desktop plays streamed tracks through korlibs; see [knfStreamSoundProvider]. */
+internal actual val knfStreamSoundProvider: NativeSoundProvider? = null
+
 internal actual val knfSfxSoundProvider: NativeSoundProvider? =
     if (useKnfOutput) KnfJvmSoundProvider(SFX_BLOCKS, "KNF-Sfx") else null
 
 internal actual val knfMusicLeadBlocks: Int = MUSIC_BLOCKS
+
+/**
+ * JavaSound has no equivalent warm-device pool: a `SourceDataLine` is bound to
+ * its mixer and a fresh line is cheap enough that reusing one is not worth the
+ * state it would keep alive.
+ */
+internal actual fun knfPrewarmMusicOutput(sampleRate: Int) = Unit

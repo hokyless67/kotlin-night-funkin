@@ -9,6 +9,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import nightfunkin.core.AnimateAtlas
 import nightfunkin.core.Constants
+import nightfunkin.core.KnfDecodedImage
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.TextureAtlas
 import nightfunkin.core.setPixelArt
@@ -364,15 +365,23 @@ class Stage(id: String) : Container() {
     }
 
     private fun buildStaticProp(prop: StagePropData): Container? {
-        val bmp: Bitmap = resolveAsset(prop.assetPath) ?: return null
+        val image = resolveAsset(prop.assetPath) ?: return null
+        val bmp = image.bitmap
         val img = Image(bmp)
-        apply(img, prop, bmp.width.toDouble(), bmp.height.toDouble())
+        // The decoded sheet may be smaller than the authored one (backdrop
+        // limit on mobile); grow it back so the prop keeps its FNF size.
+        val texScaleX = if (image.scaleX != 0.0) 1.0 / image.scaleX else 1.0
+        val texScaleY = if (image.scaleY != 0.0) 1.0 / image.scaleY else 1.0
+        apply(
+            img, prop, bmp.width.toDouble(), bmp.height.toDouble(),
+            texScaleX = texScaleX, texScaleY = texScaleY,
+        )
         // FNF: `propSprite.antialiasing = !dataProp.isPixel;`
         img.setPixelArt(prop.isPixel)
         val container = Container().also { it.addChild(img) }
         if (prop.angle != 0.0) {
-            val sx = prop.scale.getOrElse(0) { 1.0 }
-            val sy = prop.scale.getOrElse(1) { 1.0 }
+            val sx = prop.scale.getOrElse(0) { 1.0 } * texScaleX
+            val sy = prop.scale.getOrElse(1) { 1.0 } * texScaleY
             staticPivots[container] =
                 abs(bmp.width * sx) / 2.0 to abs(bmp.height * sy) / 2.0
         }
@@ -393,7 +402,7 @@ class Stage(id: String) : Container() {
             println("KNF: stage prop asset missing: ${prop.assetPath} (${prop.animType})")
             return null
         }
-        val atlas = AnimateAtlas(dir)
+        val atlas = AnimateAtlas(dir, KnfFiles.backdropTextureDimension)
         if (atlas.sprites.isEmpty()) {
             println("KNF: stage prop '${file.id}' has no sprites in $dir")
             return null
@@ -473,8 +482,8 @@ class Stage(id: String) : Container() {
                 img.y = cy - originY - anim.offsetY
                 // The same decomposition `Character.renderPose` uses: a negative
                 // determinant means the symbol is mirrored, not rotated.
-                img.scaleX = hypot(m.a, m.b)
-                img.scaleY = hypot(m.c, m.d)
+                img.scaleX = hypot(m.a, m.b) * def.textureScaleX
+                img.scaleY = hypot(m.c, m.d) * def.textureScaleY
                 if (m.a * m.d - m.c * m.b < 0.0) img.scaleY = -img.scaleY
                 img.rotation = ((if (def.turned) -90.0 else 0.0) +
                     KnfMath.toDegrees(atan2(m.b, m.a))).degrees
@@ -499,7 +508,11 @@ class Stage(id: String) : Container() {
             println("KNF: stage prop atlas missing: ${prop.assetPath}$suffix")
             return null
         }
-        val atlas = if (packer) TextureAtlas.tryLoadPacker(path) else TextureAtlas.tryLoad(path)
+        val atlas = if (packer) {
+            TextureAtlas.tryLoadPacker(path, KnfFiles.backdropTextureDimension)
+        } else {
+            TextureAtlas.tryLoad(path, KnfFiles.backdropTextureDimension)
+        }
         if (atlas == null || atlas.frames.isEmpty()) {
             println("KNF: stage prop atlas failed to load: $path")
             return null
@@ -534,14 +547,16 @@ class Stage(id: String) : Container() {
         val container = Container()
         placeAnimatedContainer(container, prop)
         val img = Image(atlas.slice(ordered.first()))
+        img.scaleX = atlas.inverseTextureScaleX
+        img.scaleY = atlas.inverseTextureScaleY
         img.setPixelArt(prop.isPixel)
         container.addChild(img)
 
         fun render(anim: StageAnimation, frameIndex: Int) {
             val frame = ordered.getOrNull(frameIndex) ?: return
             img.bitmap = atlas.slice(frame)
-            img.scaleX = if (anim.flipX) -1.0 else 1.0
-            img.scaleY = if (anim.flipY) -1.0 else 1.0
+            img.scaleX = (if (anim.flipX) -1.0 else 1.0) * atlas.inverseTextureScaleX
+            img.scaleY = (if (anim.flipY) -1.0 else 1.0) * atlas.inverseTextureScaleY
             // `Bopper.getScreenPosition` subtracts the per-animation offsets
             // after scaling. Frame trimming shifts the drawn rect inside the
             // logical frame, exactly like `TextureAtlas.addImage`.
@@ -566,8 +581,9 @@ class Stage(id: String) : Container() {
     }
 
     /**
-     * Solid-colour props: FNF makes a 1x1 sprite and scales it to `scale`, which
-     * is how the speaker/lamp blocks in later weeks are drawn.
+     * Solid-colour props: `Stage.hx` calls `makeSolidColor(scale[0], scale[1],
+     * color)`, i.e. the sprite *is* the given size and `scale` is not applied a
+     * second time (`if (!isSolidColor)` guards the scale block).
      */
     private fun buildSolidColor(prop: StagePropData): Container? {
         val w = prop.scale.getOrElse(0) { 1.0 }
@@ -578,7 +594,12 @@ class Stage(id: String) : Container() {
             1, 1, intArrayOf(argb), false,
         )
         val img = Image(bmp)
-        apply(img, prop, w, h, extraScaleX = w, extraScaleY = h)
+        img.scaleX = if (prop.flipX) -w else w
+        img.scaleY = if (prop.flipY) -h else h
+        img.x = prop.position.getOrElse(0) { 0.0 } + if (prop.flipX) w else 0.0
+        img.y = prop.position.getOrElse(1) { 0.0 } + if (prop.flipY) h else 0.0
+        img.alpha = prop.alpha
+        img.visible = true
         val container = Container().also { it.addChild(img) }
         if (prop.angle != 0.0) staticPivots[container] = w / 2.0 to h / 2.0
         return container
@@ -591,9 +612,12 @@ class Stage(id: String) : Container() {
         height: Double,
         extraScaleX: Double = 1.0,
         extraScaleY: Double = 1.0,
+        /** Compensates a sheet decoded below its authored size (mobile). */
+        texScaleX: Double = 1.0,
+        texScaleY: Double = 1.0,
     ) {
-        val sx = prop.scale.getOrElse(0) { 1.0 } * extraScaleX
-        val sy = prop.scale.getOrElse(1) { 1.0 } * extraScaleY
+        val sx = prop.scale.getOrElse(0) { 1.0 } * extraScaleX * texScaleX
+        val sy = prop.scale.getOrElse(1) { 1.0 } * extraScaleY * texScaleY
         // Flipping mirrors within the sprite's rect, so shift x by its width.
         img.scaleX = if (prop.flipX) -sx else sx
         img.scaleY = if (prop.flipY) -sy else sy
@@ -614,7 +638,7 @@ class Stage(id: String) : Container() {
      * lookup has to walk every asset library rather than just `shared`/`preload`.
      * See [KnfFiles.resolve].
      */
-    private fun resolveAsset(assetPath: String): Bitmap? {
+    private fun resolveAsset(assetPath: String): KnfDecodedImage? {
         // Static stage props use FNF's `Paths.image` while the stage's library
         // is active. Without forcing it, same-named assets from an earlier week
         // (for example week1's `erect/bg`) win over the stage's own artwork.
@@ -624,14 +648,25 @@ class Stage(id: String) : Container() {
             println("KNF:   tried " + KnfFiles.resolveCandidates(assetPath, ".png", file.directory))
             return null
         }
-        return KnfFiles.bitmapOrNull(path)
+        // Scenery is drawn at 1280x720 behind the characters, so it is the one
+        // kind of art that can be decoded at a lower limit than the sheets
+        // (FNF's mobile builds compress it with ASTC for the same reason).
+        return KnfFiles.decodedImageOrNull(path, KnfFiles.backdropTextureDimension)
     }
 
+    /**
+     * `#RRGGBB` / `#AARRGGBB` (OpenFL's `FlxColor.fromString`) in the packing
+     * `Bitmap32` expects, which is `0xAABBGGRR` - so red and blue swap.
+     */
     private fun parseHexColor(text: String): Int? {
         val hex = text.removePrefix("#")
         if (hex.length != 6 && hex.length != 8) return null
         val value = hex.toLongOrNull(16) ?: return null
-        return if (hex.length == 6) (0xFF000000L or value).toInt() else value.toInt()
+        val a = if (hex.length == 8) ((value ushr 24) and 0xFF) else 0xFF
+        val r = (value ushr 16) and 0xFF
+        val g = (value ushr 8) and 0xFF
+        val b = value and 0xFF
+        return ((a shl 24) or (b shl 16) or (g shl 8) or r).toInt()
     }
 
     val propCount: Int get() = loaded.size

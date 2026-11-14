@@ -9,6 +9,7 @@ import korlibs.korge.view.image
 import korlibs.math.geom.RectangleInt
 import korlibs.math.geom.slice.RectSlice
 import kotlin.math.floor
+import kotlin.math.roundToInt
 
 /** A sub-rectangle of a bitmap — what KorGE 6 renders images from. */
 typealias AtlasSlice = RectSlice<Bitmap>
@@ -25,6 +26,13 @@ typealias AtlasSlice = RectSlice<Bitmap>
 class TextureAtlas private constructor(
     val bitmap: Bitmap,
     val frames: Map<String, AtlasFrame>,
+    /**
+     * How much [bitmap] was shrunk to fit the GPU's texture limit (1.0 = as
+     * authored). Frame rectangles stay in source pixels; [slice] maps them onto
+     * the decoded bitmap and drawing code compensates with `1 / textureScale`.
+     */
+    val textureScaleX: Double = 1.0,
+    val textureScaleY: Double = 1.0,
 ) {
     data class AtlasFrame(
         val name: String,
@@ -78,7 +86,12 @@ class TextureAtlas private constructor(
      */
     fun shaderBlurred(amount: Double = 1.0, brightness: Double = 1.0): TextureAtlas =
         blurredCache.getOrPut("$amount/$brightness") {
-            TextureAtlas(crossBlur(bitmap.toBMP32IfRequired(), amount, brightness), frames)
+            TextureAtlas(
+                crossBlur(bitmap.toBMP32IfRequired(), amount, brightness),
+                frames,
+                textureScaleX,
+                textureScaleY,
+            )
         }
 
     /** All frames whose name starts with [prefix], in atlas order. */
@@ -107,13 +120,28 @@ class TextureAtlas private constructor(
      * [AtlasFrame.trimmedWidth] size is the one that gets drawn.
      */
     fun slice(frame: AtlasFrame): AtlasSlice = sliceCache.getOrPut(frame.name) {
+        val sx = textureScaleX
+        val sy = textureScaleY
+        val left = (frame.x * sx).roundToInt().coerceIn(0, maxOf(0, bitmap.width - 1))
+        val top = (frame.y * sy).roundToInt().coerceIn(0, maxOf(0, bitmap.height - 1))
+        val right = ((frame.x + frame.width) * sx).roundToInt().coerceIn(left + 1, bitmap.width)
+        val bottom = ((frame.y + frame.height) * sy).roundToInt().coerceIn(top + 1, bitmap.height)
+        val width = right - left
+        val height = bottom - top
         if (!frame.rotated) {
-            bitmap.sliceWithSize(frame.x, frame.y, frame.width, frame.height)
+            bitmap.sliceWithSize(left, top, width, height)
         } else {
-            val upright = extractRotatedCcw(bitmap, frame.x, frame.y, frame.width, frame.height)
+            val upright = extractRotatedCcw(bitmap, left, top, width, height)
             RectSlice(upright, RectangleInt(0, 0, upright.width, upright.height))
         }
     }
+
+    /**
+     * Scale factor to apply to an [Image] drawn from [slice] so a downscaled
+     * atlas keeps the sprite's authored size.
+     */
+    val inverseTextureScaleX: Double get() = if (textureScaleX != 0.0) 1.0 / textureScaleX else 1.0
+    val inverseTextureScaleY: Double get() = if (textureScaleY != 0.0) 1.0 / textureScaleY else 1.0
 
     fun sliceByName(name: String): AtlasSlice? = frame(name)?.let { slice(it) }
 
@@ -128,24 +156,84 @@ class TextureAtlas private constructor(
         // Keep the *logical* frame origin at (0,0) rather than the trimmed rect.
         img.x = -frame.frameX.toDouble()
         img.y = -frame.frameY.toDouble()
+        // Compensate a GPU-limit downscale so the sprite keeps its size.
+        img.scaleX = inverseTextureScaleX
+        img.scaleY = inverseTextureScaleY
         return img
     }
 
     companion object {
         private val cache = HashMap<String, TextureAtlas>()
 
-        /** Loads and caches the atlas whose XML lives at [atlasPath]. */
-        fun load(atlasPath: String): TextureAtlas = cache.getOrPut(atlasPath) {
-            val xml = KnfFiles.text(atlasPath)
-            val bitmapPath = Regex("imagePath\\s*=\\s*\"([^\"]+)\"")
-                .find(xml)?.groupValues?.get(1)
-                ?: error("KNF: atlas $atlasPath has no imagePath")
-            val resolved = resolveSibling(atlasPath, bitmapPath)
-            TextureAtlas(KnfFiles.bitmap(resolved), parseFrames(xml))
+        /**
+         * Drops cached atlases.
+         *
+         * Each [TextureAtlas] owns its decoded [bitmap], so the sheet stays in
+         * RAM as long as this map references it. Without this a session kept
+         * every stage and character sheet it had ever visited - on a phone that
+         * is hundreds of megabytes after a few songs, which is what made the
+         * GPU fail to upload new sprites (black squares) and the next song's
+         * stems fail to decode.
+         *
+         * [match] narrows it down to a subset of the keys, which is how
+         * `FunkinMemory.clearFreeplay` / `clearStickers` free one kind of art
+         * without touching the rest.
+         */
+        fun clearCache(match: (String) -> Boolean = { true }) {
+            if (match("")) {
+                cache.clear()
+            } else {
+                cache.keys.removeAll(match)
+            }
         }
 
+        /**
+         * One line about what the atlas cache currently pins, for `KNF_MEM`.
+         *
+         * Sheets are the single biggest thing KNF decodes, so "the heap is
+         * still high after a scene change" has to start with "is it this map?".
+         */
+        fun cacheStats(): String {
+            var bytes = 0L
+            var topPath = ""
+            var topBytes = 0L
+            for ((path, atlas) in cache) {
+                val size = atlas.bitmap.width.toLong() * atlas.bitmap.height * 4L
+                bytes += size
+                if (size > topBytes) {
+                    topBytes = size
+                    topPath = path
+                }
+            }
+            val top = if (topPath.isEmpty()) "-" else
+                topPath.substringAfterLast('/') + "=" + topBytes / (1024 * 1024) + "MB"
+            return "atlases=${cache.size} atlasBytes=${bytes / (1024 * 1024)}MB top=$top"
+        }
+
+        /**
+         * Loads and caches the atlas whose XML lives at [atlasPath].
+         *
+         * [limit] caps the decoded sheet's longest side; stage props pass the
+         * smaller backdrop limit on mobile (see
+         * [KnfFiles.backdropTextureDimension]). The atlas keeps the resulting
+         * scale so frames stay in source coordinates.
+         */
+        fun load(atlasPath: String, limit: Int = KnfFiles.maxTextureDimension): TextureAtlas =
+            cache.getOrPut(atlasPath) {
+                val xml = KnfFiles.text(atlasPath)
+                val bitmapPath = Regex("imagePath\\s*=\\s*\"([^\"]+)\"")
+                    .find(xml)?.groupValues?.get(1)
+                    ?: error("KNF: atlas $atlasPath has no imagePath")
+                val resolved = resolveSibling(atlasPath, bitmapPath)
+                val image = KnfFiles.decodedImage(resolved, limit)
+                TextureAtlas(image.bitmap, parseFrames(xml), image.scaleX, image.scaleY)
+            }
+
         /** Like [load], but returns null instead of throwing on a broken file. */
-        fun tryLoad(atlasPath: String): TextureAtlas? = runCatching { load(atlasPath) }.getOrNull()
+        fun tryLoad(
+            atlasPath: String,
+            limit: Int = KnfFiles.maxTextureDimension,
+        ): TextureAtlas? = runCatching { load(atlasPath, limit) }.getOrNull()
 
         /**
          * `renderType: "packer"` — spirit's hand-rolled frame list, a flat
@@ -158,7 +246,10 @@ class TextureAtlas private constructor(
          *
          * No trimming and no rotation, so the frame rect is the logical rect.
          */
-        fun loadPacker(listPath: String): TextureAtlas = cache.getOrPut(listPath) {
+        fun loadPacker(
+            listPath: String,
+            limit: Int = KnfFiles.maxTextureDimension,
+        ): TextureAtlas = cache.getOrPut(listPath) {
             val png = listPath.substringBeforeLast('.') + ".png"
             val frames = LinkedHashMap<String, AtlasFrame>()
             for (line in KnfFiles.text(listPath).lineSequence()) {
@@ -178,11 +269,14 @@ class TextureAtlas private constructor(
                     frameWidth = nums[2], frameHeight = nums[3],
                 )
             }
-            TextureAtlas(KnfFiles.bitmap(png), frames)
+            val image = KnfFiles.decodedImage(png, limit)
+            TextureAtlas(image.bitmap, frames, image.scaleX, image.scaleY)
         }
 
-        fun tryLoadPacker(listPath: String): TextureAtlas? =
-            runCatching { loadPacker(listPath) }.getOrNull()
+        fun tryLoadPacker(
+            listPath: String,
+            limit: Int = KnfFiles.maxTextureDimension,
+        ): TextureAtlas? = runCatching { loadPacker(listPath, limit) }.getOrNull()
 
         /**
          * Cuts a `rotated="true"` region out and turns it upright.

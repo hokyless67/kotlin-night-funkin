@@ -15,37 +15,46 @@ import korlibs.korge.view.Image
 import korlibs.korge.view.SContainer
 import korlibs.korge.view.SolidRect
 import korlibs.korge.view.Text
+import korlibs.korge.view.View
 import korlibs.korge.view.addUpdater
 import korlibs.korge.view.solidRect
 import korlibs.korge.view.text
 import korlibs.math.geom.Anchor2D
 import korlibs.math.geom.degrees
+import kotlin.math.PI
 import kotlin.math.atan2
 import kotlin.math.ceil
 import kotlin.math.hypot
+import kotlin.math.sin
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import nightfunkin.audio.MenuMusic
 import nightfunkin.audio.SfxPlayer
 import nightfunkin.audio.SongPreviewPlayer
+import nightfunkin.audio.knfPrewarmMusicOutput
 import nightfunkin.core.AnimateAtlas
 import nightfunkin.core.AnimateSpriteView
 import nightfunkin.core.Constants
+import nightfunkin.core.KnfBootLog
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfFmt
 import nightfunkin.core.KnfInput
+import nightfunkin.core.KnfMemory
 import nightfunkin.core.KnfTouch
+import nightfunkin.core.guardedSceneInit
 import nightfunkin.core.Save
 import nightfunkin.core.SparrowSprite
 import nightfunkin.core.TextureAtlas
 import nightfunkin.platform.KnfEnv
+import nightfunkin.platform.KnfPlatform
 import nightfunkin.play.PlayRequest
 import nightfunkin.play.PlayScene
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.random.Random
@@ -95,6 +104,7 @@ class SongSelectScene : Scene() {
     private var viewCapsules: MutableList<FreeplayCapsule> = mutableListOf()
 
     private lateinit var cardLayer: Container
+    private var djLayer: Container? = null
     private lateinit var difficultyLayer: Container
     private lateinit var capsuleLayer: Container
     private lateinit var albumLayer: Container
@@ -102,8 +112,28 @@ class SongSelectScene : Scene() {
     private lateinit var uiLayer: Container
 
     private var pinkBack: Image? = null
+    private var pinkBackRight: Image? = null
+
+    /**
+     * `BackingCard.pinkBack.width`: 524 px at 16:9, plus the widescreen
+     * `CUTOUT_WIDTH` on a phone. The plate is the backdrop the song list and
+     * the DJ card share, so its width drives every layout value below.
+     */
+    private var cardWidth = 524.0
     private var cardGlow: Image? = null
+
+    /** `cardGlow`'s widescreen stretch; its beat pulse multiplies this. */
+    private var glowBaseScaleX = 1.0
     private var backingImage: Image? = null
+    /**
+     * `blackOverlayBullshitLOLXD`: the angle-masked backdrop shape painted
+     * black, slid in from the right so the main menu that Freeplay still draws
+     * under its entrance (`persistentDraw`) stops showing through it.
+     */
+    private var backingOverlay: Image? = null
+    private var backingOverlayX = 0.0
+    private var backingOverlaySlideElapsed = 0.0
+    private var backingOverlaySlideActive = false
     private var orangeStrip: SolidRect? = null
     private var orangeStripLeft: SolidRect? = null
 
@@ -174,9 +204,25 @@ class SongSelectScene : Scene() {
     private var letterSort: FreeplayLetterSort? = null
     private var letterFilter = "ALL"
 
+    /**
+     * `overhangStuff`: the black strip at the top. It is its own layer because
+     * FNF tweens it down from `y = -164` to `-100` over the first 0.3 s, while
+     * the rest of the top bar only appears once the DJ intro lands.
+     */
+    private var overhangLayer: Container? = null
+    private var overhangSlideElapsed = 0.0
+    private var overhangSlideActive = false
+
     private var headerBg: SolidRect? = null
     private var headerText: korlibs.korge.view.Text? = null
     private var charHint: korlibs.korge.view.Text? = null
+
+    /**
+     * `fpScoreDisplay` + `fnfHighscoreSpr` + `clearBoxSprite` + `txtCompletion`:
+     * the top-right stats. FNF gives them their own `exitMovers` entry
+     * (`x = FlxG.width`), so they fly right instead of riding the top bar up.
+     */
+    private var statsLayer: Container? = null
 
     private var highscoreSprite: SparrowSprite? = null
     private var scoreDigits: List<ScoreDigit> = emptyList()
@@ -210,11 +256,55 @@ class SongSelectScene : Scene() {
 
     private var transitioning = false
     private var leaving = false
-    private var leaveElapsed = 0.0
-    private var fadeRect: SolidRect? = null
 
-    override suspend fun SContainer.sceneInit() {
+    /** One `FreeplayState.exitMovers` entry: a layer sliding to [targetX]/[targetY]. */
+    private class ExitMover(
+        val view: View,
+        val startX: Double,
+        val startY: Double,
+        val targetX: Double,
+        val targetY: Double,
+        val duration: Double,
+    )
+
+    private val exitMovers = ArrayList<ExitMover>()
+    private var exitElapsed = 0.0
+    private var switchedToMenu = false
+    private var touchControls: TouchControls? = null
+
+    // `BackingCard.disappear()`: the plate turns pink again while its glow
+    // bursts out, and the orange strips vanish.
+    private var cardDisappearActive = false
+    private var cardDisappearElapsed = 0.0
+
+    /** The marquees / YEAH!! collage / beat glows drawn on the plate. */
+    private var cardTextLayer: Container? = null
+    private var cardTextFadeActive = false
+    private var cardTextFadeElapsed = 0.0
+
+    /** `FreeplayState.fadeDots(false)`: every `DifficultyDot` fades out. */
+    private var dotsFadeActive = false
+    private var dotsFadeElapsed = 0.0
+
+    /** The previous scene's frame, drawn until the freeplay backdrop is up. */
+    private var menuBackdrop: Image? = null
+    private var menuBackdropBitmap: Bitmap? = null
+
+    override suspend fun SContainer.sceneInit() = guardedSceneInit("Freeplay") {
+        runSceneInit()
+    }
+
+    private suspend fun SContainer.runSceneInit() {
         sceneRoot = this
+        // The old scene's UI sheets are still alive while this one loads
+        // (`sceneInit` runs before its `sceneDestroy`); drop the cached art
+        // first so the two scenes' atlases never coexist on a phone.
+        KnfMemory.beginScene(views, "Freeplay")
+        // The song preview opens an audio device the moment a capsule is
+        // selected, and the first one in a session used to start with the
+        // device-open silence (hundreds of milliseconds on MIUI). Warm one up
+        // off the GL thread while the menu is still being laid out.
+        launch(Dispatchers.Default) { runCatching { knfPrewarmMusicOutput() } }
         Save.load()
         newCharacterCard = KnfEnv["KNF_NEWCARD"] == "1" || Save.hasNewCharacter()
         fiveBySeven = loadFont("fonts/5by7.ttf")
@@ -226,18 +316,29 @@ class SongSelectScene : Scene() {
         bandFontMedium = fiveBySeven?.let { runCatching { BitmapFont(it, 60.0) }.getOrNull() }
         bandFontLarge = fiveBySeven?.let { runCatching { BitmapFont(it, 80.0) }.getOrNull() }
 
-        solidRect(Constants.GAME_WIDTH.toDouble(), Constants.GAME_HEIGHT.toDouble(), Colors.BLACK)
+        // FNF opens Freeplay as a substate over the still-drawn MainMenuState
+        // (`persistentDraw = true`), so the menu is visible behind the capsule
+        // and card entrance until the freeplay backdrop fades in. The outgoing
+        // scene hands its last frame over; fall back to plain black.
+        val menuFrame = FreeplayBackdrop.consume()
+        if (menuFrame != null) {
+            menuBackdropBitmap = menuFrame
+            menuBackdrop = Image(menuFrame).also { addChild(it) }
+        } else {
+            solidRect(Constants.GAME_WIDTH.toDouble(), Constants.GAME_HEIGHT.toDouble(), Colors.BLACK)
+        }
 
         cardLayer = Container().also { addChild(it) }
         buildCard()
 
-        val djLayer = Container().also { addChild(it) }
-        buildDj(djLayer)
+        val djContainer = Container().also { addChild(it) }
+        djLayer = djContainer
+        buildDj(djContainer)
 
         difficultyLayer = Container().also { addChild(it) }
         buildDifficulty(difficultyLayer)
 
-        backingImage = buildBackingImage()
+        backingImage = buildBackingImage(this)
         backingImage?.let {
             it.alpha = 0.0
             addChild(it)
@@ -254,6 +355,18 @@ class SongSelectScene : Scene() {
         selectorLayer = Container().also { addChild(it) }
         buildSelectors(selectorLayer)
 
+        // `fpScoreDisplay`, `fnfHighscoreSpr`, `clearBoxSprite` and
+        // `txtCompletion` are added before the overhang in FNF, and their exit
+        // mover sends them right rather than up with the top bar.
+        statsLayer = Container().also {
+            it.visible = false
+            addChild(it)
+        }
+
+        // `add(overhangStuff)` is a separate layer in FNF, drawn above the
+        // capsules and album but below the top bar's texts.
+        overhangLayer = Container().also { addChild(it) }
+
         uiLayer = Container().also {
             it.visible = false
             addChild(it)
@@ -264,17 +377,10 @@ class SongSelectScene : Scene() {
         // hidden forever.
         if (dj == null) onDjIntroDone()
 
-        // Throw-away overlay for the short exit fade.
-        fadeRect = solidRect(
-            Constants.GAME_WIDTH.toDouble(),
-            Constants.GAME_HEIGHT.toDouble(),
-            Colors.BLACK,
-        ).also {
-            it.alpha = 0.0
-        }
-
         loadSounds()
-        menuMusic.pause()
+        // `freakyMenu` deliberately keeps playing here: FNF opens Freeplay as a
+        // substate and only pauses the menu track on the first
+        // `changeSelection` (at the end of the DJ intro, see `onDjIntroDone`).
 
         rebuildVisible(
             preserveSongId = rememberedSongId,
@@ -308,15 +414,33 @@ class SongSelectScene : Scene() {
     private fun buildCard() {
         val pinkBitmap = KnfFiles.bitmapOrNull("preload/images/freeplay/pinkBack.png")
         if (pinkBitmap != null) {
-            pinkBack = Image(pinkBitmap).also {
-                it.x = -pinkBitmap.width.toDouble()
+            // `BitmapUtil.scalePartByWidth(pinkBack, CUTOUT_WIDTH)`: the left
+            // half is stretched by the extra width, the right half is copied
+            // untouched, so the plate grows to the right on a wide screen.
+            // (The intro tween later slides it from -width to 0.)
+            val cutout = Constants.GAME_CUTOUT_WIDTH.toDouble()
+            val half = pinkBitmap.width / 2
+            val stretch = (half + cutout) / half
+            cardWidth = pinkBitmap.width + cutout
+
+            val left = pinkBitmap.sliceWithSize(0, 0, half, pinkBitmap.height)
+            val right = pinkBitmap.sliceWithSize(half, 0, pinkBitmap.width - half, pinkBitmap.height)
+            pinkBack = Image(left).also {
+                it.x = -cardWidth
                 it.y = 0.0
-                it.tint = RGBA(0xFF, 0xD4, 0xE9)
+                it.scaleX = stretch
+                it.tint = PINK
+                cardLayer.addChild(it)
+            }
+            pinkBackRight = Image(right).also {
+                it.x = -cardWidth + half + cutout
+                it.y = 0.0
+                it.tint = PINK
                 cardLayer.addChild(it)
             }
         }
 
-        val width = pinkBack?.let { it.bitmap.width.toDouble() } ?: 524.0
+        val width = cardWidth
         if (newCharacterCard) {
             buildNewCharacterCard()
         } else {
@@ -327,14 +451,35 @@ class SongSelectScene : Scene() {
         // over the pink plate instead of disappearing behind it.
         val glowBitmap = KnfFiles.bitmapOrNull("preload/images/freeplay/cardGlow.png")
         if (glowBitmap != null) {
+            // Also `scalePartByWidth(cardGlow, CUTOUT_WIDTH)`.
+            glowBaseScaleX = (glowBitmap.width + Constants.GAME_CUTOUT_WIDTH) / glowBitmap.width.toDouble()
             cardGlow = Image(glowBitmap).also {
                 it.x = -30.0
                 it.y = -30.0
+                it.scaleX = glowBaseScaleX
                 it.alpha = 0.0
                 it.blendMode = BlendMode.ADD
                 cardLayer.addChild(it)
             }
         }
+    }
+
+    /**
+     * Moves the two halves of the pink plate together. [x] is the left edge of
+     * the whole (`pinkBitmap.width + CUTOUT_WIDTH`)-wide plate.
+     */
+    private fun setPinkX(x: Double) {
+        val left = pinkBack ?: return
+        val cutout = Constants.GAME_CUTOUT_WIDTH.toDouble()
+        val half = (cardWidth - cutout) / 2.0
+        left.x = x
+        pinkBackRight?.x = x + half + cutout
+    }
+
+    /** `BackingCard` tints the plate pink until the intro lands, then yellow. */
+    private fun setPinkTint(color: RGBA) {
+        pinkBack?.tint = color
+        pinkBackRight?.tint = color
     }
 
     /**
@@ -360,53 +505,67 @@ class SongSelectScene : Scene() {
             it.visible = false
         }
 
+        // Everything decorative on the plate: the six marquees, the YEAH!!
+        // collage and the beat glows. The marquees are endless wrap-around
+        // copies, so sliding the card off-screen would never remove them; the
+        // exit fades this layer out while the plate flies away.
+        val textLayer = Container().also {
+            cardLayer.addChild(it)
+            cardTextLayer = it
+        }
+
         val yeahAtlas = runCatching {
             AnimateAtlas("preload/images/freeplay/backing-text-yeah")
         }.getOrNull()
         backingTextYeah = yeahAtlas?.takeIf { it.poses.isNotEmpty() }?.let { atlas ->
             AnimateSpriteView(atlas, applyStageMatrix = false).also {
-                it.x = -320.0
+                // `(CUTOUT_WIDTH * DJ_POS_MULTI) + -320`.
+                it.x = -320.0 + DJ_SHIFT
                 it.y = 120.0
                 // `BackingCard` never calls `play` on this sprite while
                 // browsing: the atlas' first pose is empty and the
                 // YEAH!!!/YES YES YES collage only plays on confirm.
                 it.playFrames("", listOf(0), loop = false)
-                cardLayer.addChild(it)
+                textLayer.addChild(it)
             }
         }
 
         val bands = ArrayList<BackingScrollBand>()
-        // `BGScrollingText` arguments: x, y, text, widthShit, bold, size.
-        buildBackingBand(cardLayer, 0.0, 160.0, "HOT BLOODED IN MORE WAYS THAN ONE",
-            1280.0, RGBA(0xFF, 0xF3, 0x83), 43.0, 6.8, bold = true, out = bands, visible = false)
-        buildBackingBand(cardLayer, 0.0, 220.0, "BOYFRIEND",
-            640.0, RGBA(0xFF, 0x99, 0x63), 60.0, -3.8, bold = false, out = bands, visible = false)
-        buildBackingBand(cardLayer, 0.0, 285.0, "PROTECT YO NUTS",
-            640.0, Colors.WHITE, 43.0, 3.5, bold = true, out = bands, visible = false)
-        buildBackingBand(cardLayer, 0.0, 335.0, "BOYFRIEND",
-            640.0, RGBA(0xFF, 0x99, 0x63), 60.0, -3.8, bold = false, out = bands, visible = false)
-        buildBackingBand(cardLayer, 0.0, 397.0, "HOT BLOODED IN MORE WAYS THAN ONE",
-            1280.0, RGBA(0xFF, 0xF3, 0x83), 43.0, 6.8, bold = true, out = bands, visible = false)
-        buildBackingBand(cardLayer, 0.0, 450.0, "BOYFRIEND",
-            640.0, RGBA(0xFE, 0xA4, 0x00), 60.0, -3.8, bold = false, out = bands, visible = false)
+        // `BGScrollingText` arguments: x, y, text, widthShit, bold, size. The
+        // scripts size the long rows to `FlxG.width` and the short ones to
+        // `FlxG.width / 2`.
+        val fullBand = Constants.GAME_WIDTH.toDouble()
+        val halfBand = fullBand / 2.0
+        buildBackingBand(textLayer, 0.0, 160.0, "HOT BLOODED IN MORE WAYS THAN ONE",
+            fullBand, RGBA(0xFF, 0xF3, 0x83), 43.0, 6.8, bold = true, out = bands, visible = false)
+        buildBackingBand(textLayer, 0.0, 220.0, "BOYFRIEND",
+            halfBand, RGBA(0xFF, 0x99, 0x63), 60.0, -3.8, bold = false, out = bands, visible = false)
+        buildBackingBand(textLayer, 0.0, 285.0, "PROTECT YO NUTS",
+            halfBand, Colors.WHITE, 43.0, 3.5, bold = true, out = bands, visible = false)
+        buildBackingBand(textLayer, 0.0, 335.0, "BOYFRIEND",
+            halfBand, RGBA(0xFF, 0x99, 0x63), 60.0, -3.8, bold = false, out = bands, visible = false)
+        buildBackingBand(textLayer, 0.0, 397.0, "HOT BLOODED IN MORE WAYS THAN ONE",
+            fullBand, RGBA(0xFF, 0xF3, 0x83), 43.0, 6.8, bold = true, out = bands, visible = false)
+        buildBackingBand(textLayer, 0.0, 450.0, "BOYFRIEND",
+            halfBand, RGBA(0xFE, 0xA4, 0x00), 60.0, -3.8, bold = false, out = bands, visible = false)
         boyfriendBands = bands
 
         val glowBitmap = KnfFiles.bitmapOrNull("preload/images/freeplay/beatglow.png")
         if (glowBitmap != null) {
             beatGlowDark = Image(glowBitmap).also {
-                it.x = -300.0
+                it.x = -300.0 + DJ_SHIFT
                 it.y = 330.0
                 it.alpha = 0.0
                 it.visible = false
-                cardLayer.addChild(it)
+                textLayer.addChild(it)
             }
             beatGlow = Image(glowBitmap).also {
-                it.x = -300.0
+                it.x = -300.0 + DJ_SHIFT
                 it.y = 330.0
                 it.alpha = 0.0
                 it.blendMode = BlendMode.ADD
                 it.visible = false
-                cardLayer.addChild(it)
+                textLayer.addChild(it)
             }
         }
     }
@@ -422,37 +581,50 @@ class SongSelectScene : Scene() {
         }
         newCardGroup = group
 
-        fun addImage(path: String, x: Double, y: Double, blend: BlendMode? = null): Image? {
+        fun addImage(
+            path: String,
+            x: Double,
+            y: Double,
+            blend: BlendMode? = null,
+            stretchByCutout: Boolean = false,
+        ): Image? {
             val bitmap = KnfFiles.bitmapOrNull("preload/images/freeplay/backingCards/newCharacter/$path")
                 ?: return null
             return Image(bitmap).also {
                 it.x = x
                 it.y = y
+                // `BitmapUtil.scalePartByWidth(bitmap, CUTOUT_WIDTH)`.
+                if (stretchByCutout && bitmap.width > 0) {
+                    it.scaleX = (bitmap.width + Constants.GAME_CUTOUT_WIDTH) / bitmap.width.toDouble()
+                }
                 if (blend != null) it.blendMode = blend
                 group.addChild(it)
             }
         }
 
-        addImage("darkback.png", 0.0, 0.0)
+        addImage("darkback.png", 0.0, 0.0, stretchByCutout = true)
 
         // The six `BGScrollingText` lines, top to bottom. All six use the
-        // script's `bold = true`.
-        buildBackingBand(group, 0.0, 163.0, "COULD IT BE A NEW FRIEND? OR FOE??", 1280.0, RGBA(0x13, 0x93, 0x76), 43.0, -4.0, bold = true)
-        buildBackingBand(group, -440.0, 215.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0, bold = true)
-        buildBackingBand(group, 0.0, 286.0, "SOMEONE'S WAITING!", 640.0, RGBA(0x40, 0xEA, 0x84), 43.0, -2.0, bold = true)
-        buildBackingBand(group, -220.0, 331.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0, bold = true)
-        buildBackingBand(group, 0.0, 402.0, "COULD IT BE A NEW FRIEND? OR FOE??", 1280.0, RGBA(0x13, 0x93, 0x76), 43.0, -4.0, bold = true)
-        buildBackingBand(group, 0.0, 458.0, "NEW UNLOCK!", 640.0, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0, bold = true)
+        // script's `bold = true`; long rows span `FlxG.width`, short ones half.
+        val fullBand = Constants.GAME_WIDTH.toDouble()
+        val halfBand = fullBand / 2.0
+        buildBackingBand(group, 0.0, 163.0, "COULD IT BE A NEW FRIEND? OR FOE??", fullBand, RGBA(0x13, 0x93, 0x76), 43.0, -4.0, bold = true)
+        buildBackingBand(group, -440.0, 215.0, "NEW UNLOCK!", halfBand, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0, bold = true)
+        buildBackingBand(group, 0.0, 286.0, "SOMEONE'S WAITING!", halfBand, RGBA(0x40, 0xEA, 0x84), 43.0, -2.0, bold = true)
+        buildBackingBand(group, -220.0, 331.0, "NEW UNLOCK!", halfBand, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0, bold = true)
+        buildBackingBand(group, 0.0, 402.0, "COULD IT BE A NEW FRIEND? OR FOE??", fullBand, RGBA(0x13, 0x93, 0x76), 43.0, -4.0, bold = true)
+        buildBackingBand(group, 0.0, 458.0, "NEW UNLOCK!", halfBand, RGBA(0x99, 0xBD, 0xF2), 80.0, 2.0, bold = true)
 
-        addImage("multiplyBar.png", -10.0, 440.0, BlendMode.MULTIPLY)
+        addImage("multiplyBar.png", -10.0, 440.0, BlendMode.MULTIPLY, stretchByCutout = true)
 
         // The pulsing light/multiply stack that turns the card yellow/red.
-        newCardLight1 = addImage("orange gradient.png", -360.0, 230.0, BlendMode.ADD)
-        newCardMultiply1 = addImage("red.png", -15.0, -125.0, BlendMode.MULTIPLY)
-        newCardMultiply2 = addImage("red.png", -15.0, -125.0, BlendMode.MULTIPLY)
-        newCardLight2 = addImage("orange gradient.png", -360.0, 230.0, BlendMode.ADD)
-        newCardYellow = addImage("yellow bg piece.png", 0.0, 0.0, BlendMode.MULTIPLY)
-        newCardLight3 = addImage("red gradient.png", -360.0, 290.0, BlendMode.ADD)
+        // `lightLayer.x = (CUTOUT_WIDTH * DJ_POS_MULTI) + -360`.
+        newCardLight1 = addImage("orange gradient.png", -360.0 + DJ_SHIFT, 230.0, BlendMode.ADD)
+        newCardMultiply1 = addImage("red.png", -15.0, -125.0, BlendMode.MULTIPLY, stretchByCutout = true)
+        newCardMultiply2 = addImage("red.png", -15.0, -125.0, BlendMode.MULTIPLY, stretchByCutout = true)
+        newCardLight2 = addImage("orange gradient.png", -360.0 + DJ_SHIFT, 230.0, BlendMode.ADD)
+        newCardYellow = addImage("yellow bg piece.png", 0.0, 0.0, BlendMode.MULTIPLY, stretchByCutout = true)
+        newCardLight3 = addImage("red gradient.png", -360.0 + DJ_SHIFT, 290.0, BlendMode.ADD)
     }
 
     /**
@@ -534,7 +706,8 @@ class SongSelectScene : Scene() {
 
         djAtlas = atlas
         val view = AnimateSpriteView(atlas, isPixel = false, applyStageMatrix = true)
-        view.x = 0.0
+        // `createFreeplayDJ((CUTOUT_WIDTH * DJ_POS_MULTI) + 640, ...)`.
+        view.x = CUTOUT_WIDTH * DJ_POS_MULTI
         view.y = 0.0
         dj = view
         parent.addChild(view)
@@ -548,18 +721,70 @@ class SongSelectScene : Scene() {
         }
     }
 
-    private fun buildBackingImage(): Image? {
+    private fun buildBackingImage(parent: Container): Image? {
         val bitmap = KnfFiles.bitmapOrNull("preload/images/freeplay/freeplayBGweek1-bf.png") ?: return null
         val masked = applyAngleMask(bitmap)
         val targetHeight = Constants.GAME_HEIGHT + 1.0
-        val scale = targetHeight / masked.height
-        val width = pinkBack?.let { it.bitmap.width.toDouble() } ?: 524.0
+        // `backingImage = create(backingCard.pinkBack.width * 0.74, 0, ...)`.
+        val x = cardWidth * 0.74
+        val heightScale = targetHeight / masked.height
+        // `setGraphicSize(0, FlxG.height + 1)`. On a 20:9 screen the shipped
+        // 821x516 art is 67 px too narrow at that scale, which FNF leaves as a
+        // black sliver; grow it just enough to cover the game area instead.
+        val widthScale = (Constants.GAME_WIDTH - x) / masked.width
+        val scale = maxOf(heightScale, widthScale)
+
+        // `blackOverlayBullshitLOLXD`: FNF creates the same size and shape in
+        // black at `x = FlxG.width` and tweens it to `backingImage.x` over
+        // 0.7 s (`FlxEase.quintOut`). It sits under the backdrop and hides the
+        // leftover main menu in the area the backdrop will cover; without it
+        // the menu keeps poking out on the right for the whole entrance.
+        backingOverlayX = x
+        backingOverlay = Image(angleMaskedBlack(masked.width, masked.height)).also {
+            it.scaleX = scale
+            it.scaleY = scale
+            it.x = Constants.GAME_WIDTH.toDouble()
+            it.y = 0.0
+            parent.addChild(it)
+        }
+        backingOverlaySlideElapsed = 0.0
+        backingOverlaySlideActive = true
+
         return Image(masked).also {
             it.scaleX = scale
             it.scaleY = scale
-            it.x = width * 0.74
+            it.x = x
             it.y = 0.0
         }
+    }
+
+    /**
+     * The exact coverage [applyAngleMask] keeps, painted black.
+     *
+     * `blackOverlayBullshitLOLXD` is a `makeGraphic` rectangle that borrows the
+     * backdrop's `angleMaskShader`, so it has to match the backdrop's slanted
+     * left edge.
+     */
+    private fun angleMaskedBlack(width: Int, height: Int): Bitmap32 {
+        val out = Bitmap32(width, height, premultiplied = true)
+        for (y in 0 until height) {
+            val edge = ANGLE_MASK_X * (y + 0.5) / height
+            val limit = min(width, ceil(edge).toInt() + 1)
+            // Everything right of the slanted edge is solid black; only the
+            // one-pixel-wide diagonal has partial coverage.
+            for (x in 0 until width) {
+                val coverage = if (x < limit) {
+                    (x + 1.0 - edge).coerceIn(0.0, 1.0)
+                } else {
+                    1.0
+                }
+                out.setRgbaAtIndex(
+                    y * width + x,
+                    RGBA(0, 0, 0, (coverage * 255.0).roundToInt()),
+                )
+            }
+        }
+        return out
     }
 
     /**
@@ -617,14 +842,16 @@ class SongSelectScene : Scene() {
 
         val left = SparrowSprite(atlas, frames, fps = 24.0, loop = true).also {
             it.setPixelArt(true)
-            it.x = 20.0
+            // `new DifficultySelector((CUTOUT_WIDTH * DJ_POS_MULTI) + 20, ...)`.
+            it.x = 20.0 + DJ_SHIFT
             it.y = 70.0
             it.alpha = 0.0
             parent.addChild(it)
         }
         val right = SparrowSprite(atlas, frames, fps = 24.0, loop = true).also {
             it.setPixelArt(true)
-            it.x = 374.0
+            // `new DifficultySelector((CUTOUT_WIDTH * DJ_POS_MULTI) + 325, ...)`.
+            it.x = 374.0 + DJ_SHIFT
             it.y = 70.0
             it.scaleX = -1.0
             it.alpha = 0.0
@@ -666,13 +893,16 @@ class SongSelectScene : Scene() {
     // ======================================================================
 
     private fun buildTopUi() {
-        // `overhangStuff` is a full-width black strip. It is 164 px tall but
-        // parked at y=-100, so exactly 64 px remain visible above every other
-        // Freeplay layer.
-        uiLayer.solidRect(Constants.GAME_WIDTH.toDouble(), 164.0, Colors.BLACK).also {
+        // `overhangStuff` is a full-width black strip. It is 164 px tall and
+        // starts at y = -164, then tweens to -100 over 0.3 s (`quartOut`), so
+        // exactly 64 px remain visible above every other Freeplay layer.
+        overhangLayer?.solidRect(Constants.GAME_WIDTH.toDouble(), 164.0, Colors.BLACK)?.also {
             it.x = 0.0
-            it.y = -100.0
+            it.y = 0.0
         }
+        overhangLayer?.y = -164.0
+        overhangSlideElapsed = 0.0
+        overhangSlideActive = true
 
         // `freeplayTxtBg`: the black plate behind the top-left heading. FNF
         // sizes it from the rendered FlxText, so use the Korge text bounds.
@@ -683,13 +913,15 @@ class SongSelectScene : Scene() {
 
         headerText = uiLayer.text("FREEPLAY", textSize = 48.0, color = Colors.WHITE).also {
             vcr?.let { font -> it.font = Resourceable.Fixed(font) }
-            it.x = 8.0
+            // `new FlxText(Math.max(gameNotchSize.x, 8), 8, ...)`.
+            it.x = max(Constants.GAME_NOTCH, 8.0)
             it.y = 8.0
+            headerBg?.x = it.x - 8.0
         }
 
         val ost = uiLayer.text("OFFICIAL OST", textSize = 48.0, color = Colors.WHITE)
         vcr?.let { ost.font = Resourceable.Fixed(it) }
-        ost.x = Constants.GAME_WIDTH - 8.0 - ost.width
+        ost.x = Constants.GAME_WIDTH - Constants.GAME_NOTCH - 8.0 - ost.width
         ost.y = 8.0
 
         // FreeplayState's `charSelectHint`. A stock save has both BF and Pico
@@ -725,7 +957,10 @@ class SongSelectScene : Scene() {
         val atlas = runCatching {
             AnimateAtlas("preload/images/freeplay/sortedLetters")
         }.getOrNull() ?: return
-        val sort = FreeplayLetterSort(atlas).also {
+        val sort = FreeplayLetterSort(
+            atlas,
+            groupX = 400.0 + Constants.GAME_CUTOUT_WIDTH / 1.5 * SONGS_POS_MULTI,
+        ).also {
             it.onChange = ::changeLetterFilter
             it.onSound = {
                 scrollSound?.let { sound -> sfx.play(sound, 0.4) }
@@ -798,10 +1033,11 @@ class SongSelectScene : Scene() {
         if (frames.isEmpty()) return
         highscoreSprite = SparrowSprite(atlas, frames, fps = 24.0, loop = false).also {
             it.setPixelArt(true)
-            it.x = 860.0
+            // `new FlxSprite(FlxG.width - (gameNotchSize.x + 420), 70)`.
+            it.x = Constants.GAME_WIDTH - Constants.GAME_NOTCH - 420.0
             it.y = 70.0
             it.visible = false
-            uiLayer.addChild(it)
+            statsLayer?.addChild(it)
         }
     }
 
@@ -813,25 +1049,28 @@ class SongSelectScene : Scene() {
         // is constructed at y = 60; `preAdd` adds the group's offset, so the
         // digits actually sit at y = 120.
         val y = 120.0
+        // `new FreeplayScore(FlxG.width - (gameNotchSize.x + 353), 60, ...)`.
+        val baseX = Constants.GAME_WIDTH - Constants.GAME_NOTCH - 353.0
         scoreDigits = (0 until 7).map { i ->
-            val baseX = 927.0 + 45.0 * i
+            val digitX = baseX + 45.0 * i
             val image = Image(atlas.slice(zeroFrames.first())).also {
                 it.scaleX = ScoreDigit.SCALE
                 it.scaleY = ScoreDigit.SCALE
                 it.visible = false
-                uiLayer.addChild(it)
+                statsLayer?.addChild(it)
             }
-            ScoreDigit(image, atlas, animations, baseX, y)
+            ScoreDigit(image, atlas, animations, digitX, y)
         }
     }
 
     private fun buildClearBox() {
         clearBox = KnfFiles.bitmapOrNull("preload/images/freeplay/clearBox.png")?.let {
             Image(it).also { image ->
-                image.x = 1165.0
+                // `new FlxSprite(FlxG.width - (gameNotchSize.x + 115), 65)`.
+                image.x = Constants.GAME_WIDTH - Constants.GAME_NOTCH - 115.0
                 image.y = 65.0
                 image.visible = false
-                uiLayer.addChild(image)
+                statsLayer?.addChild(image)
             }
         }
 
@@ -855,10 +1094,11 @@ class SongSelectScene : Scene() {
         for ((digit, rect) in rects.withIndex()) completionRects[digit] = rect
         completionDigits = (0 until 3).map { i ->
             Image(bitmap.sliceWithSize(4, 4, 25, 24)).also {
-                it.x = 1185.0 + 24.0 * i
+                // `AtlasText(FlxG.width - (gameNotchSize.x + 95), 87, ...)`.
+                it.x = Constants.GAME_WIDTH - Constants.GAME_NOTCH - 95.0 + 24.0 * i
                 it.y = 87.0
                 it.visible = false
-                uiLayer.addChild(it)
+                statsLayer?.addChild(it)
             }
         }
     }
@@ -868,7 +1108,8 @@ class SongSelectScene : Scene() {
         difficultyDots = (0 until 5).map { i ->
             Image(dot).also {
                 it.smoothing = false
-                it.x = 260.0 - 14.7 * 4.0 + 30.0 * i - 75.0
+                // `difficultyDots.group.members[i].x = (CUTOUT_WIDTH * DJ_POS_MULTI) + ...`.
+                it.x = CUTOUT_WIDTH * DJ_POS_MULTI + 260.0 - 14.7 * 4.0 + 30.0 * i - 75.0
                 it.y = 170.0
                 it.visible = false
                 uiLayer.addChild(it)
@@ -919,7 +1160,8 @@ class SongSelectScene : Scene() {
             1 -> -24.0
             else -> 0.0
         }
-        val baseX = 1185.0 - offset
+        // `AtlasText(FlxG.width - (gameNotchSize.x + 95), 87, ...)`.
+        val baseX = Constants.GAME_WIDTH - Constants.GAME_NOTCH - 95.0 - offset
         for (i in completionDigits.indices) {
             val image = completionDigits[i]
             val digit = text.getOrNull(i)
@@ -1054,7 +1296,7 @@ class SongSelectScene : Scene() {
         val badge = obtainBadge(currentDifficulty) ?: return
         shownDifficulty = currentDifficulty
         difficultyView?.visible = false
-        badge.x = 90.0
+        badge.x = BADGE_HOME_X
         badge.y = 80.0
         badge.alpha = 1.0
         badge.visible = true
@@ -1075,7 +1317,7 @@ class SongSelectScene : Scene() {
         // The intro slide shares the sprite; park it on its final position.
         if (difficultySlideActive) {
             difficultySlideActive = false
-            difficultyView?.x = 90.0
+            difficultyView?.x = BADGE_HOME_X
         }
         // A press during the 0.4 s slide lands the previous tween instantly.
         if (badgeSlideActive) finishBadgeSlide()
@@ -1090,9 +1332,9 @@ class SongSelectScene : Scene() {
         // The slide-out tween exists in the source but is occluded the same
         // frame; park the old badge straight away.
         outgoing.visible = false
-        outgoing.x = 90.0
+        outgoing.x = BADGE_HOME_X
 
-        incoming.x = if (badgeSlideSign > 0) 500.0 else -320.0
+        incoming.x = badgeEnterX(badgeSlideSign)
         incoming.y = 80.0 - 5.0
         incoming.alpha = 0.5
         incoming.visible = true
@@ -1104,10 +1346,10 @@ class SongSelectScene : Scene() {
         badgeSlideElapsed += dt
         val t = (badgeSlideElapsed / 0.2).coerceIn(0.0, 1.0)
         val eased = circInOut(t)
-        val enterX = if (badgeSlideSign > 0) 500.0 else -320.0
+        val enterX = badgeEnterX(badgeSlideSign)
 
         difficultyViewIn?.let { incoming ->
-            incoming.x = enterX + (90.0 - enterX) * eased
+            incoming.x = enterX + (BADGE_HOME_X - enterX) * eased
             // The 1/24 s flash timer: full alpha and the offset reset.
             if (badgeSlideElapsed >= 1.0 / 24.0) {
                 incoming.alpha = 1.0
@@ -1120,15 +1362,15 @@ class SongSelectScene : Scene() {
 
     private fun finishBadgeSlide() {
         badgeSlideActive = false
-        // The outgoing tween's onComplete: park back at 90 and hide.
+        // The outgoing tween's onComplete: park back at its home and hide.
         difficultyView?.also {
-            it.x = 90.0
+            it.x = BADGE_HOME_X
             it.y = 80.0
             it.alpha = 1.0
             it.visible = false
         }
         difficultyViewIn?.also { incoming ->
-            incoming.x = 90.0
+            incoming.x = BADGE_HOME_X
             incoming.y = 80.0
             incoming.alpha = 1.0
             incoming.visible = true
@@ -1221,10 +1463,10 @@ class SongSelectScene : Scene() {
                     fps = 24.0,
                     loop = true,
                 ).also {
-                    // AlbumRoll: FunkinSprite.createSparrow(width - 355, 500)
+                    // `AlbumRoll`: FunkinSprite.createSparrow((width - 355) - notch, 500)
                     // plus the album's title offsets. No scale.
                     it.setPixelArt(true)
-                    it.x = 925.0 + offsetX
+                    it.x = Constants.GAME_WIDTH - Constants.GAME_NOTCH - 355.0 + offsetX
                     it.y = 500.0 + offsetY
                     albumLayer.addChild(it)
                 }
@@ -1295,7 +1537,9 @@ class SongSelectScene : Scene() {
         // `DifficultyStars.flameCheck`: ratings 11+ put the excess stars on
         // fire, one `freeplayFlame` per point above 10. The flames sit behind
         // the stars and above the album artwork.
-        val flames = albumFlames ?: FreeplayFlamesView().also { albumFlames = it }
+        val flames = albumFlames ?: FreeplayFlamesView(
+            Constants.GAME_WIDTH - Constants.GAME_NOTCH - 367.0,
+        ).also { albumFlames = it }
         if (flames.container.parent == null) albumLayer.addChild(flames.container)
         flames.setCount(if (rating > 10) rating - 10 else 0)
 
@@ -1309,7 +1553,8 @@ class SongSelectScene : Scene() {
         }
         if (band.isEmpty()) return
         val view = AnimateSpriteView(atlas).also {
-            it.x = 950.0
+            // `DifficultyStars((FlxG.width - 330) - gameNotchSize.x, 209)`.
+            it.x = Constants.GAME_WIDTH - Constants.GAME_NOTCH - 330.0
             it.y = 209.0
             it.playFrames("difficulty-$rating", band, loop = rating != 0)
             if (rating == 0) it.stop()
@@ -1423,7 +1668,8 @@ class SongSelectScene : Scene() {
         }
     }
 
-    private fun intendedX(index: Double): Double = 270.0 + 60.0 * sin(index)
+    private fun intendedX(index: Double): Double =
+        270.0 + 60.0 * sin(index) + CUTOUT_WIDTH * SONGS_POS_MULTI
 
     private fun intendedY(index: Double): Double = index * (CAPSULE_HEIGHT * CAPSULE_SCALE + 10.0) + 120.0
 
@@ -1636,7 +1882,6 @@ class SongSelectScene : Scene() {
         if (path == null) return
 
         previewJob = launch {
-            delay(FADE_IN_DELAY_MS)
             if (generation != previewGeneration) return@launch
             preview.play(path, previewStart, previewEnd, isCurrent = { generation == previewGeneration })
         }
@@ -1681,6 +1926,9 @@ class SongSelectScene : Scene() {
         rememberedDifficulty = currentDifficulty
 
         stopPreview()
+        // The menu frame is only kept for the entry backdrop and the exit
+        // reveal; a song never shows it again.
+        dropMenuBackdrop()
         launch { sceneContainer.changeTo<PlayScene>() }
     }
 
@@ -1688,9 +1936,155 @@ class SongSelectScene : Scene() {
         if (leaving) return
         leaving = true
         transitioning = true
-        leaveElapsed = 0.0
+        exitElapsed = 0.0
         cancelSound?.let { sfx.play(it, 0.7) }
         stopPreview()
+        // `FreeplayState.goBack`: the touch back button slides out too.
+        touchControls?.visible = false
+        cardDisappear()
+        fadeDots()
+        fadeCardText()
+        startExitMovers()
+    }
+
+    /**
+     * `FreeplayState.goBack`'s exit: every layer flies out with `FlxEase.expoIn`
+     * - the card, the DJ, the difficulty block and the arrows to the left, the
+     * backdrop and the album to the right, the top bar up - while the capsules
+     * hop out through `jumpOut()`. The menu frame handed over on entry is what
+     * the animation uncovers; once the longest move (0.5 s) is done the scene
+     * switches to the menu without a transition, like closing the substate.
+     */
+    private fun startExitMovers() {
+        exitMovers.clear()
+        // `BackingCard.applyExitMovers`: x = -pinkBack.width, 0.4 s.
+        moveOut(cardLayer, targetX = -cardWidth, duration = 0.4)
+        // `exitMovers.set([dj], {x: -dj.width * 1.6, speed: 0.5})`: the whole
+        // turntable group (DJ + lights) leaves to the left.
+        moveOut(djLayer, targetX = -Constants.GAME_WIDTH.toDouble(), duration = 0.5)
+        // `exitMovers.set([grpDifficulties], {x: -300, speed: 0.25})`.
+        moveOut(difficultyLayer, targetX = -(BADGE_HOME_X + 300.0), duration = 0.25)
+        // `[diffSelLeft, diffSelRight]`: x = -width * 2, 0.26 s.
+        moveOut(selectorLayer, targetX = -400.0, duration = 0.26)
+        // `AlbumRoll.applyExitMovers`: x = FlxG.width, 0.4 s.
+        moveOut(albumLayer, targetX = Constants.GAME_WIDTH - ALBUM_ART_X, duration = 0.4)
+        // `overhangStuff` / `letterSort`: y = -height, 0.2 s.
+        moveOut(overhangLayer, targetY = -164.0, duration = 0.2)
+        moveOut(uiLayer, targetY = -164.0, duration = 0.2)
+        // `[fpScoreDisplay, fnfHighscoreSpr, clearBoxSprite]`: x = FlxG.width,
+        // 0.3 s. `txtCompletion` uses `FlxG.width * 1.05` in FNF; both targets
+        // are past the right edge, so one mover for the whole layer does it.
+        moveOut(statsLayer, targetX = Constants.GAME_WIDTH.toDouble(), duration = 0.3)
+        // `[blackOverlayBullshitLOLXD, backingImage]`: x = FlxG.width * 1.5, 0.4 s.
+        moveOut(backingOverlay, targetX = Constants.GAME_WIDTH.toDouble() * 1.5, duration = 0.4)
+        moveOut(backingImage, targetX = Constants.GAME_WIDTH.toDouble() * 1.5, duration = 0.4)
+        // `caps.doLerp = false; caps.doJumpOut = true`.
+        for (capsule in viewCapsules) capsule.jumpOut()
+    }
+
+    private fun moveOut(
+        view: View?,
+        targetX: Double? = null,
+        targetY: Double? = null,
+        duration: Double,
+    ) {
+        if (view == null) return
+        exitMovers += ExitMover(
+            view = view,
+            startX = view.x,
+            startY = view.y,
+            targetX = targetX ?: view.x,
+            targetY = targetY ?: view.y,
+            duration = duration,
+        )
+    }
+
+    /** `FlxEase.expoIn`. */
+    private fun expoIn(t: Double): Double =
+        if (t <= 0.0) 0.0 else 2.0.pow(10.0 * (t - 1.0))
+
+    /**
+     * `BackingCard.disappear()`: the yellow plate tweens back to pink over
+     * 0.25 s (`quadOut`), the orange strips hide, and `cardGlow` bursts — alpha
+     * to 0 while scaling to 1.2 (`sineOut`).
+     */
+    private fun cardDisappear() {
+        if (pinkBack == null) return
+        // The beat pulse would fight the burst for the same properties.
+        glowActive = false
+        cardGlow?.let {
+            it.visible = true
+            it.alpha = 1.0
+            it.scaleX = glowBaseScaleX
+            it.scaleY = 1.0
+        }
+        orangeStrip?.visible = false
+        orangeStripLeft?.visible = false
+        cardDisappearElapsed = 0.0
+        cardDisappearActive = true
+    }
+
+    /**
+     * `FreeplayState.goBack` fades the card's decorations out while the plate
+     * flies left: the marquees are endless wrap-around copies, so translating
+     * them would leave text stuck at the left edge until the scene dies.
+     */
+    private fun fadeCardText() {
+        cardTextFadeElapsed = 0.0
+        cardTextFadeActive = true
+    }
+
+    /** `FreeplayState.fadeDots(false)`: each dot tweens to alpha 0 in 0.25 s. */
+    private fun fadeDots() {
+        if (difficultyDots.isEmpty()) return
+        dotsFadeElapsed = 0.0
+        dotsFadeActive = true
+    }
+
+    private fun updateCardDisappear(dt: Double) {
+        if (overhangSlideActive) {
+            overhangSlideElapsed += dt
+            val t = (overhangSlideElapsed / 0.3).coerceIn(0.0, 1.0)
+            // `FlxTween.tween(overhangStuff, {y: -100}, 0.3, quartOut)`.
+            val eased = 1.0 - (1.0 - t).pow(4.0)
+            overhangLayer?.y = -164.0 + 64.0 * eased
+            if (t >= 1.0) {
+                overhangLayer?.y = -100.0
+                overhangSlideActive = false
+            }
+        }
+        if (cardDisappearActive) {
+            cardDisappearElapsed += dt
+            val t = (cardDisappearElapsed / 0.25).coerceIn(0.0, 1.0)
+            // FlxEase.quadOut on the colour, FlxEase.sineOut on the glow.
+            val q = 1.0 - (1.0 - t) * (1.0 - t)
+            val s = sin(t * PI / 2.0)
+            setPinkTint(mixColor(0xFFFFD863.toInt(), 0xFFFFD0D5.toInt(), q))
+            cardGlow?.alpha = (1.0 - s).coerceIn(0.0, 1.0)
+            cardGlow?.scaleX = glowBaseScaleX * (1.0 + 0.2 * s)
+            cardGlow?.scaleY = 1.0 + 0.2 * s
+            if (t >= 1.0) cardDisappearActive = false
+        }
+        if (dotsFadeActive) {
+            dotsFadeElapsed += dt
+            val t = (dotsFadeElapsed / 0.25).coerceIn(0.0, 1.0)
+            // `FlxTween.tween(dot, {alpha: 0}, 0.25, quadOut)`.
+            val alpha = ((1.0 - t) * (1.0 - t)).coerceIn(0.0, 1.0)
+            difficultyDots.forEach { it.alpha = alpha }
+            if (t >= 1.0) dotsFadeActive = false
+        }
+        if (cardTextFadeActive) {
+            cardTextFadeElapsed += dt
+            val t = (cardTextFadeElapsed / CARD_TEXT_FADE).coerceIn(0.0, 1.0)
+            val alpha = (1.0 - t).coerceIn(0.0, 1.0)
+            cardTextLayer?.alpha = alpha
+            newCardGroup?.alpha = alpha
+            if (t >= 1.0) {
+                cardTextFadeActive = false
+                cardTextLayer?.visible = false
+                newCardGroup?.visible = false
+            }
+        }
     }
 
     private fun setStatus(message: String) {
@@ -1704,7 +2098,7 @@ class SongSelectScene : Scene() {
 
     /** Vertical culloff band around the viewport for capsule rendering. */
     private val CAPSULE_CULL_TOP = -400.0
-    private val CAPSULE_CULL_BOTTOM = Constants.GAME_HEIGHT + 300.0
+    private val CAPSULE_CULL_BOTTOM: Double get() = Constants.GAME_HEIGHT + 300.0
 
     private var confirmSound: String? = null
     private var scrollSound: String? = null
@@ -1735,22 +2129,54 @@ class SongSelectScene : Scene() {
         val root = sceneRoot ?: return
         val overlay = Container()
         root.addChild(overlay)
-        val images = reveal.placements.map { placement ->
-            val bmp = KnfFiles.bitmap("shared/images/${placement.path}.png")
-            Image(bmp, Anchor2D.CENTER).also { img ->
-                img.smoothing = true
-                // `StickerSprite` uses the centred origin, so the peel-off
-                // copies have to spin/pop around their middle too - otherwise
-                // the rotated artwork drifts away from where it covered.
-                img.x = placement.x + bmp.width / 2.0
-                img.y = placement.y + bmp.height / 2.0
-                img.rotation = placement.angleDegrees.degrees
-                img.scaleX = placement.popScale
-                img.scaleY = placement.popScale
-                overlay.addChild(img)
+        revealElapsed = 0.0
+        // One bitmap per *distinct* sticker: the same png appears many times in
+        // the pile, and the original's graphic cache shared it too. The cover
+        // phase hands its decoded art over (`oldStickers` in the original), so
+        // nothing is decoded a second time on this - the busiest - frame.
+        val bitmaps = HashMap<String, Bitmap32>()
+        val images = ArrayList<Image>(reveal.placements.size)
+        val built = runCatching {
+            for (placement in reveal.placements) {
+                val bmp = bitmaps.getOrPut(placement.path) {
+                    reveal.bitmaps[placement.path]
+                        ?: KnfFiles.bitmap("shared/images/${placement.path}.png").toBMP32IfRequired()
+                }
+                images += Image(bmp, Anchor2D.CENTER).also { img ->
+                    img.smoothing = true
+                    // `StickerSprite` uses the centred origin, so the peel-off
+                    // copies have to spin/pop around their middle too -
+                    // otherwise the rotated artwork drifts away from where it
+                    // covered.
+                    img.x = placement.x + bmp.width / 2.0
+                    img.y = placement.y + bmp.height / 2.0
+                    img.rotation = placement.angleDegrees.degrees
+                    img.scaleX = placement.popScale
+                    img.scaleY = placement.popScale
+                }
             }
         }
+        if (built.isFailure) {
+            // A sticker that cannot be loaded must never leave the transition
+            // covering the screen (that read as a black screen).
+            println("KNF: sticker reveal failed: ${built.exceptionOrNull()}")
+            overlay.removeFromParent()
+            revealActive = false
+            return
+        }
+        // Same draw order as the cover phase (earlier stickers underneath).
+        for (index in reveal.placements.indices.sortedBy { reveal.placements[it].appearAt }) {
+            overlay.addChild(images[index])
+        }
+        KnfBootLog.mark(
+            "sticker reveal: ${images.size} images, heap=${KnfPlatform.memoryReport()}",
+        )
+
+        val sceneViews = views
+        val shared = bitmaps.values.distinct()
+        var finished = false
         overlay.addUpdater { dt ->
+            if (finished) return@addUpdater
             revealElapsed += dt.secondsDouble()
             var remaining = 0
             for ((index, img) in images.withIndex()) {
@@ -1762,8 +2188,15 @@ class SongSelectScene : Scene() {
                 if (img.visible) remaining++
             }
             if (remaining == 0 || revealElapsed >= 2.0) {
+                finished = true
                 overlay.removeFromParent()
                 revealActive = false
+                // `StickerSubState.degenStickers`: once the last sticker is gone
+                // the sticker graphics are dropped instead of staying in the
+                // graphic cache for the rest of the session.
+                KnfMemory.clearStickers(sceneViews, shared)
+                bitmaps.clear()
+                KnfBootLog.mark("sticker reveal done; heap=${KnfPlatform.memoryReport()}")
             }
         }
     }
@@ -1794,6 +2227,7 @@ class SongSelectScene : Scene() {
             knfInput.update()
 
             updateCard(d)
+            updateCardDisappear(d)
             updateDj(d)
             // Korge computes Text bounds during the first render, so the
             // FlxText-derived plate behind FREEPLAY is sized here — once:
@@ -1856,10 +2290,20 @@ class SongSelectScene : Scene() {
             }
 
             if (leaving) {
-                leaveElapsed += d
-                fadeRect?.alpha = (leaveElapsed / LEAVE_FADE).coerceIn(0.0, 1.0)
-                if (leaveElapsed >= LEAVE_FADE) {
-                    leaving = false
+                exitElapsed += d
+                // `FreeplayState.goBack`: each exit mover tweens with expoIn.
+                for (mover in exitMovers) {
+                    val t = (exitElapsed / mover.duration).coerceIn(0.0, 1.0)
+                    val eased = expoIn(t)
+                    mover.view.x = mover.startX + (mover.targetX - mover.startX) * eased
+                    mover.view.y = mover.startY + (mover.targetY - mover.startY) * eased
+                }
+                if (exitElapsed >= EXIT_TIME && !switchedToMenu) {
+                    switchedToMenu = true
+                    // Freeplay closes back into the menu (a substate in FNF), so
+                    // the main menu must not replay its in transition; the menu
+                    // frame handed over on entry is still what is on screen.
+                    SceneWipe.requestSkipNextReveal()
                     launch { sceneContainer.changeTo<MainMenuScene>() }
                     return@addUpdater
                 }
@@ -1872,19 +2316,33 @@ class SongSelectScene : Scene() {
         }
 
         // Menu gestures on top of everything (tap = accept, drags = navigation).
-        if (KnfTouch.enabled) addChild(TouchControls())
+        if (KnfTouch.enabled) {
+            touchControls = TouchControls().also { addChild(it) }
+        }
     }
 
     private fun updateCard(dt: Double) {
-        val pink = pinkBack ?: return
+        if (backingOverlaySlideActive) {
+            backingOverlaySlideElapsed += dt
+            val t = (backingOverlaySlideElapsed / BACKING_OVERLAY_SLIDE).coerceIn(0.0, 1.0)
+            // FlxEase.quintOut
+            val eased = 1.0 - (1.0 - t).pow(5.0)
+            backingOverlay?.x = Constants.GAME_WIDTH +
+                (backingOverlayX - Constants.GAME_WIDTH) * eased
+            if (t >= 1.0) {
+                backingOverlay?.x = backingOverlayX
+                backingOverlaySlideActive = false
+            }
+        }
+        if (pinkBack == null) return
         if (!cardSlideFinished) {
             cardSlideElapsed += dt
             val t = (cardSlideElapsed / 0.6).coerceIn(0.0, 1.0)
             // FlxEase.quartOut
             val eased = 1.0 - (1.0 - t).pow(4.0)
-            pink.x = -pink.bitmap.width.toDouble() * (1.0 - eased)
+            setPinkX(-cardWidth * (1.0 - eased))
             if (t >= 1.0) {
-                pink.x = 0.0
+                setPinkX(0.0)
                 cardSlideFinished = true
             }
         }
@@ -1893,9 +2351,13 @@ class SongSelectScene : Scene() {
             glowElapsed += dt
             val t = (glowElapsed / 0.45).coerceIn(0.0, 1.0)
             cardGlow?.alpha = (1.0 - t).coerceIn(0.0, 1.0)
-            cardGlow?.scaleX = 1.0 + 0.2 * t
+            cardGlow?.scaleX = glowBaseScaleX * (1.0 + 0.2 * t)
             cardGlow?.scaleY = 1.0 + 0.2 * t
-            if (t >= 1.0) glowActive = false
+            if (t >= 1.0) {
+                glowActive = false
+                cardGlow?.scaleX = glowBaseScaleX
+                cardGlow?.scaleY = 1.0
+            }
         }
 
         if (backingFadeActive) {
@@ -1904,16 +2366,22 @@ class SongSelectScene : Scene() {
             // FlxEase.expoOut
             val eased = if (t >= 1.0) 1.0 else 1.0 - 2.0.pow(-10.0 * t)
             backingImage?.alpha = eased
-            if (t >= 1.0) backingFadeActive = false
+            if (t >= 1.0) {
+                backingFadeActive = false
+                // `onComplete: blackOverlayBullshitLOLXD.visible = false`.
+                backingOverlay?.visible = false
+            }
         }
 
         if (difficultySlideActive) {
             difficultySlideElapsed += dt
             val t = (difficultySlideElapsed / 0.6).coerceIn(0.0, 1.0)
             val eased = 1.0 - (1.0 - t).pow(4.0)
-            difficultyView?.x = -300.0 + 390.0 * eased
+            // `FlxTween.tween(grpDifficulties, {x: (CUTOUT_WIDTH * DJ_POS_MULTI) + 90})`
+            // from the group's authored x of -300.
+            difficultyView?.x = -300.0 + (BADGE_HOME_X + 300.0) * eased
             if (t >= 1.0) {
-                difficultyView?.x = 90.0
+                difficultyView?.x = BADGE_HOME_X
                 difficultySlideActive = false
             }
         }
@@ -2023,6 +2491,10 @@ class SongSelectScene : Scene() {
     private fun onDjIntroDone() {
         if (djIntroDone) return
         djIntroDone = true
+        // `_parentState.persistentDraw = false` in `FreeplayState.onDJIntroDone`:
+        // the menu stops being drawn behind us. KNF keeps the frame the menu
+        // handed over, but the freeplay backdrop covers it from here on; it is
+        // what the exit reveals when the layers fly away (see `startExitMovers`).
         if (newCharacterCard) {
             // NewCharacterCard keeps the pink plate underneath; its yellow and
             // red multiply passes create the in-game card colour.
@@ -2030,7 +2502,7 @@ class SongSelectScene : Scene() {
         } else {
             // BackingCard.introDone(): plate turns yellow, the two strips and
             // all scripted marquees/beat glows appear.
-            pinkBack?.tint = RGBA(0xFF, 0xD8, 0x63)
+            setPinkTint(YELLOW_PLATE)
             orangeStrip?.visible = true
             orangeStripLeft?.visible = true
             boyfriendBands.forEach { it.container.visible = true }
@@ -2040,7 +2512,7 @@ class SongSelectScene : Scene() {
         glowActive = true
         glowElapsed = 0.0
         cardGlow?.alpha = 1.0
-        cardGlow?.scaleX = 1.0
+        cardGlow?.scaleX = glowBaseScaleX
         cardGlow?.scaleY = 1.0
 
         backingFadeActive = true
@@ -2053,6 +2525,7 @@ class SongSelectScene : Scene() {
 
         albumLayer.visible = true
         uiLayer.visible = true
+        statsLayer?.visible = true
         highscoreSprite?.let {
             it.visible = true
             it.restart()
@@ -2064,11 +2537,23 @@ class SongSelectScene : Scene() {
         updateTopUi()
         updateAlbum()
         albumRollReady = true
+        // `FreeplayState.changeSelection`: the menu track is paused as the first
+        // selection lands, then `FADE_IN_DELAY` later the preview starts.
+        menuMusic.pause()
         requestPreview()
     }
 
     private fun hasDjLabel(label: String): Boolean =
         djAtlas?.labelFrames(label)?.isNotEmpty() == true
+
+    private fun dropMenuBackdrop() {
+        val image = menuBackdrop ?: return
+        menuBackdrop = null
+        // Drop the GPU upload too: nothing else references this bitmap.
+        menuBackdropBitmap?.let { KnfMemory.releaseBitmaps(views, listOf(it)) }
+        menuBackdropBitmap = null
+        image.removeFromParent()
+    }
 
     private fun handleInputs(input: KnfInput, dt: Double) {
         // `uiStateMachine.transition(EnteringFreeplay)` blocks interaction
@@ -2136,6 +2621,15 @@ class SongSelectScene : Scene() {
         stopPreview()
         preview.dispose()
         rememberSelection()
+        // Nothing should outlive the scene, including the menu frame kept for
+        // the exit reveal when the player went back to the menu.
+        dropMenuBackdrop()
+        // The next scene is already built at this point, so all this does is
+        // report the footprint Freeplay is leaving behind (see `KNF_MEM`).
+        // The weak handle lets the next scene tell a slow collection apart
+        // from a real retention.
+        KnfMemory.probeLeavingScene(this)
+        KnfMemory.log(views, "Freeplay destroyed")
     }
 
     private fun loadFont(path: String): TtfFont? =
@@ -2144,10 +2638,44 @@ class SongSelectScene : Scene() {
         }
 
     private companion object {
-        private const val FADE_IN_DELAY_MS = 250L
-        private const val LEAVE_FADE = 0.25
+        /** `FreeplayState.goBack`'s longest exit mover (the DJ flies for 0.5 s). */
+        private const val EXIT_TIME = 0.5
+
+        /** How long the card's marquees/YEAH!! collage take to fade on exit. */
+        private const val CARD_TEXT_FADE = 0.45
         private const val CAPSULE_HEIGHT = 132.0
         private const val CAPSULE_SCALE = 0.8
+
+        /** `FlxTween.tween(blackOverlayBullshitLOLXD, {x: backingImage.x}, 0.7)`. */
+        private const val BACKING_OVERLAY_SLIDE = 0.7
+
+        /** `FreeplayState.DJ_POS_MULTI`: how far the DJ/difficulty block sits in. */
+        const val DJ_POS_MULTI = 0.44
+
+        /** `FreeplayState.SONGS_POS_MULTI`: how far the song list sits in. */
+        const val SONGS_POS_MULTI = 0.75
+
+        /**
+         * `FreeplayState.CUTOUT_WIDTH`: the extra width freeplay spreads its
+         * columns across on a screen wider than 16:9. Zero at 16:9.
+         */
+        val CUTOUT_WIDTH: Double get() = Constants.GAME_CUTOUT_WIDTH / 1.5
+
+        /** `CUTOUT_WIDTH * FreeplayState.DJ_POS_MULTI`, the card-content shift. */
+        val DJ_SHIFT: Double get() = CUTOUT_WIDTH * DJ_POS_MULTI
+
+        /** `#FFD4E9`: the pink tint BackingCard gives its plate. */
+        val PINK: RGBA get() = RGBA(0xFF, 0xD4, 0xE9)
+
+        /** `#FFD863`: the yellow the plate turns into after the intro. */
+        val YELLOW_PLATE: RGBA get() = RGBA(0xFF, 0xD8, 0x63)
+
+        /** `diff.x = 90 + (CUTOUT_WIDTH * DJ_POS_MULTI)` in FNF. */
+        val BADGE_HOME_X: Double get() = 90.0 + CUTOUT_WIDTH * DJ_POS_MULTI
+
+        /** `diffSprite.x = (500 | -320) + (CUTOUT_WIDTH * DJ_POS_MULTI)`. */
+        fun badgeEnterX(sign: Int): Double =
+            (if (sign > 0) 500.0 else -320.0) + CUTOUT_WIDTH * DJ_POS_MULTI
 
         /** `BoyfriendCard.beatFreqList`: `[1, 2, 4, 8]`. */
         private val BEAT_FREQUENCIES = intArrayOf(1, 2, 4, 8)
@@ -2264,9 +2792,8 @@ private class BackingScrollBand(
  * once, then loops from frame 2; newly visible flames are revealed one by one
  * every 0.25 s.
  */
-private class FreeplayFlamesView {
+private class FreeplayFlamesView(private val baseX: Double = 913.0) {
     companion object {
-        const val FLAME_X = 913.0
         const val FLAME_Y = 91.0
         const val SPREAD_X = 29.0
         const val SPREAD_Y = 6.0
@@ -2294,7 +2821,7 @@ private class FreeplayFlamesView {
                     loop = false,
                 ).also {
                     it.setPixelArt(true)
-                    it.x = FLAME_X + SPREAD_X * i
+                    it.x = baseX + SPREAD_X * i
                     it.y = FLAME_Y + SPREAD_Y * i
                     it.visible = false
                     container.addChild(it)
@@ -2409,5 +2936,6 @@ private class AlbumArtAnimator(
     }
 }
 
-private const val ALBUM_ART_X = 920.0
+/** `AlbumRoll`: `createTextureAtlas((FlxG.width + -360) - notch, 220, ...)`. */
+private val ALBUM_ART_X: Double get() = Constants.GAME_WIDTH - Constants.GAME_NOTCH - 360.0
 private const val ALBUM_ART_Y = 220.0

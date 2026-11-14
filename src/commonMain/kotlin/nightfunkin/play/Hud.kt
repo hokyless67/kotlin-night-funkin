@@ -109,6 +109,10 @@ class Hud(
 
         addChild(popUps)
         parent.addChild(this)
+        // FNF's HUD shows `Score: 0` from the start, and building the glyph run
+        // here keeps that work (25 pooled views on the first call) out of the
+        // first judged note.
+        setScore(0)
     }
 
     /**
@@ -260,6 +264,14 @@ class Hud(
     fun showJudgement(j: Judgement) {
         if (j == Judgement.MISS) return
         popUps.displayRating(j.label)
+    }
+
+    /**
+     * Creates the judgement/combo images before the first hit (see
+     * [PopUpStuff.prewarm]).
+     */
+    fun prewarmPopUps() {
+        popUps.prewarm()
     }
 
     /** FNF's `PopUpStuff.displayCombo`, which only shows from a combo of ten. */

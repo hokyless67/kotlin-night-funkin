@@ -427,6 +427,29 @@ class Character(val id: String) : Container() {
     /** FNF's `FlxAnimation.finished`; non-looped poses hold their last frame. */
     private var animFinished = false
 
+    /**
+     * `tankmanBattlefieldErect`'s rim when it carries one of the alt masks
+     * (`gf-tankmen`, `nene-tankmen`, `tankman-bloody`).
+     *
+     * The masks are painted over the character's atlas, so [renderPose] keeps
+     * handing the filter the atlas rect of the frame it is drawing (see
+     * [updateRimMask]).
+     */
+    private var rimMaskFilter: DropShadowRimFilter? = null
+
+    /** Binds a stage rim that samples an alt mask; see [rimMaskFilter]. */
+    fun bindRimMask(filter: DropShadowRimFilter) {
+        rimMaskFilter = filter
+        // The stage binds this after the character already played its first
+        // pose, so hand the filter that pose's atlas rect right away instead of
+        // letting the first frames sample the mask with the raw render uv.
+        val playback = currentAnim?.let { anims[it] } ?: return
+        val frames = playback.frames
+        if (frames.isEmpty()) return
+        val pose = poses.getOrNull(frames[frameIndex % frames.size]) ?: return
+        updateRimMask(pose)
+    }
+
     private var singTimer = 0.0
     private var dancing = true
     private var danceFlipped = false
@@ -487,6 +510,10 @@ class Character(val id: String) : Container() {
     private fun loadLegacySprites(atlas: TextureAtlas?): Map<String, SpriteDef> {
         if (atlas == null) return emptyMap()
         val out = LinkedHashMap<String, SpriteDef>()
+        // Rim masks are painted over the source atlas, so a frame's normalized
+        // rect does not depend on how much the sheet was shrunk for the GPU.
+        val atlasW = atlas.bitmap.width.toDouble()
+        val atlasH = atlas.bitmap.height.toDouble()
         for (f in atlas.frames.values) {
             out[f.name] = SpriteDef(
                 name = f.name,
@@ -496,6 +523,17 @@ class Character(val id: String) : Container() {
                 turned = false,
                 dx = -f.frameX,
                 dy = -f.frameY,
+                // A sheet larger than the GPU's texture limit is decoded
+                // pre-shrunk; the frame geometry above stays in source pixels.
+                textureScaleX = atlas.inverseTextureScaleX,
+                textureScaleY = atlas.inverseTextureScaleY,
+                // `slice()` turns rotated frames upright, and then the mask
+                // cell no longer lines up; those frames simply keep the base
+                // threshold (no shipped rim mask needs it).
+                maskU = if (f.rotated) 0.0 else f.x * atlas.textureScaleX / atlasW,
+                maskV = if (f.rotated) 0.0 else f.y * atlas.textureScaleY / atlasH,
+                maskW = if (f.rotated) 0.0 else f.width * atlas.textureScaleX / atlasW,
+                maskH = if (f.rotated) 0.0 else f.height * atlas.textureScaleY / atlasH,
             )
         }
         return out
@@ -739,6 +777,22 @@ class Character(val id: String) : Container() {
         singTimer = data.singTime * stepLengthMs / 1000.0 * if (miss) 2.0 else 1.0
     }
 
+    /**
+     * Renders every sing (and miss) pose once, during loading.
+     *
+     * A pose is a list of atlas parts and the view pool grows to the largest
+     * pose; the first hit used to be the first time the sing poses were built
+     * and drawn on the GL thread. Ends on the idle animation.
+     */
+    fun prewarmHitPoses() {
+        for (dir in listOf("LEFT", "DOWN", "UP", "RIGHT")) {
+            for (anim in listOf("sing$dir", "sing${dir}miss")) {
+                if (anims.containsKey(anim)) play(anim, forceRestart = true)
+            }
+        }
+        dance(forceRestart = true)
+    }
+
     fun play(anim: String, forceRestart: Boolean = false) {
         // `FlxAnimation.play` bails out only while the animation is still
         // running: `if (!Force && !finished && reversed == Reversed) return;`.
@@ -866,14 +920,59 @@ class Character(val id: String) : Container() {
             // has second column `sy * (sin, -cos)`, which is exactly what a
             // negatively-oriented matrix carries.
             val m = part.matrix
-            img.scaleX = hypot(m.a, m.b)
-            img.scaleY = hypot(m.c, m.d)
+            img.scaleX = hypot(m.a, m.b) * def.textureScaleX
+            img.scaleY = hypot(m.c, m.d) * def.textureScaleY
             if (m.a * m.d - m.c * m.b < 0.0) img.scaleY = -img.scaleY
 
             val degrees = (if (def.turned) -90.0 else 0.0) +
                 KnfMath.toDegrees(atan2(m.b, m.a))
             img.rotation = degrees.degrees
         }
+        updateRimMask(pose)
+    }
+
+    /**
+     * `DropShadowShader.updateFrameInfo`: FNF gives the rim shader the sprite's
+     * `FlxFrame.uv` and clamps the shadow sample to it; the alt mask is then
+     * sampled with those atlas uv coordinates. KNF filters a render texture of
+     * the trimmed frame instead, so the mask lookup needs the inverse of the
+     * draw transform.
+     *
+     * A legacy sheet pose is a single sprite, so "render-target uv -> atlas uv"
+     * is a plain scale/offset:
+     *
+     * ```
+     * charLocal = bounds.topLeft + rtUv * bounds.size
+     * frameUv   = (charLocal - image.pos) / drawnSize + 0.5
+     * atlasUv   = maskRect.topLeft + frameUv * maskRect.size
+     * ```
+     */
+    private fun updateRimMask(pose: Pose) {
+        val filter = rimMaskFilter ?: return
+        val part = pose.parts.singleOrNull()
+        val def = part?.let { sprites[it.sprite] }
+        val img = images.singleOrNull()
+        if (def == null || img == null || !img.visible || def.maskW <= 0.0 || def.maskH <= 0.0) {
+            filter.clearMaskUv()
+            return
+        }
+        // Where the bitmap actually lands: the image is centred, and its scale
+        // folds in the sheet's shrink compensation and the mirror flag.
+        val drawnW = img.bitmap.width.toDouble() * img.scaleX
+        val drawnH = img.bitmap.height.toDouble() * img.scaleY
+        if (drawnW == 0.0 || drawnH == 0.0) {
+            filter.clearMaskUv()
+            return
+        }
+        // The rim is attached to the one-child layer around this character, so
+        // its render target is exactly the character's local bounds.
+        val b = getLocalBounds(includeFilters = false)
+        filter.setMaskUv(
+            scaleX = b.width / drawnW * def.maskW,
+            scaleY = b.height / drawnH * def.maskH,
+            offsetX = ((b.x - img.x) / drawnW + 0.5) * def.maskW + def.maskU,
+            offsetY = ((b.y - img.y) / drawnH + 0.5) * def.maskH + def.maskV,
+        )
     }
 
     // ======================================================================

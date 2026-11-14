@@ -2,6 +2,7 @@ package nightfunkin.ui
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import korlibs.image.bitmap.Bitmap32
 import korlibs.korge.view.Container
 import korlibs.korge.view.Image
 import korlibs.korge.view.addUpdater
@@ -9,6 +10,7 @@ import korlibs.math.geom.Anchor2D
 import korlibs.math.geom.degrees
 import nightfunkin.audio.SfxPlayer
 import nightfunkin.core.Constants
+import nightfunkin.core.KnfBootLog
 import nightfunkin.core.KnfFiles
 import nightfunkin.play.ResultPlayerRegistry
 import kotlin.random.Random
@@ -39,10 +41,27 @@ class StickerOverlay(
     private var elapsed = 0.0
     private var covered = false
 
+    /**
+     * Decoded sticker art, shared with the peel-off phase.
+     *
+     * `StickerSubState` carries the actual `StickerSprite` objects into the
+     * next state, so their graphics are never decoded twice. KNF hands over the
+     * decoded bitmaps instead (the views themselves die with this scene): the
+     * reveal used to decode the whole pack again while Freeplay's art was still
+     * being uploaded, which is exactly where the transition could run out of
+     * memory.
+     */
+    private val bitmaps = HashMap<String, Bitmap32>()
+
     init {
         val packId = resolveStickerPackFor(playerCharacterId)
         val packStickers = loadPack(packId)
         val sounds = stickerSoundStems()
+        // The pile reuses a handful of sticker pngs many times; decode each one
+        // once (`FunkinSprite` shared graphics through the FlxGraphic cache).
+        fun stickerBitmap(path: String): Bitmap32 = bitmaps.getOrPut(path) {
+            KnfFiles.bitmap("shared/images/$path.png").toBMP32IfRequired()
+        }
 
         if (packStickers.isNotEmpty()) {
             // `StickerSubState.regenStickers`: initialize stickers at each
@@ -52,7 +71,7 @@ class StickerOverlay(
             var yPos = -100.0
             while (xPos <= Constants.GAME_WIDTH) {
                 val path = packStickers.random(random)
-                val bmp = KnfFiles.bitmap("shared/images/$path.png")
+                val bmp = stickerBitmap(path)
                 val placement = StickerPlacement(
                     path = path,
                     x = xPos,
@@ -73,7 +92,6 @@ class StickerOverlay(
                     img.y = placement.y + bmp.height / 2.0
                     img.rotation = placement.angleDegrees.degrees
                     img.visible = false
-                    addChild(img)
                 }
                 // Half-width overlap keeps neighbouring stickers dense.
                 xPos += bmp.width * 0.5
@@ -82,11 +100,10 @@ class StickerOverlay(
                     yPos += Random.nextDouble(70.0, 120.0)
                 }
             }
-            placements.shuffle(random)
 
             // Creates a new sticker for the very center.
             val lastPath = packStickers.random(random)
-            val lastBmp = KnfFiles.bitmap("shared/images/$lastPath.png")
+            val lastBmp = stickerBitmap(lastPath)
             val last = StickerPlacement(
                 path = lastPath,
                 x = (Constants.GAME_WIDTH - lastBmp.width) / 2.0,
@@ -103,14 +120,31 @@ class StickerOverlay(
                 img.x = last.x + lastBmp.width / 2.0
                 img.y = last.y + lastBmp.height / 2.0
                 img.visible = false
-                addChild(img)
             }
 
-            // Appear times spread over the first 0.9 s (`FlxMath.remapToRange`).
-            placements.forEachIndexed { index, placement ->
-                placement.appearAt = 0.9 * index / placements.size
+            // `FlxG.random.shuffle(grpStickers.members)` then
+            // `timing = remapToRange(ind, 0, length, 0, 0.9)`: the grid is only
+            // a placement guide - the *order* is random, so the pile pops all
+            // over the screen instead of sweeping it row by row. The centre
+            // sticker is added after the shuffle, so it always goes last and
+            // its pop is what ends the cover phase.
+            val centerIndex = placements.lastIndex
+            val order = (0 until centerIndex).shuffled(random)
+            order.forEachIndexed { step, index ->
+                val placement = placements[index]
+                placement.appearAt = 0.9 * step / placements.size
                 placement.popAt = placement.appearAt + (1.0 / 24.0) * placement.frameDelay
             }
+            val center = placements[centerIndex]
+            center.appearAt = 0.9 * centerIndex / placements.size
+            center.popAt = center.appearAt + (1.0 / 24.0) * center.frameDelay
+
+            // `grpStickers.sort(FlxSort.byValues(..., a.timing, b.timing))`:
+            // earlier stickers sit under later ones.
+            for (index in placements.indices.sortedBy { placements[it].appearAt }) {
+                addChild(images[index])
+            }
+            KnfBootLog.mark("sticker cover: ${images.size} images")
         }
 
         addUpdater { dt ->
@@ -142,7 +176,7 @@ class StickerOverlay(
                 covered = true
                 // `switchState(() -> targetState(this))`: the popped stickers
                 // are carried into the next state for the peel-off phase.
-                StickerSceneTarget.handOff(placements)
+                StickerSceneTarget.handOff(placements, bitmaps)
                 onCovered()
             }
         }
@@ -218,16 +252,23 @@ object StickerSceneTarget {
         reveal = null
     }
 
-    fun handOff(placements: List<StickerPlacement>) {
-        reveal = StickerReveal(placements)
+    fun handOff(placements: List<StickerPlacement>, bitmaps: Map<String, Bitmap32>) {
+        reveal = StickerReveal(placements, bitmaps)
     }
 
     fun consumeReveal(): StickerReveal? = reveal.also { reveal = null }
 }
 
-/** The peel-off payload (`degenStickers` input). */
+/**
+ * The peel-off payload (`degenStickers` input).
+ *
+ * [bitmaps] is the art the cover phase already decoded - `StickerSubState`
+ * hands the sprites over the same way, so the target state never pays for a
+ * second decode (or a second copy in memory) on the transition's peak frame.
+ */
 class StickerReveal(
     val placements: List<StickerPlacement>,
+    val bitmaps: Map<String, Bitmap32> = emptyMap(),
 )
 
 /** `playerCharacter.getStickerPackID` from the player registry data. */

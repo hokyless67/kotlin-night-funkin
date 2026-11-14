@@ -16,8 +16,61 @@ object Knf {
 
 object Constants {
     // ---- viewport -------------------------------------------------------
-    const val GAME_WIDTH = 1280
-    const val GAME_HEIGHT = 720
+    /**
+     * The resolution FNF is authored at (Flixel's `FlxG.initialWidth/Height`).
+     *
+     * Every layout constant in the game is expressed in this space. [GAME_WIDTH]
+     * and [GAME_HEIGHT] start equal to it and only grow on mobile, where the
+     * game area follows the screen's aspect ratio (see `KnfViewport`).
+     */
+    const val BASE_WIDTH = 1280
+    const val BASE_HEIGHT = 720
+
+    /**
+     * Size of the game area in game units.
+     *
+     * FNF's `FullScreenScaleMode` makes the logical game resolution match the
+     * device instead of letterboxing 16:9: on a 20:9 phone the area becomes
+     * 1600x720, so full-screen art covers the screen and the camera shows a
+     * little more of the stage on both sides. Everything that centres itself on
+     * these values therefore stays centred, exactly like FNF's use of
+     * `FlxG.width/FlxG.height`.
+     */
+    var GAME_WIDTH: Int = BASE_WIDTH
+        private set
+    var GAME_HEIGHT: Int = BASE_HEIGHT
+        private set
+
+    /**
+     * FNF's `FullScreenScaleMode.gameCutoutSize.x`: how much wider the game
+     * area is than the 16:9 reference, in game units. Zero at 16:9, so every
+     * `+ cutout` offset below is a no-op on desktop.
+     */
+    val GAME_CUTOUT_WIDTH: Int get() = GAME_WIDTH - BASE_WIDTH
+
+    /**
+     * FNF's `FullScreenScaleMode.gameNotchSize.x`: the width of the camera
+     * cutout, converted to game units.
+     *
+     * The game area deliberately covers the whole screen (a landscape notch
+     * sits on the display's short edge, which Android lets the window extend
+     * into), so UI pinned to the left/right edges has to step inward by this
+     * amount or it disappears under the cutout. FNF adds it to left-anchored
+     * elements and subtracts it from right-anchored ones; see
+     * `FreeplayState`/`ResultState`. Zero on desktop.
+     */
+    var GAME_NOTCH_WIDTH: Int = 0
+        private set
+
+    /** [GAME_NOTCH_WIDTH] as a `Double`, for layout math. */
+    val GAME_NOTCH: Double get() = GAME_NOTCH_WIDTH.toDouble()
+
+    /** Called once by `KnfViewport` before any scene is built. */
+    fun applyViewport(width: Int, height: Int, notchWidth: Int) {
+        GAME_WIDTH = width
+        GAME_HEIGHT = height
+        GAME_NOTCH_WIDTH = notchWidth
+    }
 
     /** FNF's `Constants.PIXEL_ART_SCALE`. */
     const val PIXEL_ART_SCALE = 6.0

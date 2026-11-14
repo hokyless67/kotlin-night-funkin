@@ -14,8 +14,10 @@ import kotlin.math.roundToInt
 import nightfunkin.core.Constants
 import nightfunkin.core.Knf
 import nightfunkin.core.KnfBootLog
+import nightfunkin.core.KnfViewport
 import nightfunkin.platform.KnfEnv
 import nightfunkin.platform.KnfPlatform
+import nightfunkin.platform.KnfProfiler
 import nightfunkin.play.PlayRequest
 import nightfunkin.play.PlayScene
 import nightfunkin.play.ResultScene
@@ -26,13 +28,18 @@ import nightfunkin.ui.SongSelectScene
 import nightfunkin.ui.TitleScene
 
 suspend fun main() {
-    KnfBootLog.install()
+    // The logger must never be able to stop the game from starting: on Android
+    // it mirrors stdout into a file, and a failure there used to leave a black
+    // screen with no window at all.
+    runCatching { KnfBootLog.install() }.onFailure { it.printStackTrace() }
     KnfBootLog.mark("main() entered")
 
     try {
         Korge(
-            windowSize = Size(Constants.GAME_WIDTH.toDouble(), Constants.GAME_HEIGHT.toDouble()),
-            virtualSize = Size(Constants.GAME_WIDTH.toDouble(), Constants.GAME_HEIGHT.toDouble()),
+            // Authored size. On mobile `KnfViewport` widens the virtual size to
+            // the device aspect a moment later, once the window reports it.
+            windowSize = Size(Constants.BASE_WIDTH.toDouble(), Constants.BASE_HEIGHT.toDouble()),
+            virtualSize = Size(Constants.BASE_WIDTH.toDouble(), Constants.BASE_HEIGHT.toDouble()),
             title = Knf.NAME,
             backgroundColor = Colors["#000000"],
             // Desktop window icon; bundled by `jvmProcessResources` from the
@@ -49,8 +56,21 @@ suspend fun main() {
             try {
                 KnfBootLog.mark("KorGE block started")
                 println("=== ${Knf.NAME} v${Knf.VERSION} (${Knf.SHORT}) ===")
+                // Fill the device screen on mobile (FNF's `FullScreenScaleMode`)
+                // *before* any scene is built, so every layout sizes itself for
+                // the real game area. On desktop this keeps the 16:9 window.
+                KnfViewport.install(views)
                 nightfunkin.core.Save.load()
                 KnfBootLog.mark("save loaded")
+
+                // Frame-stall watchdog. Off by default: it samples a stack every
+                // time a frame runs long, which fills the boot log with dozens of
+                // dumps during loading. `KNF_WATCHDOG=1` turns it on.
+                if (KnfPlatform.isMobile && KnfEnv["KNF_WATCHDOG"] == "1") {
+                    runCatching { KnfProfiler.startWatchdog("GLThread") }
+                        .onFailure { println("KNF: watchdog start failed: $it") }
+                }
+                stage.addUpdater { KnfProfiler.frame() }
 
                 if (KnfEnv["KNF_DEBUG_INPUT"] == "1") {
                     val watched = listOf(Key.A, Key.S, Key.D, Key.W, Key.Z, Key.ENTER, Key.LEFT)

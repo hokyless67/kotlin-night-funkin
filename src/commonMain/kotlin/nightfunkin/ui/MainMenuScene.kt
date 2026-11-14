@@ -1,13 +1,14 @@
 package nightfunkin.ui
 
-import korlibs.image.color.Colors
+import korlibs.image.bitmap.Bitmap
+import korlibs.image.bitmap.extract
 import korlibs.korge.scene.Scene
 import korlibs.korge.view.Image
 import korlibs.korge.view.SContainer
-import korlibs.korge.view.SolidRect
 import korlibs.korge.view.addUpdater
-import korlibs.korge.view.solidRect
+import korlibs.korge.view.renderToBitmap
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import nightfunkin.audio.MenuMusic
 import nightfunkin.audio.SfxPlayer
 import nightfunkin.core.Constants
@@ -16,9 +17,11 @@ import nightfunkin.core.KnfInput
 import nightfunkin.core.KnfTouch
 import nightfunkin.core.SparrowSprite
 import nightfunkin.core.TextureAtlas
+import nightfunkin.core.syncViewport
 import nightfunkin.platform.KnfLinks
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.roundToInt
 
 /**
  * Friday Night Funkin' 0.8.6's `MainMenuState`.
@@ -41,6 +44,9 @@ class MainMenuScene : Scene() {
     private var bgBaseY = 0.0
     private var magenta: Image? = null
 
+    /** The scene's root container; member functions like `goBack` add to it. */
+    private lateinit var sceneRoot: SContainer
+
     private val items = ArrayList<MenuItem>()
     private var selectedIndex = 0
 
@@ -55,17 +61,26 @@ class MainMenuScene : Scene() {
     private var itemFlickerElapsed = 0.0
     private var itemFlickerTogglesLeft = 0
 
+    /** `goBack`'s default FNF transition: 0.7 s fade to black, then the title. */
+    private var leaving = false
+    private var leaveElapsed = 0.0
+
     private var magentaFlickerElapsed = 0.0
     private var magentaFlickerTogglesLeft = 0
 
     /** `freeplay.goBack` restarts freakyMenu from the top with a 4 s fade-in. */
     private var musicFadeInElapsed = -1.0
 
-    /** `FlxTransitionableState.defaultTransIn`: 1 s fade from black. */
-    private var fadeInRect: SolidRect? = null
+    /** `FlxTransitionableState.defaultTransIn`: 1 s black wipe on entry. */
+    private var fadeInWipe: SceneWipe? = null
     private var fadeInElapsed = 0.0
 
+    /** `defaultTransOut`: the 0.7 s wipe to the title, created in `goBack`. */
+    private var fadeOutWipe: SceneWipe? = null
+
     override suspend fun SContainer.sceneInit() {
+        sceneRoot = this
+        syncViewport()
         buildBackground()
         buildMenuItems()
 
@@ -86,11 +101,16 @@ class MainMenuScene : Scene() {
         loadSounds()
         loadAndStartMusic()
 
-        fadeInRect = solidRect(
-            Constants.GAME_WIDTH.toDouble(),
-            Constants.GAME_HEIGHT.toDouble(),
-            Colors.BLACK,
-        ).also { it.alpha = 1.0 }
+        // `FlxTransitionableState.defaultTransIn`: the 1 s black wipe. Freeplay
+        // closes back into this state as a substate, which never plays a
+        // transition (`skipNextTransIn`), so that path opts out.
+        if (!SceneWipe.consumeSkipNextReveal()) {
+            fadeInWipe = SceneWipe(
+                Constants.GAME_WIDTH.toDouble(),
+                Constants.GAME_HEIGHT.toDouble(),
+                reveal = true,
+            ).also { addChild(it) }
+        }
     }
 
     private fun SContainer.buildBackground() {
@@ -299,10 +319,70 @@ class MainMenuScene : Scene() {
     private fun startFreeplay() {
         rememberedSelectedIndex = selectedIndex
         exiting = true
-        // FNF opens Freeplay as a substate and leaves freakyMenu playing until
-        // the first capsule selection pauses it. SongSelectScene owns that pause
-        // and the preview, so the menu track must stay loaded here.
-        launch { sceneContainer.changeTo<SongSelectScene>() }
+        // FNF opens Freeplay as a substate of MainMenuState with
+        // `persistentDraw = true`, so the menu stays on screen while the
+        // capsules and the pink card animate in. KorGE replaces the scene, so
+        // hand Freeplay the menu's last frame to draw under its entrance.
+        launch {
+            // `renderToBitmap` waits for the next frame, hence the coroutine;
+            // the timeout keeps a stalled renderer from freezing the switch.
+            val frame = withTimeoutOrNull(1_000L) {
+                runCatching { captureStageFrame() }.getOrNull()
+            }
+            FreeplayBackdrop.offer(frame)
+            // FNF opens Freeplay as a substate and leaves freakyMenu playing until
+            // the first capsule selection pauses it. SongSelectScene owns that pause
+            // and the preview, so the menu track must stay loaded here.
+            sceneContainer.changeTo<SongSelectScene>()
+        }
+    }
+
+    /**
+     * Snapshots the visible game area for the Freeplay hand-off.
+     *
+     * Rendering the stage directly is normally already the game area - the
+     * stage is a `FixedSizeContainer`, so its local bounds are its virtual
+     * size. That cache is only invalidated from its children, though, and
+     * `KnfViewport` resizes the virtual area underneath it after the window
+     * reports its size, so the snapshot used to come out at the previous
+     * 1280x720 size and left a cropped copy of the menu on the right. Refresh
+     * the bounds and crop the game area out of whatever the stage reports.
+     */
+    private suspend fun captureStageFrame(): Bitmap {
+        // An in wipe that is still running extends the stage bounds by several
+        // screens; the entrance covers that area anyway, so drop it first.
+        fadeInWipe?.removeFromParent()
+        fadeInWipe = null
+
+        // The menu flashes its magenta plate when an item is accepted and
+        // Freeplay freezes the menu mid-flash. The captured frame is what stays
+        // on screen through the entrance, so hide the flash for that render;
+        // otherwise the whole backdrop comes out magenta.
+        val magentaVisible = magenta?.visible == true
+        magenta?.visible = false
+        try {
+            // The stage is a `FixedSizeContainer`, so its local bounds are the game
+            // area - but that cache is only invalidated from the children and the
+            // virtual size can change underneath it (`KnfViewport`), so refresh it
+            // to keep the snapshot from coming out at the old 1280x720 size.
+            stage.invalidateLocalBounds()
+            val bounds = stage.getLocalBounds(includeFilters = true)
+            // `includeBackground` fills the parts the menu art does not cover with
+            // the window's clear colour, like FNF's `persistentDraw` does.
+            val full = stage.renderToBitmap(includeBackground = true)
+            val width = Constants.GAME_WIDTH
+            val height = Constants.GAME_HEIGHT
+            val left = (-bounds.x).roundToInt().coerceIn(0, (full.width - width).coerceAtLeast(0))
+            val top = (-bounds.y).roundToInt().coerceIn(0, (full.height - height).coerceAtLeast(0))
+            return full.extract(
+                left,
+                top,
+                width.coerceAtMost(full.width - left).coerceAtLeast(1),
+                height.coerceAtMost(full.height - top).coerceAtLeast(1),
+            )
+        } finally {
+            if (magentaVisible) magenta?.visible = true
+        }
     }
 
     private fun onScreenNotPorted(name: String) {
@@ -319,10 +399,21 @@ class MainMenuScene : Scene() {
     }
 
     private fun goBack() {
+        if (leaving) return
         rememberedSelectedIndex = selectedIndex
         exiting = true
+        leaving = true
+        leaveElapsed = 0.0
         cancelSoundPath?.let { sfx.play(it) }
-        launch { sceneContainer.changeTo<TitleScene>() }
+        // `defaultTransOut`: the black band slides down over the menu, then
+        // TitleState plays its own in wipe.
+        fadeInWipe?.removeFromParent()
+        fadeInWipe = null
+        fadeOutWipe = SceneWipe(
+            Constants.GAME_WIDTH.toDouble(),
+            Constants.GAME_HEIGHT.toDouble(),
+            reveal = false,
+        ).also { sceneRoot.addChild(it) }
     }
 
     override suspend fun SContainer.sceneMain() {
@@ -347,19 +438,42 @@ class MainMenuScene : Scene() {
                 music.volume = min(1.0, music.volume + 0.5 * d)
             }
 
-            if (fadeInElapsed < TRANSITION_FADE_IN) {
+            if (fadeInWipe != null && fadeInElapsed < TRANSITION_FADE_IN) {
                 fadeInElapsed += d
-                fadeInRect?.alpha = (1.0 - fadeInElapsed / TRANSITION_FADE_IN)
-                    .coerceIn(0.0, 1.0)
+                val t = (fadeInElapsed / TRANSITION_FADE_IN).coerceIn(0.0, 1.0)
+                fadeInWipe?.update(t)
+                if (t >= 1.0) {
+                    fadeInWipe?.removeFromParent()
+                    fadeInWipe = null
+                }
             }
 
-            if (fadeInElapsed >= TRANSITION_FADE_IN) {
-                handleInputs(knfInput)
+            if (leaving) {
+                leaveElapsed += d
+                val t = (leaveElapsed / TRANSITION_FADE_OUT).coerceIn(0.0, 1.0)
+                fadeOutWipe?.update(t)
+                if (leaveElapsed >= TRANSITION_FADE_OUT) {
+                    leaving = false
+                    launch { sceneContainer.changeTo<TitleScene>() }
+                    return@addUpdater
+                }
             }
+
+            // `UIStateMachine.canInteract` counts `EnteringMainMenu` as an
+            // enabled state - "we want to be able to interact even during the
+            // screen fade wipe thing" - so the menu takes input while the
+            // incoming black is still fading.
+            handleInputs(knfInput)
         }
 
         // Menu gestures on top of everything (tap = accept, drags = navigation).
         if (KnfTouch.enabled) addChild(TouchControls())
+
+        // The entry wipe covers the touch overlay too.
+        fadeInWipe?.let {
+            it.removeFromParent()
+            addChild(it)
+        }
     }
 
     private class MenuItem(
@@ -394,5 +508,7 @@ class MainMenuScene : Scene() {
         const val MAGENTA_FLICKER_INTERVAL = 0.15
         const val MUSIC_FADE_IN_SECONDS = 4.0
         const val TRANSITION_FADE_IN = 1.0
+        /** `FlxTransitionableState.defaultTransOut`. */
+        const val TRANSITION_FADE_OUT = 0.7
     }
 }

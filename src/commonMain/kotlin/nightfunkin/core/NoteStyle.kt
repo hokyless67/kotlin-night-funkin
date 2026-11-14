@@ -8,6 +8,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import korlibs.image.bitmap.Bitmap
 import korlibs.image.bitmap.Bitmap32
+import korlibs.image.bitmap.bmp
 import korlibs.image.bitmap.sliceWithSize
 import korlibs.image.color.RGBA
 import korlibs.korge.render.RenderContext
@@ -119,6 +120,17 @@ class NoteStyle(val id: String) {
     }
 
     /**
+     * Standalone bitmaps of [active], snapshotted once after [prewarmTextures].
+     *
+     * `AgBitmapTextureManager.gc()` drops every bitmap that was not referenced
+     * since the previous pass (every 60 frames), so a judgement sprite that only
+     * appears on a hit was re-uploaded on each hit. Snapshotting avoids walking
+     * a map another thread may still grow.
+     */
+    private var keptBitmaps: List<Bitmap> = emptyList()
+    private var keptBitmapCount = -1
+
+    /**
      * Re-references every texture this style renders, keeping it resident in
      * KorGE's GPU texture cache.
      *
@@ -130,12 +142,52 @@ class NoteStyle(val id: String) {
      * every frame.
      */
     fun touchTextures(ctx: RenderContext) {
-        // Only the atlases: they are the big textures (the splash sheet alone is
-        // 2048x2048). The small standalone PNGs sit in `bitmaps`, which
-        // `judgementAsset` may still populate from the update thread, so walking
-        // it here could race with a HashMap resize.
         val style = active
         for (atlas in style.atlases.values) ctx.getTex(atlas.bitmap)
+        // Judgement popups, combo digits, the hold-note strip and the countdown
+        // images are plain PNGs, not atlases. The GC pass above drops them
+        // within a second of not being drawn, and the next hit paid for the
+        // upload again.
+        val size = runCatching { style.bitmaps.size }.getOrDefault(-1)
+        if (size != keptBitmapCount) {
+            runCatching { ArrayList(style.bitmaps.values) }.getOrNull()?.let {
+                keptBitmaps = it
+                keptBitmapCount = size
+            }
+        }
+        for (bitmap in keptBitmaps) ctx.getTex(bitmap)
+    }
+
+    /**
+     * Uploads every texture of this style to the GPU.
+     *
+     * Called once after [warmup], while the countdown covers the screen.
+     * Without this the first judgement/combo/splash image paid for its texture
+     * upload on the frame it appeared, i.e. on the first note - a visible hitch
+     * on a phone. `warmup` already filled both maps, so nothing allocates here.
+     *
+     * The splash sheet's *rotated* frames are the exception: `TextureAtlas`
+     * copies them into a fresh bitmap, which is a different texture from the
+     * sheet. Building (and uploading) them here keeps that pixel copy off the
+     * first judged hit - the first Sick was the last one-off, original freeze.
+     */
+    fun prewarmTextures(ctx: RenderContext) {
+        val style = active
+        for (atlas in style.atlases.values) ctx.getTex(atlas.bitmap)
+        val bitmaps = runCatching { ArrayList(style.bitmaps.values) }.getOrDefault(ArrayList())
+        fun keep(bitmap: Bitmap) {
+            if (bitmaps.none { it === bitmap }) bitmaps += bitmap
+        }
+        for (direction in 0..3) {
+            for (variant in style.splashVariants(direction)) {
+                for (frame in variant) keep(frame.slice.bmp)
+            }
+        }
+        for (name in JUDGEMENT_KEYS) style.judgement(name)?.let { keep(it.slice.bmp) }
+        for (digit in 0..9) style.comboNumber(digit)?.let { keep(it.slice.bmp) }
+        keptBitmaps = bitmaps
+        keptBitmapCount = bitmaps.size
+        for (bitmap in bitmaps) ctx.getTex(bitmap)
     }
 
     // ======================================================================
@@ -623,6 +675,9 @@ class NoteStyle(val id: String) {
     companion object {
         private val cache = HashMap<String, NoteStyle>()
         fun get(id: String): NoteStyle = cache.getOrPut(id) { NoteStyle(id) }
+
+        /** `judgementSick` ... `judgementShit`, the popups a hit can show. */
+        private val JUDGEMENT_KEYS = listOf("sick", "good", "bad", "shit")
 
         private val knfJson = Json {
             ignoreUnknownKeys = true

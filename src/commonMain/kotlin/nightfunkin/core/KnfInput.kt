@@ -29,10 +29,8 @@ class KnfInput(private val inputKeys: InputKeys) {
     private val _justPressed = BooleanArray(laneKeys.size)
     private val _justReleased = BooleanArray(laneKeys.size)
 
-    // Touch action edges, derived in update() from KnfTouch's held flags.
-    private var touchAcceptWasDown = false
-    private var touchBackWasDown = false
-    private var touchPauseWasDown = false
+    // Touch action edges (one-shot pulses written by the overlay and consumed
+    // here, so an event that fires between two updates is never dropped).
     private var touchAcceptJust = false
     private var touchBackJust = false
     private var touchPauseJust = false
@@ -85,16 +83,19 @@ class KnfInput(private val inputKeys: InputKeys) {
             val isDownNow = laneKeys[lane].any { inputKeys.get(it) } ||
                 (lane < touchLanes.size && touchLanes[lane])
             _justReleased[lane] = _down[lane] && !isDownNow
-            _justPressed[lane] = !_down[lane] && isDownNow
+            _justPressed[lane] = (!_down[lane] && isDownNow) || KnfTouch.pressed[lane]
             _down[lane] = isDownNow
         }
+        // A tap that began and ended inside one frame gap leaves `lanes` clear
+        // but `pressed` set; it still counts as a press.
+        KnfTouch.pressed.fill(false)
 
-        touchAcceptJust = KnfTouch.acceptDown && !touchAcceptWasDown
-        touchAcceptWasDown = KnfTouch.acceptDown
-        touchBackJust = KnfTouch.backDown && !touchBackWasDown
-        touchBackWasDown = KnfTouch.backDown
-        touchPauseJust = KnfTouch.pauseDown && !touchPauseWasDown
-        touchPauseWasDown = KnfTouch.pauseDown
+        touchAcceptJust = KnfTouch.acceptDown
+        touchBackJust = KnfTouch.backDown
+        touchPauseJust = KnfTouch.pauseDown
+        // The overlay writes these from touch callbacks at any point in the
+        // frame, so they stay set until an update consumes them.
+        KnfTouch.clearFrameActions()
     }
 
     fun reset() {

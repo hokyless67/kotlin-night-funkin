@@ -40,4 +40,26 @@ actual object KnfPlatform {
     actual val isMobile: Boolean get() = true
 
     actual val isAndroid: Boolean get() = false
+
+    actual fun requestMemoryReclaim() {
+        // Kotlin/Native's collector runs on its own; there is no portable hint.
+    }
+
+    actual fun memoryReport(): String = "n/a (kotlin/native)"
+
+    actual fun trackWeak(value: Any?) = Unit
+
+    actual fun trackedStillAlive(): Boolean = false
+
+    /**
+     * iOS: the notch is reported through `safeAreaInsets`. Transparently 0
+     * until the safe-area query is wired up for the iOS target.
+     */
+    actual fun prepareWindow(window: Any?) = Unit
+
+    /**
+     * iOS: the notch is reported through `safeAreaInsets`. Transparently 0
+     * until the safe-area query is wired up for the iOS target.
+     */
+    actual fun displayCutoutPx(window: Any?): Int = 0
 }

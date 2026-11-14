@@ -282,8 +282,8 @@ class ResultAnimateSprite(
             img.y = cy - bounds.minY
 
             val m: Mat = part.matrix
-            img.scaleX = hypot(m.a, m.b)
-            img.scaleY = hypot(m.c, m.d)
+            img.scaleX = hypot(m.a, m.b) * def.textureScaleX
+            img.scaleY = hypot(m.c, m.d) * def.textureScaleY
             if (m.a * m.d - m.c * m.b < 0.0) img.scaleY = -img.scaleY
             val degrees = (if (def.turned) -90.0 else 0.0) + KnfMath.toDegrees(atan2(m.b, m.a))
             img.rotation = degrees.degrees

@@ -6,11 +6,13 @@ import korlibs.audio.sound.AudioSample
 import korlibs.audio.sound.PlaybackTimes
 import korlibs.audio.sound.Sound
 import korlibs.audio.sound.SoundAudioData
+import korlibs.audio.sound.SoundAudioStream
 import korlibs.audio.sound.SoundChannel
 import korlibs.audio.sound.nativeSoundProvider
 import korlibs.audio.sound.readSound
 import korlibs.concurrent.lock.Lock
 import korlibs.io.stream.openAsync
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -19,9 +21,12 @@ import kotlinx.coroutines.withContext
 import nightfunkin.core.KnfFiles
 import nightfunkin.platform.KnfPlatform
 import nightfunkin.core.KnfFmt
+import kotlin.math.min
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.DurationUnit
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
 
 /** Converts a frame delta into plain seconds. */
 fun Duration.dtSeconds(): Double = inWholeNanoseconds / 1_000_000_000.0
@@ -55,11 +60,18 @@ class MusicPlayer {
     private var paused = false
     private var analyzer: SpectrumAnalyzer? = null
 
-    /** True when playback runs on [knfMusicSoundProvider]'s deep-buffer output. */
+    /** True when playback runs on a KNF platform output instead of korlibs'. */
     private var usesKnfOutput = false
+
+    /** True for `SoundAudioStream`: its position is the decoder's, not the output's. */
+    private var streamed = false
 
     /** Sample rate of the loaded track; `SoundChannel` does not expose it. */
     private var sampleRate = 44100
+
+    /** Position and wall clock of the last [play] request (see [playedPositionMs]). */
+    private var playAnchorMs = 0.0
+    private var playMark: TimeMark? = null
 
     /**
      * KorGE's `SoundAudioData` registers its `onCancel` stop hook on the
@@ -108,9 +120,18 @@ class MusicPlayer {
      * the newest `outputLeadMs` of those samples have not been heard yet. The
      * korlibs backends buffer too, but there the Conductor is anchored on the
      * wall clock instead (see `PlayScene.updateClock`), so this reports 0.
+     *
+     * A stream reports the position its *decoder* reached (`AudioStream.
+     * currentTime`), which leads the speaker by its own prefetch queue. That
+     * queue holds between one and two `bufferTime`s and has always been left
+     * out of this correction: the callers that matter tolerate the difference,
+     * and subtracting a fixed guess would make the preview's loop point and
+     * the results intro handover behave differently from before on streamed
+     * tracks. Callers that must follow the sound sample by sample use
+     * [playedPositionMs] instead, which is anchored on the play request.
      */
     val outputLeadMs: Double
-        get() = if (usesKnfOutput) {
+        get() = if (usesKnfOutput && !streamed) {
             knfMusicLeadBlocks * KNF_AUDIO_BLOCK_FRAMES * 1000.0 / sampleRate
         } else {
             0.0
@@ -119,6 +140,43 @@ class MusicPlayer {
     /** Position the listener is hearing right now. */
     val audiblePositionMs: Double
         get() = (positionMs - outputLeadMs).coerceAtLeast(0.0)
+
+    /**
+     * Position the listener is hearing, counted from the last [play] request.
+     *
+     * [positionMs] is what the *producer* has reached, and right after [play]
+     * it is not where the listener is: a stream's decoder runs a prefetch
+     * buffer ahead and can jump by whole buffers before the first sample is
+     * audible, and a decoded track is ahead by the device queue. Anything
+     * that follows the sound (Freeplay's preview fade, the results intro
+     * handover) must not see those jumps, or a fade-in snaps from silence to
+     * whatever the decoder had already buffered.
+     *
+     * Taking the smaller of "generated since play" and "wall clock since
+     * play" keeps this monotonic and anchored at the play request: it starts
+     * at the requested position when playback is requested, tracks the
+     * generated position while that is behind the clock, and never runs ahead
+     * of real time. Device latency is a constant offset on both sides, so the
+     * error stays well under the length of a fade.
+     */
+    val playedPositionMs: Double
+        get() {
+            val mark = playMark ?: return positionMs
+            val generated = (positionMs - playAnchorMs).coerceAtLeast(0.0)
+            val wall = mark.elapsedNow().toMsDouble()
+            return playAnchorMs + min(generated, wall)
+        }
+
+    /**
+     * True once the current [play] request has actually started producing
+     * audio.
+     *
+     * `SoundChannel.state` reports stopped for a stream until its producer
+     * coroutine has cloned and seeked the decoder, which can take long enough
+     * that treating it as "finished" cuts a track that has not begun yet.
+     */
+    val started: Boolean
+        get() = channel != null && (playing || positionMs > 0.0)
 
     val playing: Boolean get() = channel?.state?.playing == true
 
@@ -175,46 +233,67 @@ class MusicPlayer {
         // easily take a few hundred milliseconds. KorGE's main dispatcher
         // drains scene callbacks per frame, so doing this there stalls the game
         // and logs "Too many callbacks to handle in this frame".
-        val loaded = withContext(Dispatchers.Default) {
-            val bytes = readBytes() ?: return@withContext null
+        //
+        // A failed decode must not abort `sceneInit`: on a phone this is where
+        // memory pressure shows up first, and throwing here left the scene half
+        // built (no music, no listeners) instead of a playable silent chart.
+        val loaded = try {
+            withContext(Dispatchers.Default) {
+                val bytes = readBytes() ?: return@withContext null
 
-            // Gameplay stems MUST be fully decoded: the streaming decoder's
-            // output position jumps in buffer-sized chunks and can underrun
-            // under CPU load, which desyncs the stems from each other AND
-            // cuts the track's beginning. Solo tracks (menu music, previews)
-            // stream on mobile — a momentary gap there is harmless. Decoded
-            // PCM costs ~10 MB per minute of stereo audio; `largeHeap`
-            // covers a song's worth on mobile, desktop has 2 GB.
-            val loadedSound = bytes.readSound(streaming = streaming)
+                // Gameplay stems MUST be fully decoded: the streaming decoder's
+                // output position jumps in buffer-sized chunks and can underrun
+                // under CPU load, which desyncs the stems from each other AND
+                // cuts the track's beginning. Solo tracks (menu music, previews)
+                // stream on mobile - a momentary gap there is harmless. Decoded
+                // PCM costs ~10 MB per minute of stereo audio; `largeHeap`
+                // covers a song's worth on mobile, desktop has 2 GB.
+                val loadedSound = bytes.readSound(streaming = streaming)
 
-            // Fully decoded tracks are played back through KNF's own platform
-            // output (see `KnfAudioOutput`): korlibs' default output is only one
-            // `AudioTrack` block deep on Android, so a late producer wake-up
-            // under rendering load leaves an audible gap at every block seam.
-            val musicOutput = knfMusicSoundProvider
-            if (!streaming && musicOutput != null) {
-                (loadedSound as? SoundAudioData)?.soundProvider = musicOutput
+                // Fully decoded tracks are played back through KNF's own platform
+                // output (see `KnfAudioOutput`): korlibs' default output is only one
+                // `AudioTrack` block deep on Android, so a late producer wake-up
+                // under rendering load leaves an audible gap at every block seam.
+                //
+                // Streamed tracks get their own single-block output instead:
+                // korlibs' stream generator only emits a block while its queue
+                // holds a whole `bufferTime`, so a deep device queue makes the
+                // pump drain several blocks at once and receive silence for the
+                // difference. The single-block device still moves the (slow,
+                // binder-bound) device creation off the GL thread, which is what
+                // used to leave the Freeplay preview silent for a while.
+                when (loadedSound) {
+                    is SoundAudioData ->
+                        if (!streaming) knfMusicSoundProvider?.let { loadedSound.soundProvider = it }
+                    is SoundAudioStream ->
+                        knfStreamSoundProvider?.let { loadedSound.soundProvider = it }
+                }
+
+                // Sound.length is zero for KorGE's non-streaming SoundAudioData,
+                // but its decoded AudioData still knows the real duration.
+                // Streaming sounds report it from the MP3 header; fall back to a
+                // cheap metadata probe when the header did not carry one. Freeplay
+                // needs this before playback starts to compute the preview window.
+                val audio = if (!streaming) {
+                    runCatching { loadedSound.decode() }.getOrNull()
+                } else {
+                    null
+                }
+                val lengthMs = audio?.totalTime?.toMsDouble()
+                    ?: loadedSound.length.toMsDouble().takeIf { it > 0.0 }
+                    ?: (runCatching { probeDurationMs(bytes) }.getOrNull() ?: 0.0)
+                println(
+                    "KNF: audio '$key' streaming=$streaming rate=${audio?.rate} " +
+                        "channels=${audio?.channels} totalSamples=${audio?.totalSamples} " +
+                        "lengthMs=${KnfFmt.decimals(lengthMs, 0)}"
+                )
+                Triple(loadedSound, lengthMs, audio)
             }
-
-            // Sound.length is zero for KorGE's non-streaming SoundAudioData,
-            // but its decoded AudioData still knows the real duration.
-            // Streaming sounds report it from the MP3 header; fall back to a
-            // cheap metadata probe when the header did not carry one. Freeplay
-            // needs this before playback starts to compute the preview window.
-            val audio = if (!streaming && (analyze || musicOutput != null)) {
-                runCatching { loadedSound.decode() }.getOrNull()
-            } else {
-                null
-            }
-            val lengthMs = audio?.totalTime?.toMsDouble()
-                ?: loadedSound.length.toMsDouble().takeIf { it > 0.0 }
-                ?: (runCatching { probeDurationMs(bytes) }.getOrNull() ?: 0.0)
-            println(
-                "KNF: audio '$key' streaming=$streaming rate=${audio?.rate} " +
-                    "channels=${audio?.channels} totalSamples=${audio?.totalSamples} " +
-                    "lengthMs=${KnfFmt.decimals(lengthMs, 0)}"
-            )
-            Triple(loadedSound, lengthMs, audio)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            println("KNF: audio '$key' failed to decode: $e")
+            null
         }
         if (loaded == null) {
             println("KNF: audio missing: $missingName")
@@ -225,8 +304,13 @@ class MusicPlayer {
         s.volume = volume
         sound = s
         analyzer = if (analyze) audio?.let { runCatching { SpectrumAnalyzer(it) }.getOrNull() } else null
-        usesKnfOutput = s is SoundAudioData && s.soundProvider === knfMusicSoundProvider
-        sampleRate = audio?.rate ?: 44100
+        streamed = s is SoundAudioStream
+        usesKnfOutput = when (s) {
+            is SoundAudioData -> knfMusicSoundProvider != null && s.soundProvider === knfMusicSoundProvider
+            is SoundAudioStream -> knfStreamSoundProvider != null && s.soundProvider === knfStreamSoundProvider
+            else -> false
+        }
+        sampleRate = audio?.rate ?: (s as? SoundAudioStream)?.stream?.rate ?: 44100
         this.volume = volume
         loadedPath = key
         stoppedAtMs = 0.0
@@ -250,6 +334,8 @@ class MusicPlayer {
         channel?.stop()
         stoppedAtMs = startMs
         paused = false
+        playAnchorMs = startMs
+        playMark = TimeSource.Monotonic.markNow()
         val times = if (loop) PlaybackTimes.INFINITE else PlaybackTimes.ONE
         val ch = s.play(playbackContext, times, startMs.milliseconds)
         ch.volume = volume
@@ -294,6 +380,8 @@ class MusicPlayer {
         channel = null
         stoppedAtMs = 0.0
         paused = false
+        playMark = null
+        playAnchorMs = 0.0
     }
 
     /** Hard seek. Resumes only if we were playing. */

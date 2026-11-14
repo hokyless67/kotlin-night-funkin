@@ -41,6 +41,36 @@ class PopUpStuff(
     var beatLengthMs: Double = 500.0
 
     /**
+     * Builds (and draws) one hidden copy of every judgement and combo digit
+     * while the game is still loading.
+     *
+     * The first judged note used to be the first time these images existed: the
+     * view, its texture binding and its draw were all first-time work on the GL
+     * thread, which showed up as a ~0.5 s freeze on the first hit. Off-screen at
+     * an invisible alpha, they cost nothing afterwards and make the hit path
+     * identical to every later hit.
+     */
+    fun prewarm() {
+        for (name in listOf("sick", "good", "bad", "shit")) {
+            noteStyle.judgement(name)?.let { hidden(it.slice, it.scale) }
+        }
+        for (digit in 0..9) {
+            noteStyle.comboNumber(digit)?.let { hidden(it.slice, it.scale) }
+        }
+    }
+
+    private fun hidden(slice: nightfunkin.core.AtlasSlice, scale: Float) {
+        val img = Image(slice)
+        img.anchor = korlibs.math.geom.Anchor2D.TOP_LEFT
+        img.x = -4000.0
+        img.y = -4000.0
+        img.scaleX = scale.toDouble()
+        img.scaleY = scale.toDouble()
+        img.alpha = 0.004
+        addChild(img)
+    }
+
+    /**
      * FNF's `PopUpStuff.displayRating`.
      *
      * The rating sprite sits slightly left of centre and above the middle, then

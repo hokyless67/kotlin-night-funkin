@@ -1,6 +1,7 @@
 package nightfunkin.ui
 
 import korlibs.event.MouseButton
+import korlibs.korge.input.touch
 import korlibs.korge.view.Container
 import korlibs.korge.view.addUpdater
 import korlibs.korge.view.image
@@ -60,6 +61,9 @@ class TouchControls : Container() {
             field = value
             pauseButton?.visible = !value
             if (value) releaseAll()
+            // A pulse left over from the screen we just left must not fire in
+            // this one.
+            KnfTouch.clearFrameActions()
         }
 
     /**
@@ -107,14 +111,39 @@ class TouchControls : Container() {
     }
 
     // ------------------------------------------------------------------
+    // touch events
+    // ------------------------------------------------------------------
+
+    /** `stage.touch` listeners are bound on the first update, once the stage exists. */
+    private var eventsBound = false
+
+    /**
+     * Listens to the touch events themselves instead of only sampling
+     * `input.activeTouches` once per frame.
+     *
+     * On this phone the game runs at ~7 fps while it streams and uploads, so a
+     * normal 80-120 ms tap can *begin and end inside one frame gap*: the poll
+     * never sees the finger and the tap is lost. The events fire as Android
+     * delivers them, and [KnfTouch.pressed] keeps the press readable until
+     * `KnfInput` consumes it, so a tap is never dropped no matter how long the
+     * frame took.
+     */
+    private fun bindTouchEvents() {
+        if (eventsBound) return
+        val stage = stage ?: return
+        eventsBound = true
+        stage.touch.start { onPointerDown(it.id, it.global.x, it.global.y) }
+        stage.touch.move { onPointerMove(it.id, it.global.x, it.global.y) }
+        stage.touch.end { onPointerEnd(it.id) }
+    }
+
+    // ------------------------------------------------------------------
     // per-frame polling
     // ------------------------------------------------------------------
 
     private fun poll() {
         bringToFront()
-        // Action flags are one-frame pulses; the tap/button handlers below run
-        // after this clear within the same poll.
-        KnfTouch.clearFrameActions()
+        bindTouchEvents()
         pollPointers()
     }
 
@@ -159,6 +188,12 @@ class TouchControls : Container() {
     // ------------------------------------------------------------------
 
     private fun onPointerDown(id: Int, x: Double, y: Double) {
+        // A poll and a touch event can both report the same first frame; the
+        // events win, the poll just confirms the position.
+        if (pointers.containsKey(id)) {
+            onPointerMove(id, x, y)
+            return
+        }
         val pointer = Pointer(x, y, x, y)
         pointers[id] = pointer
 
@@ -183,6 +218,7 @@ class TouchControls : Container() {
         if (lane >= 0) {
             pointer.lane = lane
             KnfTouch.lanes[lane] = true
+            KnfTouch.pressed[lane] = true
         }
     }
 
@@ -205,6 +241,7 @@ class TouchControls : Container() {
                 if (lane >= 0) {
                     pointer.lane = lane
                     KnfTouch.lanes[lane] = true
+                    KnfTouch.pressed[lane] = true
                 }
             }
         }
@@ -255,6 +292,7 @@ class TouchControls : Container() {
 
     private fun releaseAll() {
         KnfTouch.lanes.fill(false)
+        KnfTouch.pressed.fill(false)
         for (pointer in pointers.values) {
             pointer.lane = -1
             pointer.navAxis = 0

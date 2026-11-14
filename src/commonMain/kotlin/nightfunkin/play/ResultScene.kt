@@ -22,7 +22,9 @@ import nightfunkin.core.AnimateAtlas
 import nightfunkin.core.Constants
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfInput
+import nightfunkin.core.KnfMemory
 import nightfunkin.core.KnfTouch
+import nightfunkin.core.guardedSceneInit
 import nightfunkin.core.SparrowSprite
 import nightfunkin.core.TextureAtlas
 import nightfunkin.ui.SongSelectScene
@@ -30,9 +32,11 @@ import nightfunkin.ui.StickerOverlay
 import nightfunkin.ui.StickerSceneTarget
 import nightfunkin.ui.TouchControls
 import nightfunkin.ui.secondsDouble
+import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.floor
 import kotlin.math.max
+import kotlin.math.PI
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -102,7 +106,7 @@ class ResultScene : Scene() {
     private var movingSongStuff = false
     private var speedX = 0.0
     private var speedY = 0.0
-    private var difficultyWorldX = 555.0
+    private var difficultyWorldX = 555.0 + Constants.GAME_NOTCH
     private var smallWorldX = 0.0
     private var titleWorldX = 0.0
 
@@ -113,6 +117,9 @@ class ResultScene : Scene() {
     private var introAvailable = false
     private var introStarted = false
     private var introStartedAt = 0.0
+
+    /** True once the intro has produced audio (see the handover in `updateScene`). */
+    private var introHeard = false
     private var loopStarted = false
     private var scrollMenuSound: String? = null
     private var confirmMenuSound: String? = null
@@ -121,8 +128,15 @@ class ResultScene : Scene() {
     // setup
     // =====================================================================
 
-    override suspend fun SContainer.sceneInit() {
+    override suspend fun SContainer.sceneInit() = guardedSceneInit("Results") {
+        runSceneInit()
+    }
+
+    private suspend fun SContainer.runSceneInit() {
         sceneRoot = this
+        // Free the finished song's stage/character sheets before decoding the
+        // result art: KorGE keeps the old scene alive until after this runs.
+        KnfMemory.beginScene(views, "Results")
         val data = ResultRequest.data
         if (data == null) {
             println("KNF: ResultScene started without ResultRequest.data")
@@ -231,16 +245,37 @@ class ResultScene : Scene() {
         barLayer = Container().also { addChild(it) }
         effectsLayer = Container().also { addChild(it) }
 
-        soundSystem = makeSparrowAnim("resultScreen/soundSystem", "sound system", -15.0, -180.0)
-            ?.also { effectsLayer.addChild(it.sprite) }
-        resultsAnim = makeSparrowAnim("resultScreen/results", "results instance 1", -200.0, -10.0)
-            ?.also { effectsLayer.addChild(it.sprite) }
-        ratingsPopin = makeSparrowAnim("resultScreen/ratingsPopin", "Categories", -135.0, 135.0)
-            ?.also { effectsLayer.addChild(it.sprite) }
-        scorePopin = makeSparrowAnim("resultScreen/scorePopin", "tally score", -180.0, 515.0)
-            ?.also { effectsLayer.addChild(it.sprite) }
-        highscoreNew = makeSparrowAnim("resultScreen/highscoreNew", "highscoreAnim0", 44.0, 557.0)
-            ?.also { effectsLayer.addChild(it.sprite) }
+        soundSystem = makeSparrowAnim(
+            "resultScreen/soundSystem",
+            "sound system",
+            -15.0 + Constants.GAME_NOTCH,
+            -180.0,
+        )?.also { effectsLayer.addChild(it.sprite) }
+        // `resultsAnim = FlxG.width - (1480 + gameCutoutSize.x / 2)`.
+        resultsAnim = makeSparrowAnim(
+            "resultScreen/results",
+            "results instance 1",
+            Constants.GAME_WIDTH - 1480.0 - Constants.GAME_CUTOUT_WIDTH / 2.0,
+            -10.0,
+        )?.also { effectsLayer.addChild(it.sprite) }
+        ratingsPopin = makeSparrowAnim(
+            "resultScreen/ratingsPopin",
+            "Categories",
+            -135.0 + Constants.GAME_NOTCH,
+            135.0,
+        )?.also { effectsLayer.addChild(it.sprite) }
+        scorePopin = makeSparrowAnim(
+            "resultScreen/scorePopin",
+            "tally score",
+            -180.0 + Constants.GAME_NOTCH,
+            515.0,
+        )?.also { effectsLayer.addChild(it.sprite) }
+        highscoreNew = makeSparrowAnim(
+            "resultScreen/highscoreNew",
+            "highscoreAnim0",
+            44.0 + Constants.GAME_NOTCH,
+            557.0,
+        )?.also { effectsLayer.addChild(it.sprite) }
 
         after(6.0 / 24.0) { resultsAnim?.showAndPlay() }
         after(8.0 / 24.0) { soundSystem?.showAndPlay() }
@@ -248,7 +283,11 @@ class ResultScene : Scene() {
         after(36.0 / 24.0) { scorePopin?.showAndPlay() }
 
         // ---- black bar ----------------------------------------------------
-        val barBitmap = KnfFiles.bitmapOrNull("shared/images/resultScreen/topBarBlack.png")
+        // `ResultState` uses `BitmapUtil.createResultsBar()`: a black band
+        // rotated by -3.8 degrees, sized from `FlxG.width` (not a fixed
+        // 1280 px image), so the slanted bottom edge keeps its angle on wide
+        // phone screens.
+        val barBitmap = createResultsBar()
         if (barBitmap != null) {
             barHeight = barBitmap.height.toDouble()
             val bar = Image(barBitmap).also {
@@ -277,7 +316,8 @@ class ResultScene : Scene() {
         for (anim in playerResults?.animationsFor(rank).orEmpty()) {
             if (!filterPasses(anim.filter)) continue
             val offsets = anim.offsets.orEmpty()
-            val x = offsets.getOrElse(0) { 0.0 }
+            // `xPos = offsets[0] + (gameCutoutSize.x / 2)`.
+            val x = offsets.getOrElse(0) { 0.0 } + Constants.GAME_CUTOUT_WIDTH / 2.0
             val y = offsets.getOrElse(1) { 0.0 }
             val scale = anim.scale ?: 1.0
             val zIndex = anim.zIndex ?: 500
@@ -307,16 +347,18 @@ class ResultScene : Scene() {
         }
 
         // ---- tallies ------------------------------------------------------
+        // Every tally is `x + FullScreenScaleMode.gameNotchSize.x` in FNF.
         val tallies = data.tallies
-        val hitX = if (tallies.totalNotesHit >= 1000) 345.0 else 375.0
+        val notch = Constants.GAME_NOTCH
+        val hitX = (if (tallies.totalNotesHit >= 1000) 345.0 else 375.0) + notch
         val tallyAtlas = requireTallyAtlas()
         tallyCounters += TallyCounter(tallyAtlas, hitX, 150.0, tallies.totalNotesHit)
         tallyCounters += TallyCounter(tallyAtlas, hitX, 200.0, tallies.maxCombo)
-        tallyCounters += TallyCounter(tallyAtlas, 230.0, 277.0, tallies.sick, Colors["#89E59E"])
-        tallyCounters += TallyCounter(tallyAtlas, 210.0, 331.0, tallies.good, Colors["#89C9E5"])
-        tallyCounters += TallyCounter(tallyAtlas, 190.0, 385.0, tallies.bad, Colors["#E6CF8A"])
-        tallyCounters += TallyCounter(tallyAtlas, 220.0, 439.0, tallies.shit, Colors["#E68C8A"])
-        tallyCounters += TallyCounter(tallyAtlas, 260.0, 493.0, tallies.missed, Colors["#C68AE6"])
+        tallyCounters += TallyCounter(tallyAtlas, 230.0 + notch, 277.0, tallies.sick, Colors["#89E59E"])
+        tallyCounters += TallyCounter(tallyAtlas, 210.0 + notch, 331.0, tallies.good, Colors["#89C9E5"])
+        tallyCounters += TallyCounter(tallyAtlas, 190.0 + notch, 385.0, tallies.bad, Colors["#E6CF8A"])
+        tallyCounters += TallyCounter(tallyAtlas, 220.0 + notch, 439.0, tallies.shit, Colors["#E68C8A"])
+        tallyCounters += TallyCounter(tallyAtlas, 260.0 + notch, 493.0, tallies.missed, Colors["#C68AE6"])
         for ((index, counter) in tallyCounters.withIndex()) {
             counter.visible = false
             effectsLayer.addChild(counter)
@@ -331,7 +373,8 @@ class ResultScene : Scene() {
 
         val scoreAtlas = TextureAtlas.tryLoad("shared/images/resultScreen/score-digital-numbers.xml")
         if (scoreAtlas != null) {
-            val score = ResultScore(scoreAtlas, 35.0, 305.0, 10, data.score)
+            // `score = new ResultScore(35 + gameNotchSize.x, 305, 10, ...)`.
+            val score = ResultScore(scoreAtlas, 35.0 + Constants.GAME_NOTCH, 305.0, 10, data.score)
             score.visible = false
             effectsLayer.addChild(score)
             scoreView = score
@@ -482,9 +525,24 @@ class ResultScene : Scene() {
         }
 
         // The intro (when it exists) hands over to the looping track.
+        //
+        // A streamed intro reports "stopped" until its producer coroutine has
+        // cloned and seeked the decoder - on a loaded phone that is longer
+        // than the frame this check used to run on, so the intro was killed
+        // right after it was requested and the loop (which begins where the
+        // intro ends) took over mid-phrase. Only treat "not playing" as the
+        // end once the intro has actually produced audio.
         if (introStarted && time - introStartedAt > 0.05) {
-            val ended = !introMusic.playing ||
-                (introMusic.totalMs > 0.0 && introMusic.audiblePositionMs >= introMusic.totalMs - 50.0)
+            if (!introHeard && introMusic.started) introHeard = true
+            val total = introMusic.totalMs
+            val ended = when {
+                introHeard -> !introMusic.playing ||
+                    (total > 0.0 && introMusic.playedPositionMs >= total - 30.0)
+                // Safety net: an intro that never starts (a dead device, a
+                // decode that reported success but produces nothing) must not
+                // leave the results screen silent for good.
+                else -> time - introStartedAt > 1.5
+            }
             if (ended) {
                 introStarted = false
                 introMusic.stop()
@@ -517,7 +575,7 @@ class ResultScene : Scene() {
         val start = max(0, clearPercentTarget - 36)
 
         val counter = ClearPercentCounter(
-            Constants.GAME_WIDTH / 2.0 + 190.0,
+            Constants.GAME_WIDTH / 2.0 + 190.0 + Constants.GAME_CUTOUT_WIDTH / 2.0,
             Constants.GAME_HEIGHT / 2.0 - 70.0,
             start,
         )
@@ -615,7 +673,8 @@ class ResultScene : Scene() {
     ) {
         movingSongStuff = false
 
-        difficultyWorldX = 555.0
+        // `difficulty.x = 555 + FullScreenScaleMode.gameNotchSize.x`.
+        difficultyWorldX = 555.0 + Constants.GAME_NOTCH
         smallWorldX = difficultyWorldX + difficultyWidth + 60.0
         titleWorldX = smallWorldX + 94.0
 
@@ -659,6 +718,7 @@ class ResultScene : Scene() {
         if (introAvailable && introMusic.exists) {
             introStarted = true
             introStartedAt = time
+            introHeard = false
             introMusic.play()
         } else {
             startLoopMusic()
@@ -683,7 +743,17 @@ class ResultScene : Scene() {
         // `ResultState`: non-story exits go through the sticker transition
         // (`StickerSubState` over the results screen).
         val overlay = StickerOverlay(ResultRequest.data?.characterId ?: "bf", sfx) {
-            launch { sceneContainer.changeTo<SongSelectScene>() }
+            launch {
+                // `preStateSwitch` purge: drop the results loops before
+                // Freeplay decodes its art, not after (see
+                // `KnfMemory.beginScene`).
+                runCatching {
+                    music.dispose()
+                    introMusic.dispose()
+                    sfx.stopAll()
+                }
+                sceneContainer.changeTo<SongSelectScene>()
+            }
         }
         sceneRoot?.addChild(overlay)
     }
@@ -835,6 +905,37 @@ class ResultScene : Scene() {
 
     private fun quadIn(t: Double): Double = t * t
 
+    /**
+     * `BitmapUtil.createResultsBar`: the black strip behind the results title.
+     *
+     * A `width x ceil(width / 8.7)` black bitmap is drawn rotated by -3.8
+     * degrees and offset by (-15, 0), leaving a slanted bottom edge. Width
+     * follows the game area, exactly like the Haxe helper follows
+     * `FlxG.width`, so the bar always spans the screen on wide phones.
+     */
+    private fun createResultsBar(): Bitmap32? {
+        val width = ceil(Constants.GAME_WIDTH * 1.011).toInt()
+        val height = ceil(width / 8.7).toInt()
+        if (width <= 0 || height <= 0) return null
+        val angle = -3.8 * PI / 180.0
+        val cos = cos(angle)
+        val sin = sin(angle)
+        val tx = -15.0
+        val pixels = IntArray(width * height)
+        val black = 0xFF000000.toInt()
+        for (y in 0 until height) {
+            val row = y * width
+            for (x in 0 until width) {
+                // Inverse of `matrix.rotate(angle); matrix.translate(-15, 0)`.
+                val xr = x - tx
+                val sx = cos * xr + sin * y
+                val sy = -sin * xr + cos * y
+                if (sx >= 0.0 && sx < width && sy >= 0.0 && sy < height) pixels[row + x] = black
+            }
+        }
+        return Bitmap32(width, height, pixels, true)
+    }
+
     private fun gradientBitmap(width: Int, height: Int, top: Int, bottom: Int): Bitmap32 {
         val pixels = IntArray(width * height)
         for (y in 0 until height) {
@@ -917,7 +1018,8 @@ class ResultScene : Scene() {
         const val CLIP_X = 520.0
         const val SONG_NAME_HEIGHT = 61.0
         const val SMALL_CLEAR_HEIGHT = 72.0
-        const val RANK_ROW_LOCAL_X = 320.0 - Constants.GAME_WIDTH / 2.0
+        /** `rankTextBack.x = FlxG.width / 2 - 320`, local to the centre. */
+        const val RANK_ROW_LOCAL_X = -320.0
 
         /** Preferences.naughtyness defaults to true in FNF 0.8.6. */
         const val NAUGHTYNESS = true

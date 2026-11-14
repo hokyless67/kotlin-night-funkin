@@ -5,6 +5,7 @@ import korlibs.image.bitmap.sliceWithSize
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlin.math.roundToInt
 @Serializable
 data class RawSprite(@SerialName("SPRITE") val sprite: RawSpriteData? = null)
 
@@ -41,6 +42,27 @@ data class SpriteDef(
      */
     val dx: Int = 0,
     val dy: Int = 0,
+    /**
+     * Compensation for a sheet that was shrunk to fit the GPU's texture limit.
+     *
+     * [slice] then comes from the smaller bitmap while [width]/[height] keep the
+     * authored size, so an `Image` drawn from it must be scaled by these to keep
+     * the sprite's size and the animation's coordinates intact.
+     */
+    val textureScaleX: Double = 1.0,
+    val textureScaleY: Double = 1.0,
+    /**
+     * This frame's rect in the *source* atlas, normalized (`0..1`).
+     *
+     * `tankmanBattlefieldErect`'s rim masks (`erect/masks/gfTankmen_mask`, ...)
+     * are painted over the whole character atlas, so the shader has to know
+     * where the frame being drawn sits inside it. Empty for Animate sprites,
+     * whose mask is the animation canvas, and for rotated frames.
+     */
+    val maskU: Double = 0.0,
+    val maskV: Double = 0.0,
+    val maskW: Double = 0.0,
+    val maskH: Double = 0.0,
 )
 
 // ===========================================================================
@@ -407,6 +429,11 @@ class Bounds {
 class AnimateAtlas(
     /** The folder holding `Animation.json` and `spritemap1.png`. */
     val dir: String,
+    /**
+     * Longest side the sheet may be decoded at. Stage props pass the smaller
+     * backdrop limit on mobile; characters keep the full texture limit.
+     */
+    private val textureLimit: Int = KnfFiles.maxTextureDimension,
 ) {
     private val animationJson: String =
         KnfFiles.textOrNull("$dir/Animation.json") ?: "{}"
@@ -428,7 +455,7 @@ class AnimateAtlas(
     private val rootTimeline: AnimTimeline? =
         anim?.animation?.timeline ?: legacyAnim?.animation?.timeline?.toTimeline()
 
-    val sprites: Map<String, SpriteDef> = loadSprites(dir)
+    val sprites: Map<String, SpriteDef> = loadSprites(dir, textureLimit)
 
     private val symbolByName: Map<String, AnimTimeline> =
         anim?.symbolDefs?.symbols.orEmpty().associate { it.name to it.timeline }
@@ -543,15 +570,33 @@ class AnimateAtlas(
         return null
     }
 
-    fun loadSprites(dir: String): Map<String, SpriteDef> {
+    fun loadSprites(
+        dir: String,
+        limit: Int = KnfFiles.maxTextureDimension,
+    ): Map<String, SpriteDef> {
         val json = KnfFiles.textOrNull("$dir/spritemap1.json") ?: return emptyMap()
-        val bitmap: Bitmap = KnfFiles.bitmapOrNull("$dir/spritemap1.png") ?: return emptyMap()
+        // The sheet can be shrunk to fit the GPU's texture limit; the sprite
+        // rectangles below are in source pixels and are mapped through it.
+        val image = KnfFiles.decodedImageOrNull("$dir/spritemap1.png", limit) ?: return emptyMap()
+        val bitmap: Bitmap = image.bitmap
+        val scaleX = image.scaleX
+        val scaleY = image.scaleY
+        val inverseX = if (scaleX != 0.0) 1.0 / scaleX else 1.0
+        val inverseY = if (scaleY != 0.0) 1.0 / scaleY else 1.0
 
         val raw = runCatching { knfJson.decodeFromString<SpritemapRoot>(json) }
             .getOrElse {
                 println("KNF: animate atlas '$dir' spritemap parse failed: $it")
                 return emptyMap()
             }.atlas
+
+        fun sliceOf(s: RawSpriteData): AtlasSlice {
+            val left = (s.x * scaleX).roundToInt().coerceIn(0, maxOf(0, bitmap.width - 1))
+            val top = (s.y * scaleY).roundToInt().coerceIn(0, maxOf(0, bitmap.height - 1))
+            val right = ((s.x + s.w) * scaleX).roundToInt().coerceIn(left + 1, bitmap.width)
+            val bottom = ((s.y + s.h) * scaleY).roundToInt().coerceIn(top + 1, bitmap.height)
+            return bitmap.sliceWithSize(left, top, right - left, bottom - top)
+        }
 
         val out = LinkedHashMap<String, SpriteDef>()
         for (entry in raw.sprites) {
@@ -566,18 +611,22 @@ class AnimateAtlas(
                 // which made results characters appear giant and misplaced.
                 out[s.name] = SpriteDef(
                     name = s.name,
-                    slice = bitmap.sliceWithSize(s.x, s.y, s.w, s.h),
+                    slice = sliceOf(s),
                     width = s.h,
                     height = s.w,
                     turned = true,
+                    textureScaleX = inverseX,
+                    textureScaleY = inverseY,
                 )
             } else {
                 out[s.name] = SpriteDef(
                     name = s.name,
-                    slice = bitmap.sliceWithSize(s.x, s.y, s.w, s.h),
+                    slice = sliceOf(s),
                     width = s.w,
                     height = s.h,
                     turned = false,
+                    textureScaleX = inverseX,
+                    textureScaleY = inverseY,
                 )
             }
         }

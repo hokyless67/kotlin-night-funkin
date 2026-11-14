@@ -23,6 +23,8 @@ import kotlinx.coroutines.launch
 import nightfunkin.core.Constants
 import nightfunkin.core.KnfBootLog
 import nightfunkin.core.KnfFiles
+import nightfunkin.core.KnfMemory
+import nightfunkin.core.syncViewport
 import nightfunkin.data.SongRegistry
 import nightfunkin.platform.KnfEnv
 import nightfunkin.platform.KnfPlatform
@@ -88,6 +90,11 @@ class LoadingScene : Scene() {
 
     override suspend fun SContainer.sceneInit() {
         KnfBootLog.mark("LoadingScene.sceneInit start")
+        // `LoadingState.hx` purges every non-permanent graphic before the next
+        // state is created; doing it here means the boot path starts from a
+        // clean GL/heap too (and any scene we come back from is gone).
+        KnfMemory.beginScene(views, "Loading")
+        syncViewport()
         val width = Constants.GAME_WIDTH.toDouble()
         val height = Constants.GAME_HEIGHT.toDouble()
 
@@ -126,8 +133,10 @@ class LoadingScene : Scene() {
         // FNF measures the height while this is still the single-line
         // "Downloading assets..." placeholder, then never repositions it when
         // the real two-line status text replaces it.
+        // `progressLeftText.x += ScreenUtil.getNotchRect().width * ratio`:
+        // keep the status line out from under the camera cutout.
         progressLeftText = makeText(
-            x = BAR_PADDING,
+            x = BAR_PADDING + Constants.GAME_NOTCH,
             y = progressY,
             value = "Downloading assets...",
             size = 32.0,
@@ -229,6 +238,9 @@ class LoadingScene : Scene() {
             launch { sceneContainer.changeTo<PlayScene>() }
         } else {
             KnfBootLog.mark("LoadingScene -> TitleScene")
+            // `InitState.startGame` sets `skipNextTransIn`, so the title does
+            // not play its in transition on boot.
+            SceneWipe.requestSkipNextReveal()
             launch { sceneContainer.changeTo<TitleScene>() }
         }
     }

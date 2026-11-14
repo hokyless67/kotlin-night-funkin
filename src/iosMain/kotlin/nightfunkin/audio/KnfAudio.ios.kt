@@ -8,6 +8,12 @@ import korlibs.audio.sound.NativeSoundProvider
  */
 internal actual val knfMusicSoundProvider: NativeSoundProvider? = null
 
+/** CoreAudio already queues several buffers for streams; see [knfStreamSoundProvider]. */
+internal actual val knfStreamSoundProvider: NativeSoundProvider? = null
+
 internal actual val knfSfxSoundProvider: NativeSoundProvider? = null
 
 internal actual val knfMusicLeadBlocks: Int = 0
+
+/** CoreAudio is opened by korlibs itself here; there is no device to prewarm. */
+internal actual fun knfPrewarmMusicOutput(sampleRate: Int) = Unit

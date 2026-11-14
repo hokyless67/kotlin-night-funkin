@@ -56,7 +56,7 @@ internal fun knfBlockPumpOutput(
     channels: Int,
     frequency: Int,
     gen: AudioPlatformOutputGen,
-    sink: KnfAudioSink,
+    sinkFactory: () -> KnfAudioSink,
     threadName: String,
 ): AudioPlatformOutput {
     // A one-thread pool, not `NativeThreadDispatcher`: that class's
@@ -75,7 +75,15 @@ internal fun knfBlockPumpOutput(
         val block = AudioSamplesInterleaved(channels, KNF_AUDIO_BLOCK_FRAMES)
         var started = false
         var lastPaused: Boolean? = null
+        var sink: KnfAudioSink? = null
         try {
+            // Opening the device is the expensive part: `new AudioTrack(...)`
+            // is a binder round trip that MIUI happily stretches to a couple of
+            // hundred milliseconds, and `play()` is called from the GL thread
+            // (song start, pause/resume). Creating the sink here moves that
+            // cost onto the audio thread, so the frame that starts the song
+            // does not stall while three stems open their devices.
+            sink = sinkFactory()
             while (running) {
                 if (!currentCoroutineContext().isActive) break
                 if (lastPaused != paused) {
@@ -96,7 +104,7 @@ internal fun knfBlockPumpOutput(
         } catch (e: Throwable) {
             if (running) println("KNF: audio '$threadName' failed: ${e.message}")
         } finally {
-            runCatching { sink.close() }
+            runCatching { sink?.close() }
             // A fresh dispatcher is created per output (`play()` rebuilds one
             // for every pause/resync), so its thread has to go with it.
             dispatcher.close()
@@ -105,13 +113,40 @@ internal fun knfBlockPumpOutput(
 }
 
 /**
- * Fully decoded tracks (gameplay stems, cutscene audio) get this output on the
- * platforms that provide one; `null` keeps korlibs' backend.
+ * Music output for fully decoded tracks; `null` keeps korlibs' backend.
  */
 internal expect val knfMusicSoundProvider: NativeSoundProvider?
+
+/**
+ * Music output for streamed tracks (previews, menu, pause and results music).
+ *
+ * This is a *separate* output on purpose: `SoundAudioStream.play`'s generator
+ * only hands a block to the device while its own queue holds a full
+ * `bufferTime` (0.25 s), and it never holds more than twice that. A deeper
+ * device queue therefore does not add headroom - the pump simply writes
+ * several blocks back to back, drains the generator below that threshold, and
+ * gets silence in exchange, which is audible as a gap every few blocks. One
+ * device block keeps the generator's pacing (the producer's queue is the
+ * buffer) while still opening the device on the audio thread instead of the
+ * GL thread, which is what made the Freeplay preview start late.
+ *
+ * `null` on platforms without a custom backend.
+ */
+internal expect val knfStreamSoundProvider: NativeSoundProvider?
 
 /** The one shared SFX mixer output. Latency matters more than headroom here. */
 internal expect val knfSfxSoundProvider: NativeSoundProvider?
 
 /** Device blocks the music output queues ahead of the speaker; 0 without a custom backend. */
 internal expect val knfMusicLeadBlocks: Int
+
+/**
+ * Opens one music device into the platform's warm-device pool, if it has one.
+ *
+ * Backends that open a device per playback pay a fixed cost before the first
+ * sample (Android's `AudioTrack` constructor is a binder round trip that MIUI
+ * stretches to hundreds of milliseconds). Warming one while a menu is still
+ * being built keeps the first short playback - Freeplay's song preview - from
+ * starting with that much silence.
+ */
+internal expect fun knfPrewarmMusicOutput(sampleRate: Int = 44_100)

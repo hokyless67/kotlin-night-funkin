@@ -22,6 +22,8 @@ import nightfunkin.core.KnfInput
 import nightfunkin.core.KnfTouch
 import nightfunkin.core.SparrowSprite
 import nightfunkin.core.TextureAtlas
+import nightfunkin.core.syncViewport
+import nightfunkin.platform.KnfPlatform
 import kotlin.math.min
 import kotlin.random.Random
 import kotlin.time.Duration
@@ -60,6 +62,9 @@ class TitleScene : Scene() {
     private var gfRightFrames: List<TextureAtlas.AtlasFrame> = emptyList()
     private var titleText: TitleTextSprite? = null
 
+    /** The scene's root container; member functions like `moveToMenu` add to it. */
+    private lateinit var sceneRoot: SContainer
+
     private var danceLeft = false
     private var lastTitleBeat = 0
     private var confirmSoundPath: String? = null
@@ -69,7 +74,11 @@ class TitleScene : Scene() {
     private var movedToMenu = false
     private var leaving = false
     private var leaveElapsed = 0.0
-    private var fadeOutRect: SolidRect? = null
+    private var fadeOutWipe: SceneWipe? = null
+
+    /** `FlxTransitionableState.defaultTransIn`: 1 s black wipe on entry. */
+    private var fadeInWipe: SceneWipe? = null
+    private var fadeInElapsed = 0.0
 
     private var newgrounds: Image? = null
     private var newgroundsBitmap: Bitmap? = null
@@ -79,6 +88,8 @@ class TitleScene : Scene() {
     private val wacky: Pair<String, String> by lazy { loadRandomIntroText() }
 
     override suspend fun SContainer.sceneInit() {
+        sceneRoot = this
+        syncViewport()
         playIntro = !initialized
         if (playIntro) initialized = true
         introDone = !playIntro
@@ -110,13 +121,15 @@ class TitleScene : Scene() {
             it.alpha = 1.0
         }
 
-        // `FlxTransitionableState.defaultTransOut`: 0.7 s fade to black.
-        fadeOutRect = solidRect(
-            Constants.GAME_WIDTH.toDouble(),
-            Constants.GAME_HEIGHT.toDouble(),
-            Colors.BLACK,
-        ).also {
-            it.alpha = 0.0
+        // `FlxTransitionableState.defaultTransIn`: the 1 s black wipe. FNF's
+        // `InitState.startGame` sets `skipNextTransIn`, so the title appears
+        // without a transition right after the loading screen.
+        if (!SceneWipe.consumeSkipNextReveal()) {
+            fadeInWipe = SceneWipe(
+                Constants.GAME_WIDTH.toDouble(),
+                Constants.GAME_HEIGHT.toDouble(),
+                reveal = true,
+            ).also { addChild(it) }
         }
     }
 
@@ -130,7 +143,7 @@ class TitleScene : Scene() {
             val frames = logoAtlas.framesByPrefix("logo bumpin")
             if (frames.isNotEmpty()) {
                 logoView = SparrowSprite(logoAtlas, frames, fps = 24.0, loop = true).also {
-                    it.x = -150.0
+                    it.x = -150.0 + Constants.GAME_CUTOUT_WIDTH / 2.5
                     it.y = -100.0
                     parent.addChild(it)
                 }
@@ -147,7 +160,7 @@ class TitleScene : Scene() {
             gfRightFrames = (15..29).mapNotNull { all.getOrNull(it) }
             if (gfLeftFrames.isNotEmpty()) {
                 gfView = SparrowSprite(gfAtlas, gfLeftFrames, fps = 24.0, loop = false).also {
-                    it.x = Constants.GAME_WIDTH * 0.4
+                    it.x = Constants.GAME_WIDTH * 0.4 + Constants.GAME_CUTOUT_WIDTH / 2.5
                     it.y = Constants.GAME_HEIGHT * 0.07
                     it.playing = false
                     parent.addChild(it)
@@ -155,12 +168,16 @@ class TitleScene : Scene() {
             }
         }
 
-        // titleText = FunkinSprite.createTextureAtlas(100, height * 0.8, ...).
-        val titleAtlas = AnimateAtlas("preload/images/title-screen-text")
+        // titleText = createTextureAtlas((mobile ? 50 : 100) + cutout/2, ...).
+        // Mobile ships a narrower atlas so the line still fits next to the logo.
+        val titleAtlas = AnimateAtlas(
+            if (KnfPlatform.isMobile) "preload/images/title-screen-text-mobile"
+            else "preload/images/title-screen-text"
+        )
         val slices = listOf("0", "1", "2", "3").mapNotNull { titleAtlas.sprites[it]?.slice }
         if (slices.size == 4) {
             titleText = TitleTextSprite(slices[0], slices[1], slices[2], slices[3]).also {
-                it.x = 100.0
+                it.x = (if (KnfPlatform.isMobile) 50.0 else 100.0) + Constants.GAME_CUTOUT_WIDTH / 2.0
                 it.y = Constants.GAME_HEIGHT * 0.8
                 parent.addChild(it)
             }
@@ -264,6 +281,16 @@ class TitleScene : Scene() {
 
             updateTitle(s)
 
+            if (fadeInWipe != null && fadeInElapsed < TRANSITION_FADE_IN) {
+                fadeInElapsed += s
+                val t = (fadeInElapsed / TRANSITION_FADE_IN).coerceIn(0.0, 1.0)
+                fadeInWipe?.update(t)
+                if (t >= 1.0) {
+                    fadeInWipe?.removeFromParent()
+                    fadeInWipe = null
+                }
+            }
+
             flashRect?.let { flash ->
                 if (flash.visible) {
                     flashElapsed += s
@@ -274,7 +301,8 @@ class TitleScene : Scene() {
 
             if (leaving) {
                 leaveElapsed += s
-                fadeOutRect?.alpha = (leaveElapsed / LEAVE_FADE).coerceIn(0.0, 1.0)
+                val t = (leaveElapsed / LEAVE_FADE).coerceIn(0.0, 1.0)
+                fadeOutWipe?.update(t)
                 if (leaveElapsed >= LEAVE_FADE && !movedToMenu) {
                     movedToMenu = true
                     launch { sceneContainer.changeTo<MainMenuScene>() }
@@ -299,6 +327,12 @@ class TitleScene : Scene() {
 
         // Menu gestures on top of everything (tap = accept).
         if (KnfTouch.enabled) addChild(TouchControls())
+
+        // The entry wipe covers the touch overlay too.
+        fadeInWipe?.let {
+            it.removeFromParent()
+            addChild(it)
+        }
     }
 
     /** Drives the title screen's idle animations and per-beat bops. */
@@ -343,11 +377,18 @@ class TitleScene : Scene() {
 
     private fun moveToMenu() {
         if (movedToMenu || leaving) return
-        // Start the default FNF transition: fade the title out to black, then
-        // MainMenuState fades in from black over one second.
+        // Start the default FNF transition (`defaultTransOut`, 0.7 s): a black
+        // band slides down over the title, then MainMenuState plays its own
+        // 1 s in wipe.
         leaving = true
         leaveElapsed = 0.0
-        fadeOutRect?.alpha = 0.0
+        fadeInWipe?.removeFromParent()
+        fadeInWipe = null
+        fadeOutWipe = SceneWipe(
+            Constants.GAME_WIDTH.toDouble(),
+            Constants.GAME_HEIGHT.toDouble(),
+            reveal = false,
+        ).also { sceneRoot.addChild(it) }
     }
 
     private fun updateIntro(elapsed: Double) {
@@ -462,6 +503,9 @@ class TitleScene : Scene() {
 
         /** `FlxTransitionableState.defaultTransOut` duration. */
         private const val LEAVE_FADE = 0.7
+
+        /** `FlxTransitionableState.defaultTransIn` duration. */
+        private const val TRANSITION_FADE_IN = 1.0
     }
 }
 

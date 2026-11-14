@@ -1,6 +1,8 @@
 package nightfunkin.audio
 
+import kotlinx.coroutines.delay
 import kotlin.math.min
+import kotlin.time.TimeSource
 
 /**
  * Freeplay's partial instrumental preview, from
@@ -9,7 +11,7 @@ import kotlin.math.min
  * FNF loads only the [previewStart]..[previewEnd] slice of the instrumental,
  * fades in from 0 to 0.7 over two seconds, fades out over the last two seconds,
  * then reloads and plays it again. We keep the same timings but reuse the
- * already-decoded sound and restart it at the preview start instead of paying
+ * already-loaded sound and restart it at the preview start instead of paying
  * the reload cost on every loop.
  */
 class SongPreviewPlayer {
@@ -29,7 +31,16 @@ class SongPreviewPlayer {
         isCurrent: () -> Boolean = { true },
     ): Boolean {
         stop()
+        // `FreeplayState.FADE_IN_DELAY` waits a quarter of a second after the
+        // capsule is selected before the preview starts, so scrolling through
+        // the list does not fire one load per step. Reading and opening the
+        // track takes most of that time already, so the clock starts before the
+        // load instead of after it: the preview still waits the full delay, but
+        // the delay covers the file work instead of being added to it.
+        val requestedAt = TimeSource.Monotonic.markNow()
         if (!player.load(path)) return false
+        val waitMs = START_DELAY_MS - requestedAt.elapsedNow().inWholeMilliseconds
+        if (waitMs > 0L) delay(waitMs)
         // Loading is asynchronous; the selection may have moved on while the
         // file was decoding. Never start a preview that is no longer current.
         if (!isCurrent()) {
@@ -58,14 +69,23 @@ class SongPreviewPlayer {
     fun update() {
         if (!active) return
 
-        val position = player.positionMs
-        if (position >= endMs) {
+        // The loop point follows the producer: it is where the track's data
+        // actually ends, and it is the position the fade-out below refers to,
+        // so the fade reaches zero exactly when the preview is cut.
+        val generated = player.positionMs
+        if (generated >= endMs) {
             restart()
             return
         }
 
-        val elapsed = (position - startMs).coerceAtLeast(0.0)
-        val remaining = (endMs - position).coerceAtLeast(0.0)
+        // The fade-in follows the listener instead. A stream's decoder jumps
+        // forward by a whole prefetch buffer right after `play()`, so reading
+        // the producer's position here made the gain snap from silence to a
+        // large value instead of ramping (Freeplay read `FlxG.sound.music.time`,
+        // which is the position the device has played).
+        val heard = player.playedPositionMs
+        val elapsed = (heard - startMs).coerceAtLeast(0.0)
+        val remaining = (endMs - generated).coerceAtLeast(0.0)
         var gain = 1.0
         if (elapsed < FADE_DURATION_MS) gain = min(gain, elapsed / FADE_DURATION_MS)
         if (remaining < FADE_DURATION_MS) gain = min(gain, remaining / FADE_DURATION_MS)
@@ -109,5 +129,8 @@ class SongPreviewPlayer {
         const val FADE_DURATION_MS = 2_000.0
         const val DEFAULT_PREVIEW_START = 0.0
         const val DEFAULT_PREVIEW_END = 0.2
+
+        /** `FreeplayState.FADE_IN_DELAY` (0.25 s), in milliseconds. */
+        const val START_DELAY_MS = 250L
     }
 }

@@ -150,8 +150,8 @@ class AnimateSpriteView(
             val (cx, cy) = m.xform(def.width / 2.0, def.height / 2.0)
             img.x = cx - originX
             img.y = cy - originY
-            img.scaleX = hypot(m.a, m.b)
-            img.scaleY = hypot(m.c, m.d)
+            img.scaleX = hypot(m.a, m.b) * def.textureScaleX
+            img.scaleY = hypot(m.c, m.d) * def.textureScaleY
             if (m.a * m.d - m.c * m.b < 0.0) img.scaleY = -img.scaleY
             img.rotation = ((if (def.turned) -90.0 else 0.0) +
                 KnfMath.toDegrees(atan2(m.b, m.a))).degrees

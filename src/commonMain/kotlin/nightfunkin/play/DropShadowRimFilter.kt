@@ -39,9 +39,10 @@ import nightfunkin.core.KnfMath
  *   base color first.
  *
  * Differences to the source, both structural: the filter runs on KorGE's
- * render-to-texture of the whole character, so the atlas `uFrameBounds` clamp
- * and the per-frame `angleOffset` are not needed, and `fwidth` is replaced by
- * the filter's standard texel derivates.
+ * render-to-texture of the whole character, so the per-frame `angleOffset` is
+ * not needed and `fwidth` is replaced by the filter's standard texel derivates.
+ * The alt mask is still sampled in *atlas* coordinates like the original, via
+ * the per-frame uv transform of [setMaskUv].
  */
 class DropShadowRimFilter(
     angle: Double = 0.0,
@@ -58,6 +59,17 @@ class DropShadowRimFilter(
         /** `rim.color = 0xFFDFEF3C`: the yellow key light of the stage script. */
         val DEFAULT_LIGHT_COLOR = RGBA(0xDF, 0xEF, 0x3C)
 
+        /**
+         * Longest side the alt mask is decoded at.
+         *
+         * It is only a boolean-ish region test in the shader, and the shipped
+         * masks are 8192x4096; at full size that single upload is 128 MB of GL
+         * memory for a light rim. 2048 still resolves each frame cell at
+         * ~1/4 of its authored size, which is plenty for a threshold region.
+         */
+        val MASK_TEXTURE_LIMIT: Int
+            get() = if (nightfunkin.platform.KnfPlatform.isMobile) 2048 else 4096
+
         /** Sampler index 0 is the one `ShaderIndices` reserves for users. */
         val u_AltMask by Sampler(ShaderIndices.SAMPLER_INDEX0, SamplerVarType.Sampler2D)
 
@@ -69,11 +81,15 @@ class DropShadowRimFilter(
             val u_AngCos by float()
             val u_AngSin by float()
             val u_UseMask by float()
-            val u_Pad by float()
+            /** 1 when [u_MaskScale]/[u_MaskOffset] remap the mask uv to the frame. */
+            val u_MaskFrame by float()
             val u_DropColor by vec4()
             val u_HsbRow0 by vec4()
             val u_HsbRow1 by vec4()
             val u_HsbRow2 by vec4()
+            /** uv01 -> mask uv, see [setMaskUv]. */
+            val u_MaskScale by vec4()
+            val u_MaskOffset by vec4()
         }
 
         private val PROGRAM_PROVIDER = object : BaseProgramProvider() {
@@ -91,7 +107,20 @@ class DropShadowRimFilter(
                     ((abs(right - center) + abs(down - center) + abs(diagonal - center) * 0.7f.lit) / 2.7f.lit) * 2f.lit
 
                 // `getThreshold`: inside the alt mask the mask threshold wins.
-                val maskIntensity = texture2DZeroOutside(u_AltMask, fragmentCoords01, check = false)["b"]
+                //
+                // `DropShadowShader` samples the mask at the sprite's *atlas*
+                // uv (the shipped masks, e.g. `erect/masks/gfTankmen_mask`, are
+                // painted over the character's atlas). KNF renders the trimmed
+                // frame into its own render target, so for legacy sheets the
+                // atlas rect of the current frame is folded into a uv
+                // transform ([setMaskUv]); Animate characters keep the raw
+                // render-target uv, which is their whole animation canvas.
+                val maskUv = TERNARY(
+                    UB.u_MaskFrame eq 1f.lit,
+                    fragmentCoords01 * UB.u_MaskScale["xy"] + UB.u_MaskOffset["xy"],
+                    fragmentCoords01,
+                )
+                val maskIntensity = texture2DZeroOutside(u_AltMask, maskUv, check = false)["b"]
                 val threshold = TERNARY(
                     (UB.u_UseMask eq 1f.lit) and (maskIntensity gt 0f.lit),
                     UB.u_Thr2,
@@ -126,8 +155,11 @@ class DropShadowRimFilter(
          * Folds FNF's four `setAdjustColor` setters into one affine transform:
          * `applyHSBCEffect` is `(brightness + color) * hue`, then contrast,
          * then saturation - every step linear except two constant offsets.
+         *
+         * Shared with [AdjustColorFilter], which is FNF's plain
+         * `AdjustColorShader` (the A-Bot pieces on Week 6 Erect).
          */
-        private fun foldAdjustColor(
+        internal fun foldAdjustColor(
             b: Double,
             h: Double,
             c: Double,
@@ -207,13 +239,72 @@ class DropShadowRimFilter(
     /** `rim.useAltMask`, toggled by the `EnableMask` song event. */
     var useAltMask: Boolean = false
 
+    /** True when the stage gave this rim an alt mask (`rim.loadAltMask`). */
+    val usesAltMask: Boolean get() = altMaskPath != null
+
+    /**
+     * uv transform into the alt mask, used instead of the raw render-target uv
+     * while [maskFrameActive].
+     *
+     * `DropShadowShader` samples the mask with the sprite's atlas uv; KNF's
+     * filter sees a render target of the trimmed frame instead. [Character]
+     * keeps this in sync with the pose it is drawing (see
+     * `Character.updateRimMask`).
+     */
+    private var maskFrameActive = false
+    private var maskScaleX = 1.0
+    private var maskScaleY = 1.0
+    private var maskOffsetX = 0.0
+    private var maskOffsetY = 0.0
+
+    /** `renderTargetUv * (scaleX, scaleY) + (offsetX, offsetY)` = mask uv. */
+    fun setMaskUv(scaleX: Double, scaleY: Double, offsetX: Double, offsetY: Double) {
+        maskFrameActive = true
+        maskScaleX = scaleX
+        maskScaleY = scaleY
+        maskOffsetX = offsetX
+        maskOffsetY = offsetY
+    }
+
+    fun clearMaskUv() {
+        maskFrameActive = false
+    }
+
     private var maskTexture: AGTexture? = null
+
+    /**
+     * The decoded mask, capped to [MASK_TEXTURE_LIMIT].
+     *
+     * The shader only samples it through `fragmentCoords01` to decide whether a
+     * pixel is inside the alt-mask region, so resolution beyond a few hundred
+     * pixels is wasted GPU memory. FNF's own masks are 8192x4096, i.e. 128 MB
+     * on a device that may only have 4096-wide textures.
+     */
+    private var maskBitmap: Bitmap32? = null
 
     /** `rim.loadAltMask(path)` + `maskThreshold` + the initial `useAltMask`. */
     fun setAltMask(path: String, thresholdValue: Double, use: Boolean) {
         altMaskPath = path
         maskThreshold = thresholdValue
         useAltMask = use
+        // Decode here, during `sceneInit`, not inside `updateUniforms`: the
+        // latter runs on the render thread mid-frame, and the tankmen masks are
+        // 8192x4096 PNGs (128 MB decoded) - allocating that while a render
+        // target is bound is exactly how a phone loses the frame.
+        maskBitmap = runCatching {
+            // `Paths.image` in FNF resolves through `shared` and the week
+            // libraries; the masks live in `week7/images`, while the stage
+            // script passes `erect/masks/...` (no week, no extension).
+            KnfFiles.resolve("$path.png")
+                ?.let { KnfFiles.bitmapOrNull(it, MASK_TEXTURE_LIMIT) }
+                ?.toBMP32IfRequired()
+        }.getOrNull()
+        if (maskBitmap == null) {
+            println(
+                "KNF: rim mask '$path' not found (looked in " +
+                    KnfFiles.resolveCandidates("$path.png") + ")",
+            )
+        }
         maskTexture = null
     }
 
@@ -228,8 +319,10 @@ class DropShadowRimFilter(
             it[u_AngCos] = angCos.toFloat()
             it[u_AngSin] = angSin.toFloat()
             it[u_UseMask] = if (useAltMask) 1f else 0f
-            it[u_Pad] = 0f
+            it[u_MaskFrame] = if (maskFrameActive) 1f else 0f
             it[u_DropColor] = Vector4F(dropR.toFloat(), dropG.toFloat(), dropB.toFloat(), 0f)
+            it[u_MaskScale] = Vector4F(maskScaleX.toFloat(), maskScaleY.toFloat(), 0f, 0f)
+            it[u_MaskOffset] = Vector4F(maskOffsetX.toFloat(), maskOffsetY.toFloat(), 0f, 0f)
             it[u_HsbRow0] = Vector4F(
                 hsb.first[0][0].toFloat(), hsb.first[0][1].toFloat(),
                 hsb.first[0][2].toFloat(), hsb.second[0].toFloat(),
@@ -250,16 +343,20 @@ class DropShadowRimFilter(
 
     private fun resolveMaskTexture(ctx: RenderContext): AGTexture? {
         maskTexture?.let { return it }
-        val path = altMaskPath
-        val bitmap = path?.let { KnfFiles.bitmapOrNull(it) }?.toBMP32IfRequired()
+        val bitmap = maskBitmap
         if (bitmap == null) {
-            if (path != null) println("KNF: rim mask '$path' not found")
             // A transparent 1x1 fallback: mask intensity 0 keeps the base
             // threshold active even if `useAltMask` is on.
             return AGTexture().also {
                 it.upload(Bitmap32(1, 1, intArrayOf(0), false))
             }.also { maskTexture = it }
         }
-        return AGTexture().also { it.upload(bitmap) }.also { maskTexture = it }
+        return AGTexture().also { it.upload(bitmap) }.also {
+            maskTexture = it
+            // The texture keeps its own reference to the pixels; this CPU copy
+            // is one upload's worth of memory (32 MB at 4096x2048) and never
+            // changes.
+            maskBitmap = null
+        }
     }
 }

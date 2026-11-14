@@ -19,6 +19,8 @@ import kotlin.math.abs
  */
 internal class FreeplayLetterSort(
     private val atlas: AnimateAtlas,
+    /** `LetterSort((CUTOUT_WIDTH * SONGS_POS_MULTI) + 400, 75)`. */
+    groupX: Double = 400.0,
 ) {
     companion object {
         /** `FreeplayLetter.regexLetters`, including the inserted leading tabs. */
@@ -32,10 +34,6 @@ internal class FreeplayLetterSort(
 
         private const val SLOT_COUNT = 5
 
-        // `LetterSort((CUTOUT_WIDTH * SONGS_POS_MULTI) + 400, 75)`. KNF runs at a
-        // fixed 1280x720 viewport, so `gameCutoutSize` is zero and the group is
-        // back at 400 like a 16:9 FNF window.
-        private const val GROUP_X = 400.0
         private const val GROUP_Y = 75.0
 
         /** `doLetterChangeAnims`'s four kick positions, in 1/24 s steps. */
@@ -52,7 +50,7 @@ internal class FreeplayLetterSort(
     }
 
     val container: Container = Container().also {
-        it.x = GROUP_X
+        it.x = groupX
         it.y = GROUP_Y
     }
 

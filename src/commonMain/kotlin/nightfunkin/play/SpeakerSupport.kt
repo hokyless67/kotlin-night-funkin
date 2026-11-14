@@ -4,6 +4,7 @@ import korlibs.image.bitmap.Bitmap32
 import korlibs.image.color.RGBA
 import korlibs.korge.view.Container
 import korlibs.korge.view.Image
+import korlibs.korge.view.filter.filter
 import korlibs.math.geom.Anchor2D
 import korlibs.math.geom.degrees
 import nightfunkin.audio.MusicPlayer
@@ -87,7 +88,15 @@ class SpeakerSupport private constructor(
         /** `NeneBaseCharacter` ids and the matching A-Bot flavour. */
         private val NORMAL_NENE_IDS = setOf("nene", "nene-christmas", "nene-tankmen")
 
-        fun forCharacter(character: Character, audio: MusicPlayer?): SpeakerSupport? {
+        /**
+         * @param sunset `nene-pixel.hxc`'s `addSunsetShaders()` - the warm
+         *   Week 6 Erect light. `schoolErect.hxc` calls it for Nene only.
+         */
+        fun forCharacter(
+            character: Character,
+            audio: MusicPlayer?,
+            sunset: Boolean = false,
+        ): SpeakerSupport? {
             return when (character.id) {
                 in NORMAL_NENE_IDS -> {
                     val rig = NormalRig(dark = false, audio)
@@ -97,7 +106,7 @@ class SpeakerSupport private constructor(
                     val rig = NormalRig(dark = true, audio)
                     SpeakerSupport(character, -95.0, 384.0, audio, rig)
                 }
-                "nene-pixel" -> SpeakerSupport(character, 296.0, 430.0, audio, PixelRig(audio))
+                "nene-pixel" -> SpeakerSupport(character, 296.0, 430.0, audio, PixelRig(audio, sunset))
                 // `otis-speaker.hxc` builds the same rig for Otis.
                 "otis-speaker" -> SpeakerSupport(character, 170.0, 455.0, audio, NormalRig(dark = false, audio))
                 else -> null
@@ -106,6 +115,16 @@ class SpeakerSupport private constructor(
 
         private val EMPTY_BITMAP =
             Bitmap32(1, 1, intArrayOf(0xFF000000.toInt()), true)
+
+        /** `nene-pixel.hxc` scales every A-Bot piece by 6. */
+        private const val PIECE_SCALE = 6.0
+
+        /** `schoolErect.hxc`: `rim.color = 0xFF52351D`. */
+        private val SUNSET_LIGHT = RGBA(0x52, 0x35, 0x1D)
+        private const val SUNSET_BRIGHTNESS = -66.0
+        private const val SUNSET_HUE = -10.0
+        private const val SUNSET_CONTRAST = 24.0
+        private const val SUNSET_SATURATION = -23.0
 
         private fun sparrowImage(assetPath: String): Image? {
             val path = KnfFiles.resolve(assetPath, ".png") ?: return null
@@ -208,7 +227,7 @@ class SpeakerSupport private constructor(
      * scales every piece by 6 and places the detached head and speakers around
      * the body.
      */
-    private class PixelRig(audio: MusicPlayer?) : Container(), Rig {
+    private class PixelRig(audio: MusicPlayer?, sunset: Boolean) : Container(), Rig {
         private val body: SparrowView
         private val speaker: SparrowView
         private val head: SparrowView
@@ -251,6 +270,53 @@ class SpeakerSupport private constructor(
 
             body.play("danceLeft")
             speaker.play("danceLeft")
+
+            if (sunset) applySunsetShaders(back)
+        }
+
+        /**
+         * `nene-pixel.hxc`'s `addSunsetShaders()`: the Week 6 Erect light.
+         *
+         * `noRimShader` is a plain Adjust Color on the A-Bot body, back plate,
+         * detached head and visualizer; the speaker instead gets the stage's
+         * `DropShadowShader` (same warm brown light as the characters) with
+         * the `aBotPixelSpeaker_mask` arcs, sampled through the sheet uv.
+         */
+        private fun applySunsetShaders(back: Image?) {
+            val noRim = AdjustColorFilter(
+                brightness = SUNSET_BRIGHTNESS,
+                hue = SUNSET_HUE,
+                contrast = SUNSET_CONTRAST,
+                saturation = SUNSET_SATURATION,
+            )
+            // Pixel art: the filter's render target is sampled 1:1, so nearest
+            // keeps the sprites as crisp as their own `antialiasing = false`.
+            noRim.filtering = false
+            body.filter = noRim
+            head.filter = noRim
+            viz.filter = noRim
+            back?.filter = noRim
+
+            val rim = DropShadowRimFilter(
+                angle = 90.0,
+                // `distance` is in sheet pixels; the filter runs on the 6x
+                // render target, like `PlayScene.stageRimFilter`.
+                distance = PIECE_SCALE * 5.0,
+                threshold = 1.0,
+                lightColor = SUNSET_LIGHT,
+                adjustBrightness = SUNSET_BRIGHTNESS,
+                adjustHue = SUNSET_HUE,
+                adjustContrast = SUNSET_CONTRAST,
+                adjustSaturation = SUNSET_SATURATION,
+            )
+            // `maskThreshold = 0`: the mask *is* the rim region.
+            rim.setAltMask("weeb/erect/masks/aBotPixelSpeaker_mask", 0.0, use = true)
+            // Pixel art upscaled 6x: do not blur the filter's render target.
+            rim.filtering = false
+            speaker.filter = rim
+            speaker.rimMask = rim
+            // The sheet already drew its first frame before the filter existed.
+            speaker.refreshRimMask()
         }
 
         override fun onBeat() {
@@ -411,8 +477,8 @@ class SpeakerSupport private constructor(
                 img.y = cy - originY
 
                 val m = part.matrix
-                img.scaleX = hypot(m.a, m.b)
-                img.scaleY = hypot(m.c, m.d)
+                img.scaleX = hypot(m.a, m.b) * def.textureScaleX
+                img.scaleY = hypot(m.c, m.d) * def.textureScaleY
                 if (m.a * m.d - m.c * m.b < 0.0) img.scaleY = -img.scaleY
                 img.rotation = (
                     (if (def.turned) -90.0 else 0.0) +
@@ -438,6 +504,13 @@ class SpeakerSupport private constructor(
         private var frameIndex = 0
         private var frameTime = 0.0
         private var finished = true
+
+        /**
+         * `DropShadowShader.attachedSprite` + `updateFrameInfo`: the alt mask is
+         * painted over the whole sheet, so the filter needs the atlas rect of
+         * the frame currently drawn (see [render]).
+         */
+        var rimMask: DropShadowRimFilter? = null
 
         init {
             val first = atlas?.firstFrame()
@@ -486,6 +559,13 @@ class SpeakerSupport private constructor(
             render()
         }
 
+        /** Re-binds the rim mask to the frame that is already on screen. */
+        fun refreshRimMask() {
+            val atlas = atlas ?: return
+            val frame = frames.getOrNull(frameIndex) ?: return
+            updateMaskUv(atlas, frame)
+        }
+
         fun update(dt: Double) {
             if (atlas == null || finished || frames.isEmpty()) return
             frameTime += dt
@@ -508,6 +588,27 @@ class SpeakerSupport private constructor(
             image.bitmap = atlas.slice(frame)
             image.x = -frame.frameX * pieceScale + originOffsetX
             image.y = -frame.frameY * pieceScale + originOffsetY
+            updateMaskUv(atlas, frame)
+        }
+
+        /**
+         * Maps the filter's render-target uv (the trimmed frame, scaled by
+         * [pieceScale]) back into the sheet so the mask lands on the same
+         * pixels FNF samples. The image is anchored top-left, so the frame
+         * fills the whole render target.
+         */
+        private fun updateMaskUv(atlas: TextureAtlas, frame: TextureAtlas.AtlasFrame) {
+            val rim = rimMask ?: return
+            if (frame.rotated) return
+            val atlasW = atlas.bitmap.width.toDouble()
+            val atlasH = atlas.bitmap.height.toDouble()
+            if (atlasW <= 0.0 || atlasH <= 0.0) return
+            rim.setMaskUv(
+                scaleX = frame.width * atlas.textureScaleX / atlasW,
+                scaleY = frame.height * atlas.textureScaleY / atlasH,
+                offsetX = frame.x * atlas.textureScaleX / atlasW,
+                offsetY = frame.y * atlas.textureScaleY / atlasH,
+            )
         }
     }
 

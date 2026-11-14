@@ -1,6 +1,7 @@
 package nightfunkin.play
 
 import korlibs.image.color.Colors
+import korlibs.image.color.RGBA
 import korlibs.image.bitmap.sliceWithSize
 import korlibs.korge.render.RenderContext
 import korlibs.korge.scene.Scene
@@ -28,7 +29,9 @@ import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfFmt
 import nightfunkin.core.KnfInput
 import nightfunkin.core.Knf
+import nightfunkin.core.KnfMemory
 import nightfunkin.core.KnfTouch
+import nightfunkin.core.guardedSceneInit
 import nightfunkin.core.NoteStyle
 import nightfunkin.core.Save
 import nightfunkin.data.SongDifficulty
@@ -37,6 +40,7 @@ import nightfunkin.data.SongEventData
 import nightfunkin.data.SongRegistry
 import nightfunkin.platform.KnfEnv
 import nightfunkin.platform.KnfPlatform
+import nightfunkin.platform.KnfProfiler
 import nightfunkin.timing.Conductor
 import nightfunkin.ui.SongSelectScene
 import nightfunkin.ui.StickerOverlay
@@ -217,6 +221,64 @@ class PlayScene : Scene() {
     private var lastSongWallMs = -1.0
     private var clockSampleTimer = 0.0
 
+    /** When [startSong] fired; used to detect an output that never starts. */
+    private var audioStartWatchMs = -1.0
+
+    /** Last audio-restart attempt, and how many were made for this song. */
+    private var lastAudioRecoveryMs = -1.0
+    private var audioRecoveryAttempts = 0
+
+    /**
+     * When the stems were last (re)started.
+     *
+     * `SoundChannel.state.playing` can report `false` for the first frames
+     * after `play()` (the output is opened asynchronously on the audio thread).
+     * Without this grace window that looked like a dead stem on the very first
+     * frame of the song - `recoverDeadAudio()` then rebuilt all three
+     * `AudioTrack`s, which is exactly the half-second freeze players saw on
+     * mobile right as the first note arrived.
+     */
+    private var lastStemsStartWallMs = -1.0
+
+    private fun markStemsStarted() {
+        lastStemsStartWallMs = wallClock
+    }
+
+    /** Frames slower than this are logged to the boot log (bounded count). */
+    private var slowFrameLogs = 0
+
+    /**
+     * `KNF_DEBUG_SLOW=1` writes a `KNF_SLOW` line for every frame that runs
+     * long. Off for normal play: it is a diagnostic, not a player-facing log.
+     */
+    private val debugSlowFrames: Boolean get() = KnfEnv["KNF_DEBUG_SLOW"] == "1"
+
+    /** `KNF_DEBUG_HIT=1` logs the first judged hits with their per-step cost. */
+    private val debugHitFrames: Boolean get() = KnfEnv["KNF_DEBUG_HIT"] == "1"
+
+    /** Wall clock of the previous frame, for the gap measurement in `sceneMain`. */
+    private var lastTickWallMs = -1.0
+
+    /**
+     * Per-phase timings of the last `tick`, in ms.
+     *
+     * A stall inside the game update has to be attributed to a phase, otherwise
+     * the only data is "the frame took 260 ms" - which is exactly what the
+     * first-note freeze looked like.
+     */
+    private var phaseStart = 0.0
+    private var phaseMenuMs = 0.0
+    private var phaseCharsMs = 0.0
+    private var phaseClockMs = 0.0
+    private var phaseNotesMs = 0.0
+    private var phaseHudMs = 0.0
+    private var phaseStrumMs = 0.0
+    private var phaseStageMs = 0.0
+
+    /** True while the stems are still opening their devices. */
+    private fun stemsStarting(): Boolean =
+        lastStemsStartWallMs >= 0.0 && wallClock - lastStemsStartWallMs < STEM_START_GRACE_MS
+
     private fun realNowMs(): Double = realClock.elapsedNow().toDouble(DurationUnit.MILLISECONDS)
 
     private var nextEventIndex = 0
@@ -333,10 +395,20 @@ class PlayScene : Scene() {
 
     // ---------------------------------------------------------------------
 
-    override suspend fun SContainer.sceneInit() {
+    override suspend fun SContainer.sceneInit() = guardedSceneInit("PlayScene") {
+        runSceneInit()
+    }
+
+    private suspend fun SContainer.runSceneInit() {
         // Available here as well as in sceneMain: cutscenes need to mount their
         // black screen while sceneInit is still running.
         sceneRoot = this
+        // KorGE initialises this scene *before* destroying the old one, so the
+        // outgoing scene's art and a retried song's decoded stems would still
+        // be alive while this scene loads its own. Release both first: the
+        // overlap is what used to exhaust the heap on a phone.
+        releasePreviousSongAudio()
+        KnfMemory.beginScene(views, "PlayScene")
         song = SongRegistry.get(PlayRequest.songId)
             ?: error("KNF: unknown song '${PlayRequest.songId}'")
         chart = song.difficulty(PlayRequest.difficulty, PlayRequest.variation)
@@ -402,7 +474,13 @@ class PlayScene : Scene() {
         ).sortedBy { it.third }
         for ((slot, character, zIndex) in byZIndex) {
             character.dance(forceRestart = true)
-            val support = SpeakerSupport.forCharacter(character, music)
+            // `schoolErect.hxc`'s GF case runs `character.addSunsetShaders()`
+            // for Nene (pixel), which lights the whole A-Bot rig.
+            val support = SpeakerSupport.forCharacter(
+                character,
+                music,
+                sunset = stageFile.id == "schoolErect" && character.id == "nene-pixel",
+            )
             val stage = stageProps
             val scroll = stageFile.characterFor(slot)?.scroll.orEmpty()
             val layer = Container().also { it.addChild(character) }
@@ -434,6 +512,7 @@ class PlayScene : Scene() {
             }
         }
         for (support in speakerSupports) support.update(0.0)
+        KnfMemory.log(views, "stage+chars")
 
         // FNF opens the camera on the opponent's focus point, at the stage zoom.
         val (focusX, focusY) = opponent.cameraFocusPoint(opponentSlot.cameraOffsets)
@@ -483,9 +562,6 @@ class PlayScene : Scene() {
         // freeze the GL thread for half a second while the splash sheet
         // decoded on a mobile CPU.
         withContext(Dispatchers.Default) { noteStyle.warmup() }
-        // After `warmup` so the keeper never triggers a lazy atlas decode on
-        // the render thread. Keeps the textures on the GPU for the whole song.
-        addChild(NoteStyleTextureKeeper(noteStyle))
 
         // ---- audio -------------------------------------------------------
         val instPath = song.instrumentalPath(PlayRequest.variation)
@@ -510,6 +586,11 @@ class PlayScene : Scene() {
                 println("KNF: vocals opponent " + path)
             }
         }
+        // If this scene is replaced (retry, quit) the next PlayScene runs its
+        // `sceneInit` while this one is still alive; it disposes these players
+        // before decoding its own stems so two songs' PCM never coexist.
+        previousSongPlayers = listOf(music, vocals, opponentVocals)
+        KnfMemory.log(views, "stems")
 
         sfx.preload(resolveSfx("shared/sounds/gameplay/countdown/funkin/introTHREE"))
         sfx.preload(resolveSfx("shared/sounds/gameplay/countdown/funkin/introTWO"))
@@ -590,55 +671,246 @@ class PlayScene : Scene() {
         if (KnfEnv["KNF_DEBUG_TEXTURES"] == "1") addTextureDebugStrip()
         debugEnabled = KnfEnv["KNF_DEBUG_FRAMES"] == "1"
         debugFrames = 0
+
+        // Upload the skin's textures last, right before the scene is shown.
+        // `AgBitmapTextureManager` deletes any texture that has not been drawn
+        // for 60 frames, and it runs on the *outgoing* scene's frames while the
+        // stems decode. Doing this earlier meant the whole note skin (splash
+        // sheet included, ~38 MB) was dropped during loading and had to be
+        // uploaded again on the first rendered frame of the song - a measured
+        // 1.3 s stall at the point the first note arrives.
+        val prewarmStart = realNowMs()
+        runCatching { noteStyle.prewarmTextures(views.renderContext) }
+        println("KNF: note textures prewarmed in ${(realNowMs() - prewarmStart).roundToInt()}ms")
+        KnfMemory.log(views, "noteStyle")
+        // After `warmup` so the keeper never triggers a lazy atlas decode on
+        // the render thread. Keeps the textures on the GPU for the whole song.
+        addChild(NoteStyleTextureKeeper(noteStyle))
+
+        // Everything the first judged hit can create for the first time is
+        // created here, while loading still covers the screen: the judgement /
+        // combo popup images, the four splash layers and one hidden splash per
+        // direction, the receptor Press/Confirm animations and the characters'
+        // sing poses. The first Sick was the only hit that could pay for a lazy
+        // first-time step on the GL thread (texture binding, view creation,
+        // program use), which is what a single ~0.5 s freeze at that one hit
+        // looks like.
+        runCatching { hud.prewarmPopUps() }
+            .onFailure { println("KNF: popup prewarm failed: $it") }
+        runCatching { playerStrumline.prewarmHitEffects() }
+            .onFailure { println("KNF: splash prewarm failed: $it") }
+        runCatching {
+            player.prewarmHitPoses()
+            opponent.prewarmHitPoses()
+        }.onFailure { println("KNF: pose prewarm failed: $it") }
+
+        // Free the decode garbage (compressed bytes, the decoder's sample
+        // arrays) now, while the previous scene is still alive but the heap is
+        // at its peak. The previous scene itself only becomes garbage later:
+        // `sceneAfterInit` collects that.
+        KnfMemory.endScene(views, "PlayScene")
     }
 
     /**
-     * `tankmanBattlefieldErect.hxc`'s `addCharacter`: every character gets a
-     * yellow rim light (the `DropShadowShader`) with per-character angles and
-     * thresholds, plus alt masks for the character variants that need them.
+     * Per-stage shaders on the characters, as their stage scripts apply them.
+     *
+     * Both stages that use `DropShadowShader` do it in `addCharacter`, so every
+     * character gets the stage's rim light (plus its Adjust Color pass) and, for
+     * most of them, an alternate mask that suppresses the rim over specific
+     * parts of the sheet.
      */
     private fun applyStageCharacterEffects(slot: String, character: Character, layer: Container) {
-        if (stageFile.id != "tankmanBattlefieldErect") return
-        val rim = when (slot) {
-            "bf" -> stageRimFilter(angle = 90.0)
-            "gf" -> stageRimFilter(angle = 90.0).also { f ->
-                // gf-tankmen / nene-tankmen sit on the tankmen speakers, where
-                // the plain drop shadow picks up conflicting colors and needs
-                // the alternate mask (`useAltMask = true` right away).
-                when (character.id) {
-                    "gf-tankmen" -> f.setAltMask("erect/masks/gfTankmen_mask", 0.4, use = true)
-                    "nene-tankmen" -> f.setAltMask("erect/masks/neneTankmen_mask", 0.4, use = true)
-                }
-            }
-            "dad" -> stageRimFilter(angle = 25.0, threshold = 0.3).also { f ->
-                // tankman-bloody's mask starts off; the `EnableMask` song event
-                // turns it on mid-song.
-                if (character.id == "tankman-bloody") {
-                    f.setAltMask("erect/masks/tankmanCaptainBloody_mask", 1.0, use = false)
-                    tankmanRimFilter = f
-                }
-            }
+        val rim = when (stageFile.id) {
+            "tankmanBattlefieldErect" -> tankmanBattlefieldRim(slot, character)
+            "schoolErect" -> schoolErectRim(slot, character)
             else -> null
         }
-        if (rim != null) layer.filter = rim
+        if (rim != null) {
+            layer.filter = rim
+            // The filter draws its render target with this sampling mode. A
+            // pixel character is upscaled 6x *before* the filter, so bilinear
+            // here would blur the whole sprite; nearest keeps both the art and
+            // the rim's texel steps crisp, like FNF's shader on the raw sheet.
+            rim.filtering = !character.isPixel
+            // `DropShadowShader.attachedSprite` + `updateFrameInfo`: the alt
+            // masks are painted over the character's *atlas*, so the filter
+            // needs the atlas rect of every frame the character draws.
+            if (rim.usesAltMask) character.bindRimMask(rim)
+        }
     }
 
-    /** `rim.setAdjustColor(-46, -38, -25, -20)` + the stage's light color. */
+    /** `tankmanBattlefieldErect.hxc`'s `addCharacter` (Week 7 Erect). */
+    private fun tankmanBattlefieldRim(slot: String, character: Character): DropShadowRimFilter? = when (slot) {
+        "bf" -> stageRimFilter(character, angle = 90.0)
+        "gf" -> stageRimFilter(character, angle = 90.0).also { f ->
+            // gf-tankmen / nene-tankmen sit on the tankmen speakers, where
+            // the plain drop shadow picks up conflicting colors and needs
+            // the alternate mask (`useAltMask = true` right away).
+            when (character.id) {
+                "gf-tankmen" -> f.setAltMask("erect/masks/gfTankmen_mask", 0.4, use = true)
+                "nene-tankmen" -> f.setAltMask("erect/masks/neneTankmen_mask", 0.4, use = true)
+            }
+        }
+        "dad" -> stageRimFilter(character, angle = 25.0, threshold = 0.3).also { f ->
+            // tankman-bloody's mask starts off; the `EnableMask` song event
+            // turns it on mid-song.
+            if (character.id == "tankman-bloody") {
+                f.setAltMask("erect/masks/tankmanCaptainBloody_mask", 1.0, use = false)
+                tankmanRimFilter = f
+            }
+        }
+        else -> null
+    }
+
+    /**
+     * `schoolErect.hxc`'s `addCharacter` (Week 6 Erect: Senpai / Roses).
+     *
+     * The stage's mood is a warm brown light from above: a much stronger Adjust
+     * Color (`-66, -10, 24, -23`), a dark brown rim (`0xFF52351D`) at only 5 px,
+     * and masks that switch the rim *off* (`maskThreshold = 1`) over the parts
+     * the script excluded.
+     */
+    private fun schoolErectRim(slot: String, character: Character): DropShadowRimFilter? = when (slot) {
+        "bf" -> stageRimFilter(
+            character,
+            angle = 90.0,
+            distance = 5.0,
+            lightColor = SCHOOL_ERECT_LIGHT,
+            brightness = -66.0,
+            hue = -10.0,
+            contrast = 24.0,
+            saturation = -23.0,
+        ).also { f ->
+            f.setAltMask(
+                if (character.id == "pico-pixel") {
+                    "weeb/erect/masks/picoPixel_mask"
+                } else {
+                    "weeb/erect/masks/bfPixel_mask"
+                },
+                1.0,
+                use = true,
+            )
+        }
+        "gf" -> stageRimFilter(
+            character,
+            angle = 90.0,
+            distance = 3.0,
+            threshold = 0.3,
+            lightColor = SCHOOL_ERECT_LIGHT,
+            brightness = -42.0,
+            hue = -10.0,
+            contrast = 5.0,
+            saturation = -25.0,
+        ).also { f ->
+            f.setAltMask(
+                if (character.id == "nene-pixel") {
+                    "weeb/erect/masks/nenePixel_mask"
+                } else {
+                    "weeb/erect/masks/gfPixel_mask"
+                },
+                1.0,
+                use = true,
+            )
+        }
+        "dad" -> stageRimFilter(
+            character,
+            angle = 90.0,
+            distance = 5.0,
+            lightColor = SCHOOL_ERECT_LIGHT,
+            brightness = -66.0,
+            hue = -10.0,
+            contrast = 24.0,
+            saturation = -23.0,
+        ).also { f -> f.setAltMask("weeb/erect/masks/senpai_mask", 1.0, use = true) }
+        else -> null
+    }
+
+    /** `rim.setAdjustColor(...)` + the stage's `rim.color`; tankman defaults. */
     private fun stageRimFilter(
+        character: Character,
         angle: Double,
+        /**
+         * `DropShadowShader.distance` is in *source texture* pixels. The filter
+         * runs on the already-scaled render target, so a 6x pixel character
+         * needs a 6x larger offset to keep the same on-screen rim.
+         */
+        distance: Double = 15.0,
         threshold: Double = 0.1,
+        lightColor: RGBA = DropShadowRimFilter.DEFAULT_LIGHT_COLOR,
+        brightness: Double = -46.0,
+        hue: Double = -38.0,
+        contrast: Double = -25.0,
+        saturation: Double = -20.0,
     ): DropShadowRimFilter = DropShadowRimFilter(
         angle = angle,
+        distance = distance * abs(character.scaleX).coerceAtLeast(0.0001),
         threshold = threshold,
-        adjustBrightness = -46.0,
-        adjustHue = -38.0,
-        adjustContrast = -25.0,
-        adjustSaturation = -20.0,
+        lightColor = lightColor,
+        adjustBrightness = brightness,
+        adjustHue = hue,
+        adjustContrast = contrast,
+        adjustSaturation = saturation,
     )
+
+    /**
+     * Runs after the outgoing scene has been destroyed - the first moment its
+     * views, atlases and bitmaps are actually garbage.
+     *
+     * KorGE's `SceneContainer._changeTo` starts the incoming `sceneInit`, then
+     * `sceneMain` (undispatched!), then `sceneBeforeLeaving`/`sceneDestroy` of
+     * the old scene, and only then `sceneAfterInit`. So the collection at the
+     * end of `sceneInit` cannot free Freeplay: `KNF_MEM` showed 360/384 MB
+     * after a Freeplay entry against 183/207 MB on a direct boot, with the
+     * difference being the still-live Freeplay scene, not a leak. By this hook
+     * that scene is gone and one collection brings the song back to the direct
+     * boot footprint, before the countdown ends - instead of a blocking GC
+     * landing on the first notes.
+     */
+    override suspend fun sceneAfterInit() {
+        KnfMemory.endScene(views, "PlayScene after transition")
+    }
 
     override suspend fun SContainer.sceneMain() {
         sceneRoot = this
-        addUpdater { dt -> tick(dt.dtSeconds()) }
+        // One-off stalls (a lazily decoded sheet, a device open) are invisible
+        // in averages; sample this thread's stack so they get a name in the
+        // boot log. Off by default, `KNF_WATCHDOG=1` turns it on.
+        if (KnfPlatform.isMobile && KnfEnv["KNF_WATCHDOG"] == "1") {
+            runCatching { KnfProfiler.startWatchdog("GLThread") }
+                .onFailure { println("KNF: watchdog start failed: $it") }
+        }
+        addUpdater { dt ->
+            // A stall can happen inside `tick` or between frames (render pass,
+            // GC pause). Post-frame deltas alias both into one clamped `dt`, so
+            // the wall-clock gap between frames is the honest measurement.
+            val frameStart = realNowMs()
+            val gap = if (lastTickWallMs >= 0.0) frameStart - lastTickWallMs else 0.0
+            lastTickWallMs = frameStart
+            tick(dt.dtSeconds())
+            KnfProfiler.frame()
+            val spent = realNowMs() - frameStart
+            if (
+                debugSlowFrames &&
+                (spent >= SLOW_FRAME_LOG_MS || gap >= SLOW_FRAME_LOG_MS) &&
+                slowFrameLogs < SLOW_FRAME_LOG_LIMIT
+            ) {
+                slowFrameLogs++
+                println(
+                    "KNF_SLOW gap=" + gap.roundToInt() + "ms spent=" + spent.roundToInt() +
+                        "ms song=" + songClockMs.roundToInt() + "ms starting=" + startingSong +
+                        " inst=" + music.playing + "/" + music.exists +
+                        " vocals=" + vocals.playing + "/" + vocals.exists +
+                        " opponent=" + opponentVocals.playing + "/" + opponentVocals.exists +
+                        " | phases menu=" + phaseMenuMs.roundToInt() +
+                        " chars=" + phaseCharsMs.roundToInt() +
+                        " clock=" + phaseClockMs.roundToInt() +
+                        " notes=" + phaseNotesMs.roundToInt() +
+                        " hud=" + phaseHudMs.roundToInt() +
+                        " strum=" + phaseStrumMs.roundToInt() +
+                        " stage=" + phaseStageMs.roundToInt()
+                )
+            }
+        }
 
         // Added in sceneMain so it sits above everything sceneInit creates
         // (cutscene black screens included). It re-asserts itself on top every
@@ -658,9 +930,14 @@ class PlayScene : Scene() {
         cutscene = null
         blackScreen?.removeFromParent()
         blackScreen = null
-        music.stop()
-        vocals.stop()
-        opponentVocals.stop()
+        // `dispose` (not `stop`): a stopped player still holds the fully
+        // decoded PCM (~30 MB per stem). The scene switch happens long before
+        // this object is collected, so freeing the samples here is what keeps
+        // the next scene from decoding on top of them.
+        music.dispose()
+        vocals.dispose()
+        opponentVocals.dispose()
+        if (previousSongPlayers.contains(music)) previousSongPlayers = emptyList()
         gameOverMusic.dispose()
         pauseMusic.dispose()
         sfx.stopAll()
@@ -711,9 +988,10 @@ class PlayScene : Scene() {
         //   cutoutSize = FullScreenScaleMode.gameCutoutSize.x / 2.5
         //   player.x = FlxG.width / 2 + STRUMLINE_X_OFFSET + cutoutSize / 2
         //   opponent.x = STRUMLINE_X_OFFSET + cutoutSize
-        // At 16:9 `gameCutoutSize.x` is zero, so the cutout must not move the
-        // lanes. Using `GAME_WIDTH / 2.5 / 2` pushed both rows 128 px right.
-        val cutout = 0.0
+        // At 16:9 `gameCutoutSize.x` is zero, so the cutout does not move the
+        // lanes. On a wide phone it spreads them towards the screen edges the
+        // same way the original mobile build does.
+        val cutout = Constants.GAME_CUTOUT_WIDTH / 2.5
         val playerX = Constants.GAME_WIDTH / 2.0 + Constants.STRUMLINE_X_OFFSET + cutout / 2.0
         val opponentX = Constants.STRUMLINE_X_OFFSET.toDouble() + cutout
 
@@ -742,11 +1020,13 @@ class PlayScene : Scene() {
      * on-screen buttons; the opponent's lane collapses to `0.4` and its notes
      * are hidden (`Strumline.enterMiniMode`).
      *
-     * `amplification` maps FNF's `(width / height) / (initialWidth /
-     * initialHeight)` onto KNF's fixed 16:9 virtual stage, where it is 1.
+     * `amplification` is FNF's `(width / height) / (initialWidth /
+     * initialHeight)`; on a 16:9 game area it is exactly 1, on a wide phone it
+     * spreads the buttons over the wider screen.
      */
     private fun layoutTouchStrumlines() {
-        val amplification = 1.0
+        val amplification = (Constants.GAME_WIDTH.toDouble() / Constants.GAME_HEIGHT) /
+            (Constants.BASE_WIDTH.toDouble() / Constants.BASE_HEIGHT)
         val laneScale = (Constants.GAME_HEIGHT.toDouble() / Constants.GAME_WIDTH) * 1.95 * amplification
         val spacing = (Constants.GAME_HEIGHT.toDouble() / Constants.GAME_WIDTH) * 2.8 * amplification
 
@@ -1041,6 +1321,14 @@ class PlayScene : Scene() {
 
     private fun tick(dt: Double) {
         wallClock = realNowMs()
+        phaseStart = wallClock
+        phaseMenuMs = 0.0
+        phaseCharsMs = 0.0
+        phaseClockMs = 0.0
+        phaseNotesMs = 0.0
+        phaseHudMs = 0.0
+        phaseStrumMs = 0.0
+        phaseStageMs = 0.0
         gameInput.update()
         // While an overlay owns the screen the touch overlay switches to
         // menu gestures (tap = accept, drags = navigation). `PlayState.endSong`
@@ -1051,12 +1339,17 @@ class PlayScene : Scene() {
         // gameplay, the stage and the conductor until it closes.
         val menu = pauseMenu
         if (menu != null) {
+            // Gameplay is frozen here, so this update is the only thing the
+            // frame does; without timing it a menu hitch shows up as "the
+            // frame took 136 ms" with every gameplay phase at 0.
+            val tMenu = realNowMs()
             if (!exitingViaStickers) menu.update(dt, gameInput)
             if (pauseMenu != null) {
                 pauseMusicFade += dt
                 pauseMusic.volume = PAUSE_MUSIC_VOLUME *
                     (pauseMusicFade / PAUSE_MUSIC_FADE_SECONDS).coerceIn(0.0, 1.0)
             }
+            phaseMenuMs = realNowMs() - tMenu
             return
         }
 
@@ -1080,7 +1373,9 @@ class PlayScene : Scene() {
         // `PlayState.pause`: no pausing during the countdown, after the song
         // ended, or while the results transition runs.
         if (cutscene == null && !startingSong && !songEnded && !ending && gameInput.pause) {
+            val t = realNowMs()
             openPause()
+            phaseMenuMs = realNowMs() - t
             return
         }
 
@@ -1103,16 +1398,22 @@ class PlayScene : Scene() {
         // non-looped animation that reaches its last frame on the same frame as
         // a beat is still marked unfinished when `dance()` runs, so the restart
         // slips to the following beat.
+        val tChars = realNowMs()
         opponent.update(dt)
         girlfriend?.update(dt)
         player.update(dt)
         for (support in speakerSupports) support.update(dt)
+        phaseCharsMs = realNowMs() - tChars
 
         if (!ending) {
             // SONG_END freezes gameplay. Ending videos still tick their own
             // clock, but the just-finished instrumental must not drag the
             // Conductor backwards when its channel is released.
-            if (!songEnded) updateClock(dt)
+            if (!songEnded) {
+                val tClock = realNowMs()
+                updateClock(dt)
+                phaseClockMs = realNowMs() - tClock
+            }
             // FNF's song scripts cancel `onCountdownStart` and call
             // `PlayState.startCountdown()` when their cutscene is done. Until
             // then gameplay notes and the countdown are held back (the
@@ -1137,15 +1438,18 @@ class PlayScene : Scene() {
             } else if (startingSong) {
                 updateCountdown(dt)
             } else if (!songEnded) {
+                val tNotes = realNowMs()
                 processSongEvents()
                 processInput()
                 processNotes()
                 checkSongEnd()
+                phaseNotesMs = realNowMs() - tNotes
             }
         } else {
             updateEnding(dt)
         }
 
+        val tHud = realNowMs()
         updateHudFade(dt)
         camera.update(dt)
         // FNF's camHUD zoom scales every HUD element around the screen centre;
@@ -1164,16 +1468,21 @@ class PlayScene : Scene() {
         }
         hud.popUps.beatLengthMs = conductor.beatLengthMs.toDouble()
         hud.update(dt)
+        phaseHudMs = realNowMs() - tHud
         // `isInCutscene`: no gameplay notes may spawn or scroll while a
         // scripted cutscene owns the screen. Otherwise a ten-second video
         // consumes the first notes of the chart and the player sees them fly
         // past as soon as the song starts.
         if (cutscene == null) {
+            val tStrum = realNowMs()
             playerStrumline.update(conductor, startTimestampMs.toFloat(), dt)
             opponentStrumline.update(conductor, startTimestampMs.toFloat(), dt)
+            phaseStrumMs = realNowMs() - tStrum
         }
 
+        val tStage = realNowMs()
         stageProps?.update(dt, camera.scrollX, camera.scrollY)
+        phaseStageMs = realNowMs() - tStage
 
         if (avsyncDebug && !startingSong) measureAvSync()
         if (KnfEnv["KNF_DEBUG_CHAR"] == "1" && debugFrames == 300) dumpCharacters()
@@ -1355,6 +1664,7 @@ class PlayScene : Scene() {
         vocals.play(resumeAt)
         opponentVocals.play(resumeAt)
         lastSongWallMs = wallClock
+        markStemsStarted()
     }
 
     /** `PauseSubState.restartPlayState`: rebuild the scene from `PlayRequest`. */
@@ -1376,7 +1686,19 @@ class PlayScene : Scene() {
         // `PauseSubState.quitToMenu` opens the sticker substate OVER the live
         // pause menu; the scene switch happens once the screen is covered.
         val overlay = StickerOverlay(chart.characters.player, sfx) {
-            launch { sceneContainer.changeTo<SongSelectScene>() }
+            launch {
+                // FNF purges the old state's cache in `preStateSwitch`, i.e.
+                // right here. The stems are tens of megabytes each and
+                // `sceneDestroy` only runs *after* Freeplay has decoded its own
+                // art, so without this both live through the transition's peak.
+                runCatching {
+                    music.dispose()
+                    vocals.dispose()
+                    opponentVocals.dispose()
+                    gameOverMusic.dispose()
+                }
+                sceneContainer.changeTo<SongSelectScene>()
+            }
         }
         sceneRoot.addChild(overlay)
     }
@@ -1389,8 +1711,8 @@ class PlayScene : Scene() {
      * not clamped to 100 ms (`Views.clampElapsedTimeTo`), which is what made a
      * dt-integrated song clock fall behind on every freeze and never recover.
      */
-    private fun advanceSongClock() {
-        if (!music.playing) {
+    private fun advanceSongClock(force: Boolean = false) {
+        if (!force && !music.playing) {
             lastSongWallMs = wallClock
             return
         }
@@ -1400,6 +1722,78 @@ class PlayScene : Scene() {
             songClockMs += realDt * 1000.0 * music.pitch
         }
         lastSongWallMs = now
+    }
+
+    /** Keeps the chart running when no audio output is alive. */
+    private fun advanceOnWallClock(dt: Double) {
+        if (lastSongWallMs < 0.0) lastSongWallMs = wallClock
+        advanceSongClock(force = true)
+        conductor.accumulateDelta(dt.toFloat(), music.pitch.toFloat())
+        conductor.update(songClockMs.toFloat() + conductor.combinedOffset, false)
+    }
+
+    /**
+     * Restarts the stems after their output died.
+     *
+     * The chart itself never waits for this: every stem is restarted from
+     * [songClockMs], which keeps running on the wall clock, so the music simply
+     * rejoins the song wherever it is. Attempts are throttled and capped so a
+     * permanently broken device does not spawn an `AudioTrack` every frame.
+     */
+    private fun recoverDeadAudio() {
+        if (!music.exists || songEnded) return
+        // The stems open their devices on the audio thread; a channel that has
+        // not reported `playing` yet is not dead.
+        if (stemsStarting()) return
+        val length = music.totalMs
+        if (length > 0.0 && songClockMs >= length - AUDIO_END_GUARD_MS) return
+        if (audioRecoveryAttempts >= AUDIO_RECOVERY_LIMIT) return
+        if (lastAudioRecoveryMs >= 0.0 &&
+            wallClock - lastAudioRecoveryMs < AUDIO_RECOVERY_INTERVAL_MS
+        ) {
+            return
+        }
+        lastAudioRecoveryMs = wallClock
+        audioRecoveryAttempts++
+        println(
+            "KNF: music output stopped at ${songClockMs.roundToInt()}ms, " +
+                "restarting stems (attempt $audioRecoveryAttempts)"
+        )
+        val resumeAt = songClockMs
+        music.play(resumeAt)
+        vocals.play(resumeAt)
+        opponentVocals.play(resumeAt)
+        markStemsStarted()
+    }
+
+    /**
+     * Restarts a vocal stem whose output died while the instrumental plays on.
+     *
+     * Called on every beat (`onBeat`), so a stem that cannot start is only
+     * retried at beat rate - and only while it is not simply finished.
+     */
+    private fun rescueDeadVocals() {
+        if (songEnded) return
+        if (stemsStarting()) return
+        val playerDead = vocals.exists && !vocals.playing && !stemFinished(vocals)
+        val opponentDead = opponentVocals.exists && !opponentVocals.playing && !stemFinished(opponentVocals)
+        if (!playerDead && !opponentDead) return
+        if (lastAudioRecoveryMs >= 0.0 &&
+            wallClock - lastAudioRecoveryMs < AUDIO_RECOVERY_INTERVAL_MS
+        ) {
+            return
+        }
+        lastAudioRecoveryMs = wallClock
+        println("KNF: vocal stem stopped at ${songClockMs.roundToInt()}ms, restarting")
+        if (playerDead) vocals.play(songClockMs)
+        if (opponentDead) opponentVocals.play(songClockMs)
+        markStemsStarted()
+    }
+
+    /** A stem that ran out of samples is finished, not broken. */
+    private fun stemFinished(player: MusicPlayer): Boolean {
+        val length = player.totalMs
+        return length > 0.0 && songClockMs >= length - AUDIO_END_GUARD_MS
     }
 
     /**
@@ -1425,14 +1819,40 @@ class PlayScene : Scene() {
             return
         }
 
-        if (!music.playing) return
+        if (!music.playing) {
+            // The stems' output can stop without the song being over: an
+            // `AudioTrack` invalidated by the audio server (route change,
+            // reclaim, MIUI killing the focus) makes every write fail and the
+            // pump exits, and a stem that never got a block at all leaves
+            // `positionMs` parked at the countdown offset. FNF reads its clock
+            // from the sound backend, so its arrows would simply freeze while
+            // the characters keep idling - the exact symptom this fallback
+            // removes. The wall clock keeps the chart moving and the stems
+            // rejoin from it.
+            if (music.exists) recoverDeadAudio()
+            advanceOnWallClock(dt)
+            return
+        }
 
         if (lastSongWallMs < 0.0) {
             // The audio thread has not queued its first block yet. `play()`
             // returns immediately; `waveOutOpen` / `AudioTrack` start a few
             // milliseconds later. Anchoring before that would make every note
             // arrive by the device-open latency.
-            if (music.positionMs <= startTimestampMs) return
+            if (music.positionMs <= startTimestampMs) {
+                // ... but if it never does, do not sit at the countdown
+                // forever: run on the wall clock and try the output again.
+                if (audioStartWatchMs < 0.0) {
+                    audioStartWatchMs = wallClock
+                } else if (wallClock - audioStartWatchMs > AUDIO_START_TIMEOUT_MS) {
+                    println("KNF: audio output never queued a block, using the wall clock")
+                    audioStartWatchMs = -1.0
+                    lastSongWallMs = wallClock
+                    recoverDeadAudio()
+                }
+                return
+            }
+            audioStartWatchMs = -1.0
             lastSongWallMs = wallClock
             return
         }
@@ -1478,9 +1898,13 @@ class PlayScene : Scene() {
         // `updateClock`): `play` starts the output asynchronously, and starting
         // the wall clock now would count the device-open latency as song time.
         lastSongWallMs = -1.0
+        audioStartWatchMs = -1.0
+        lastAudioRecoveryMs = -1.0
+        audioRecoveryAttempts = 0
         music.play(startTimestampMs)
         vocals.play(startTimestampMs - conductor.instrumentalOffset)
         opponentVocals.play(startTimestampMs - conductor.instrumentalOffset)
+        markStemsStarted()
         hud.showCountdown("go", conductor.beatLengthMs.toDouble())
         // No `resyncVocals()` here. `SoundChannel.current` is the decoder's
         // read cursor, while the samples already queued in the output keep
@@ -1512,10 +1936,11 @@ class PlayScene : Scene() {
         music.play(resumeAt)
         vocals.play(resumeAt)
         opponentVocals.play(resumeAt)
+        markStemsStarted()
     }
 
     private fun checkSongEnd() {
-        val length = music.totalMs
+        val length = music.totalMs.takeIf { it > 0.0 } ?: fallbackSongLengthMs()
         // `positionMs` is the *generated* position: it counts the samples
         // handed to the platform output. The audible position lags by
         // `outputLeadMs` and freezes at `total - outputLeadMs` once the
@@ -1524,8 +1949,10 @@ class PlayScene : Scene() {
         //
         // Ending on the generated position does not cut the tail: the last
         // `outputLeadMs` of samples are already queued in the device and keep
-        // playing after `endSong` mutes the mixer.
-        val generated = music.positionMs
+        // playing after `endSong` mutes the mixer. `songClockMs` is the
+        // fallback when the output is dead or the instrumental never loaded,
+        // so a silent song still reaches its results instead of hanging.
+        val generated = maxOf(music.positionMs, songClockMs)
         val reachedEnd = (length > 0 && generated >= length - 120) ||
             (forcedSongEndMs != null && generated >= forcedSongEndMs)
         if (reachedEnd) {
@@ -1637,6 +2064,10 @@ class PlayScene : Scene() {
             isNewHighscore = isNewHighscore,
         )
     }
+
+    /** Song length when the instrumental is missing: last note plus a short tail. */
+    private fun fallbackSongLengthMs(): Double =
+        (chart.notes.maxOfOrNull { it.time }?.toDouble()?.plus(1_500.0)) ?: 0.0
 
     private fun updateEnding(dt: Double) {
         endingTimer += dt
@@ -1762,6 +2193,7 @@ class PlayScene : Scene() {
         // The instrumental itself is driven by `updateClock`, so it is the only
         // stem never compared against anything.
         if (!startingSong && music.playing) {
+            rescueDeadVocals()
             val length = music.totalMs
             if (length > 0.0) {
                 val correctSync = min(length, max(0.0, music.positionMs))
@@ -1784,6 +2216,7 @@ class PlayScene : Scene() {
     }
 
     private fun goodNoteHit(note: NoteSprite) {
+        val hitStart = realNowMs()
         val timingError = conductor.songPosition - note.strumTime
         val absError = abs(timingError)
 
@@ -1824,18 +2257,23 @@ class PlayScene : Scene() {
         }
         combo = tallies.combo
 
+        val scoreStart = realNowMs()
         hud.setScore(score)
+        val scoreDone = realNowMs()
         hud.showJudgement(judgement)
         hud.showCombo(combo)
         hud.addHealth(Scoring.healthDelta(judgement))
+        val hudDone = realNowMs()
 
         // FNF's BF behaviour: strike the matching `singDIR` pose on every hit.
         if (note.isPlayerNote) player.sing(note.directionIndex, conductor.stepLengthMs.toDouble())
+        val singDone = realNowMs()
 
         // FNF's `HitNoteScriptEvent.doesNotesplash` defaults to `daRating == 'sick'`,
         // and PlayState only calls `playerStrumline.playNoteSplash` when that
         // event flag is set. The opponent never gets a splash.
         if (judgement == Judgement.SICK) playerStrumline.playNoteSplash(note.directionIndex)
+        val splashDone = realNowMs()
 
         if (note.isHoldNote) {
             note.startClip()
@@ -1843,7 +2281,24 @@ class PlayScene : Scene() {
             // `if (note.isHoldNote && note.holdNoteSprite != null) playerStrumline.playNoteHoldCover(note.holdNoteSprite);`
             playerStrumline.playNoteHoldCover(note.directionIndex)
         }
+        // The first hits are the only ones that can pay for a lazy first-time
+        // cost, so time them once (bounded) - see `KNF_SLOW` for the frame view.
+        // `KNF_DEBUG_HIT=1` logs every one of them, however cheap.
+        if (debugHitFrames && hitTimingLogs < 3) {
+            hitTimingLogs++
+            val total = realNowMs() - hitStart
+            println(
+                "KNF_HIT total=" + total.roundToInt() + "ms score=" +
+                    (scoreDone - scoreStart).roundToInt() + " hud=" +
+                    (hudDone - scoreDone).roundToInt() + " sing=" +
+                    (singDone - hudDone).roundToInt() + " splash=" +
+                    (splashDone - singDone).roundToInt() + " hold=" +
+                    (realNowMs() - splashDone).roundToInt() + "ms"
+            )
+        }
     }
+
+    private var hitTimingLogs = 0
 
     private fun ghostTap(lane: Int) {
         // FNF's ghost miss only takes health and score. It intentionally does
@@ -2047,8 +2502,9 @@ class PlayScene : Scene() {
         player.isDead = true
 
         // `tankmanBattlefieldErect.hxc`'s `onGameOver`: the dead character
-        // loses its rim light on this screen.
-        playerLayer?.container?.filter = null
+        // loses its rim light on this screen. `schoolErect.hxc` has no such
+        // hook, so BF keeps its shader there.
+        if (stageFile.id == "tankmanBattlefieldErect") playerLayer?.container?.filter = null
 
         // `setCameraTarget`: FNF starts from `resetCameraFocusPoint`'s center
         // (original position + half the idle frame), subtracts the character's
@@ -2546,9 +3002,57 @@ class PlayScene : Scene() {
 
     private val variation: String get() = PlayRequest.variation
 
+    /**
+     * Stems of the gameplay scene that is still alive during a scene switch.
+     *
+     * `SceneContainer` runs the incoming scene's `sceneInit` before the
+     * outgoing scene's `sceneDestroy`, so on a retry the old song's decoded PCM
+     * would still be allocated while the new song decodes its own (three stems
+     * are tens of megabytes each). The next PlayScene disposes these first.
+     */
+    private fun releasePreviousSongAudio() {
+        if (previousSongPlayers.isEmpty()) return
+        for (player in previousSongPlayers) runCatching { player.dispose() }
+        previousSongPlayers = emptyList()
+    }
+
     private companion object {
+        /** Players registered by the previous gameplay scene, see [releasePreviousSongAudio]. */
+        var previousSongPlayers: List<MusicPlayer> = emptyList()
+
+        /** `schoolErect.hxc`: `rim.color = 0xFF52351D`, the warm brown key light. */
+        val SCHOOL_ERECT_LIGHT = RGBA(0x52, 0x35, 0x1D)
+
+        /**
+         * How long after `go` a stem may take to queue its first block before
+         * the chart switches to the wall clock. Device-open is ~10-100 ms; a
+         * second of silence means the output is dead.
+         */
+        const val AUDIO_START_TIMEOUT_MS = 1_000.0
+
+        /** Throttle for restarting dead stems, so a broken device is not spammed. */
+        const val AUDIO_RECOVERY_INTERVAL_MS = 1_500.0
+
+        /**
+         * How long a just-started stem may report `playing = false` before it
+         * counts as dead. The output opens on the audio thread, so the channel
+         * state lags `play()` by a few frames - long enough for the old code to
+         * rebuild every `AudioTrack` on the first frame of the song.
+         */
+        const val STEM_START_GRACE_MS = 1_000.0
+
+        /** Give up restarting after this many attempts; the chart still runs. */
+        const val AUDIO_RECOVERY_LIMIT = 6
+
+        /** Near the end a stopped channel is the song finishing, not a failure. */
+        const val AUDIO_END_GUARD_MS = 500.0
+
         /** FNF's `camTransition.fade(..., 0.6, ...)` and HUD fade. */
         const val ENDING_FADE_SECONDS = 0.6
+
+        /** A `tick` this long freezes the frame; log it (see `sceneMain`). */
+        const val SLOW_FRAME_LOG_MS = 120.0
+        const val SLOW_FRAME_LOG_LIMIT = 24
 
         /** `PauseSubState.MUSIC_FINAL_VOLUME` / `MUSIC_FADE_IN_TIME`. */
         const val PAUSE_MUSIC_VOLUME = 0.75
