@@ -2231,8 +2231,14 @@ class PlayScene : Scene() {
         note.hasBeenHit = true
         note.judgement = judgement
         note.timingErrorMs = timingError
-        // FNF's `hitNote` -> `killNote`: the arrow disappears on impact.
-        note.hideHead()
+        // FNF's `hitNote(note, removeNote = !event.isComboBreak)`: a BAD/SHIT
+        // hit breaks the combo, so the arrow is kept on screen at half alpha
+        // and 20% saturation instead of being killed on impact.
+        if (judgement == Judgement.BAD || judgement == Judgement.SHIT) {
+            note.dimAfterHit()
+        } else {
+            note.hideHead()
+        }
 
         score += Scoring.scoreNote(absError)
         hits++

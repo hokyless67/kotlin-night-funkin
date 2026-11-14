@@ -76,6 +76,7 @@ class NoteStyle(val id: String) {
     private val bitmaps = HashMap<String, Bitmap>()
     private val sustainCache = HashMap<Int, Pair<AtlasSlice, AtlasSlice>>()
     private val colorFallbackCache = HashMap<Int, AtlasSlice>()
+    private val desaturatedNoteCache = HashMap<Int, AtlasSlice>()
     private val judgementCache = HashMap<String, JudgementAsset>()
     private val splashVariantCache = HashMap<Int, List<List<TrimmedFrame>>>()
 
@@ -156,6 +157,9 @@ class NoteStyle(val id: String) {
             }
         }
         for (bitmap in keptBitmaps) ctx.getTex(bitmap)
+        // The combo-break copies are not part of `style.bitmaps`; touching the
+        // ones already built keeps them off the upload path in the same way.
+        for (direction in 0..3) desaturatedNoteCache[direction]?.let { ctx.getTex(it.base) }
     }
 
     /**
@@ -182,6 +186,9 @@ class NoteStyle(val id: String) {
             for (variant in style.splashVariants(direction)) {
                 for (frame in variant) keep(frame.slice.bmp)
             }
+            // BAD/SHIT hits draw this desaturated copy of the arrow; baking and
+            // uploading it here keeps the first combo break from paying for it.
+            keep(desaturatedNoteSlice(direction).base)
         }
         for (name in JUDGEMENT_KEYS) style.judgement(name)?.let { keep(it.slice.bmp) }
         for (digit in 0..9) style.comboNumber(digit)?.let { keep(it.slice.bmp) }
@@ -262,6 +269,45 @@ class NoteStyle(val id: String) {
             atlas.sliceByPrefix(key)?.let { return it }
         }
         return colorFallbackSlice(direction)
+    }
+
+    /**
+     * `NoteSprite.desaturate()`: a combo-breaking hit (BAD/SHIT) keeps the
+     * arrow tumbling instead of hiding it, with `hsvShader.saturation = 0.2`.
+     *
+     * Scaling HSV saturation only scales the distance between a pixel and its
+     * HSV value, so it is a plain blend: `v + (rgb - v) * 0.2`, `v = max(r,g,b)`.
+     * Baking it into a copy of the slice keeps the HUD free of per-note shader
+     * render targets (there can be a dozen dimmed arrows on screen at once).
+     */
+    fun desaturatedNoteSlice(direction: Int): AtlasSlice {
+        val dir = direction.coerceIn(0, 3)
+        desaturatedNoteCache[dir]?.let { return it }
+        val slice = noteSlice(dir)
+        val rect = slice.rect
+        val width = rect.width
+        val height = rect.height
+        val src = slice.base.toBMP32IfRequired()
+        val out = Bitmap32(width, height, premultiplied = src.premultiplied)
+        for (y in 0 until height) {
+            val row = (rect.y + y) * src.width + rect.x
+            for (x in 0 until width) {
+                val color = src.getRgbaAtIndex(row + x)
+                val value = maxOf(color.r, color.g, color.b)
+                fun channel(c: Int) = (value + (c - value) * 0.2).toInt().coerceIn(0, 255)
+                out.setRgbaAtIndex(
+                    y * width + x,
+                    RGBA(channel(color.r), channel(color.g), channel(color.b), color.a),
+                )
+            }
+        }
+        // Keep the frame padding/orientation so the dimmed copy lands exactly
+        // where the original arrow did.
+        val bitmap: Bitmap = out
+        val dimmed = bitmap.sliceWithSize(0, 0, width, height)
+            .copy(orientation = slice.orientation, padding = slice.padding)
+        desaturatedNoteCache[dir] = dimmed
+        return dimmed
     }
 
     /** `kind` is one of `Static`, `Press`, `Confirm`, `ConfirmHold`. */

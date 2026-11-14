@@ -304,11 +304,15 @@ class NoteSprite(
 
     private var head: Image? = null
 
+    /** The slice currently drawn on [head], so it can be restored from the pool. */
+    private var headSlice: AtlasSlice? = null
+
     init {
         host.addChild(this)
         // FNF: `this.notes.zIndex = 30;` - the note head draws over the tail.
         zIndex = 30.0
         slice?.let { s ->
+            headSlice = s
             head = image(s).also {
                 // Flixel draws a sprite's graphic from its *top left* corner
                 // (`centerOffsets` + `centerOrigin` cancel out), so the note head
@@ -334,6 +338,7 @@ class NoteSprite(
         val img = head
         if (img != null && slice != null) {
             img.bitmap = slice
+            headSlice = slice
             img.scaleX = noteStyle.scale.toDouble() * scaleMultiplier
             img.scaleY = noteStyle.scale.toDouble() * scaleMultiplier
         }
@@ -407,9 +412,25 @@ class NoteSprite(
         head?.visible = false
     }
 
+    /**
+     * `Strumline.hitNote(note, removeNote = false)`: a BAD/SHIT hit keeps the
+     * arrow falling, half-transparent and desaturated
+     * (`note.alpha = 0.5; note.desaturate();`). The tail, if any, still lives on
+     * like any other struck hold.
+     */
+    fun dimAfterHit() {
+        val img = head ?: return
+        img.alpha = 0.5
+        img.bitmap = noteStyle.desaturatedNoteSlice(directionIndex)
+    }
+
     /** Re-shows the head when the pooled sprite is handed back out. */
     fun showHead() {
-        head?.visible = true
+        head?.let {
+            it.visible = true
+            it.alpha = 1.0
+            headSlice?.let { slice -> it.bitmap = slice }
+        }
     }
 
     fun releaseClip(conductor: Conductor? = null) {
