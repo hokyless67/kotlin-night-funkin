@@ -149,6 +149,20 @@ class SongSelectScene : Scene() {
     private var glowDarkTweenElapsed = 0.0
     private var glowDarkTweenActive = false
 
+    // `BackingCard.confirm()`: the confirm flash stack (two glows behind the
+    // card's text plus the YEAH!!!/GET IT!!! lettering) and the tween clock
+    // that drives its colour/alphas. Negative means "not confirming".
+    private var confirmGlow: Image? = null
+    private var confirmGlow2: Image? = null
+    private var confirmTextGlow: Image? = null
+    private var confirmCardClock = -1.0
+
+    /**
+     * `BoyfriendCard.prevLevelId`: the level of the last capsule selection,
+     * so the LE SSERAFIM "SPECIAL" marquee swap runs exactly on the crossing.
+     */
+    private var cardPrevLevelId: String? = null
+
     // `NewCharacterCard` is only used for saves that still have an unseen
     // playable character (KNF's stock save marks both as seen).
     private var newCharacterCard = false
@@ -528,6 +542,10 @@ class SongSelectScene : Scene() {
             it.visible = false
         }
 
+        // `BackingCard.onCreate` adds the confirm glows after the plate and the
+        // strips but before `backingTextYeah`, so the collage draws over them.
+        buildConfirmGlows(cardLayer, BlendMode.NORMAL)
+
         // Everything decorative on the plate: the six marquees, the YEAH!!
         // collage and the beat glows. The marquees are endless wrap-around
         // copies, so sliding the card off-screen would never remove them; the
@@ -559,17 +577,17 @@ class SongSelectScene : Scene() {
         // `FlxG.width / 2`.
         val fullBand = Constants.GAME_WIDTH.toDouble()
         val halfBand = fullBand / 2.0
-        buildBackingBand(textLayer, 0.0, 160.0, "HOT BLOODED IN MORE WAYS THAN ONE",
+        buildBackingBand(textLayer, 0.0, 160.0, BF_DJ_TEXT_2,
             fullBand, RGBA(0xFF, 0xF3, 0x83), 43.0, 6.8, bold = true, out = bands, visible = false)
-        buildBackingBand(textLayer, 0.0, 220.0, "BOYFRIEND",
+        buildBackingBand(textLayer, 0.0, 220.0, BF_DJ_TEXT_1,
             halfBand, RGBA(0xFF, 0x99, 0x63), 60.0, -3.8, bold = false, out = bands, visible = false)
-        buildBackingBand(textLayer, 0.0, 285.0, "PROTECT YO NUTS",
+        buildBackingBand(textLayer, 0.0, 285.0, BF_DJ_TEXT_3,
             halfBand, Colors.WHITE, 43.0, 3.5, bold = true, out = bands, visible = false)
-        buildBackingBand(textLayer, 0.0, 335.0, "BOYFRIEND",
+        buildBackingBand(textLayer, 0.0, 335.0, BF_DJ_TEXT_1,
             halfBand, RGBA(0xFF, 0x99, 0x63), 60.0, -3.8, bold = false, out = bands, visible = false)
-        buildBackingBand(textLayer, 0.0, 397.0, "HOT BLOODED IN MORE WAYS THAN ONE",
+        buildBackingBand(textLayer, 0.0, 397.0, BF_DJ_TEXT_2,
             fullBand, RGBA(0xFF, 0xF3, 0x83), 43.0, 6.8, bold = true, out = bands, visible = false)
-        buildBackingBand(textLayer, 0.0, 450.0, "BOYFRIEND",
+        buildBackingBand(textLayer, 0.0, 450.0, BF_DJ_TEXT_1,
             halfBand, RGBA(0xFE, 0xA4, 0x00), 60.0, -3.8, bold = false, out = bands, visible = false)
         boyfriendBands = bands
 
@@ -594,6 +612,175 @@ class SongSelectScene : Scene() {
     }
 
     /**
+     * `BackingCard`'s confirm flash stack: `confirmGlow2` under `confirmGlow`
+     * under `confirmTextGlow` (the "GET IT!!!" / "YEAH!!!" lettering). All
+     * three start hidden and only appear from [cardConfirm] on.
+     */
+    private fun buildConfirmGlows(parent: Container, blend: BlendMode) {
+        fun make(path: String, x: Double, y: Double): Image? {
+            val bitmap = KnfFiles.bitmapOrNull("preload/images/freeplay/$path.png")
+                ?: return null
+            return Image(bitmap).also {
+                it.x = x
+                it.y = y
+                it.visible = false
+                it.blendMode = blend
+                parent.addChild(it)
+            }
+        }
+
+        // `(CUTOUT_WIDTH * DJ_POS_MULTI) + -30, 240`.
+        confirmGlow2 = make("confirmGlow2", DJ_SHIFT - 30.0, 240.0)
+        confirmGlow = make("confirmGlow", DJ_SHIFT - 30.0, 240.0)
+        // `(CUTOUT_WIDTH * DJ_POS_MULTI) + -8, 115`.
+        confirmTextGlow = make("glowingText", DJ_SHIFT - 8.0, 115.0)
+    }
+
+    /**
+     * `BackingCard.confirm()` plus `BoyfriendCard.confirm()`: the plate drops
+     * to its dark confirm colour, the backdrop greys out, the six marquees and
+     * the beat glows vanish, and the YEAH!!!/YES YES YES collage flashes in
+     * behind the confirm glows.
+     *
+     * FNF runs this in the same frame as the capsule's confirm pose, then
+     * holds the state for `styleData.getStartDelay()` before the load, so all
+     * of it plays inside that one-second window.
+     */
+    private fun cardConfirm() {
+        orangeStrip?.visible = false
+        orangeStripLeft?.visible = false
+
+        // `BoyfriendCard.confirm()` hides every marquee and both beat glows.
+        boyfriendBands.forEach { it.container.visible = false }
+        glowTweenActive = false
+        glowDarkTweenActive = false
+        beatGlow?.alpha = 0.0
+        beatGlowDark?.alpha = 0.0
+        beatGlow?.visible = false
+        beatGlowDark?.visible = false
+
+        // `FlxTween.color(pinkBack, 0.33, 0xFFFFD0D5, 0xFF171831, quadOut)`:
+        // the from-colour is applied immediately, as in Flixel.
+        setPinkTint(RGBA(0xFF, 0xD0, 0xD5))
+
+        confirmGlow?.visible = true
+        confirmGlow2?.visible = true
+        confirmGlow?.alpha = 0.0
+        confirmGlow2?.alpha = 0.0
+        confirmTextGlow?.visible = false
+        confirmTextGlow?.alpha = 0.0
+
+        // `backingTextYeah.anim.play("")`: the whole collage timeline once.
+        backingTextYeah?.play("", loop = false)
+
+        // `FlxTween.color(backingImage, 0.5, 0xFFA8A8A8, 0xFF646464)`. The
+        // new-character card rewrites this tint every frame in its own update
+        // (`angleMaskShader.extraColor`), exactly like FNF.
+        if (!newCharacterCard) backingImage?.tint = RGBA(0xA8, 0xA8, 0xA8)
+
+        confirmCardClock = 0.0
+    }
+
+    /**
+     * `BackingCard.confirm()`'s tween timeline:
+     *
+     *   0.00 s  plate `#FFD0D5 -> #171831` (0.33 s quadOut),
+     *           backdrop tint `#A8A8A8 -> #646464` (0.5 s linear),
+     *           `confirmGlow2` alpha `0 -> 0.5` (0.33 s quadOut);
+     *   0.33 s  `confirmGlow2` snaps to 0.6, `confirmGlow` flashes at 1 and
+     *           fades to 0 (0.5 s), the lettering appears at 1 and eases to
+     *           0.4 (0.5 s), and the backdrop tint snaps to `#CDCDCD` and
+     *           settles on `#555555` (2 s expoOut).
+     */
+    private fun updateCardConfirm(dt: Double) {
+        val clock = confirmCardClock
+        if (clock < 0.0) return
+        confirmCardClock = clock + dt
+        val t = confirmCardClock
+
+        // FlxEase.quadOut.
+        val plateT = (t / 0.33).coerceIn(0.0, 1.0)
+        val q = 1.0 - (1.0 - plateT) * (1.0 - plateT)
+        if (plateT < 1.0) {
+            setPinkTint(mixColor(0xFFFFD0D5.toInt(), 0xFF171831.toInt(), q))
+        } else {
+            setPinkTint(RGBA(0x17, 0x18, 0x31))
+        }
+
+        if (!newCharacterCard) {
+            backingImage?.tint = if (t < 0.33) {
+                mixColor(0xFFA8A8A8.toInt(), 0xFF646464.toInt(), (t / 0.5).coerceIn(0.0, 1.0))
+            } else {
+                // The second colour tween starts from its own colour, so the
+                // tint snaps where the two tweens overlap.
+                mixColor(0xFFCDCDCD.toInt(), 0xFF555555.toInt(), expoOut((t - 0.33) / 2.0))
+            }
+        }
+
+        if (t < 0.33) {
+            confirmGlow2?.alpha = 0.5 * q
+            confirmGlow?.alpha = 0.0
+        } else {
+            val since = t - 0.33
+            confirmGlow2?.alpha = 0.6
+            val fade = (since / 0.5).coerceIn(0.0, 1.0)
+            confirmGlow?.alpha = 1.0 - fade
+            if (confirmTextGlow?.visible != true) {
+                confirmTextGlow?.visible = true
+                confirmTextGlow?.alpha = 1.0
+            }
+            confirmTextGlow?.alpha = 1.0 - 0.6 * fade
+        }
+
+        // The last tween ends 2.33 s after the confirm; the scene is long gone
+        // by then, but stop the clock anyway.
+        if (t >= 0.33 + 2.0) confirmCardClock = -1.0
+    }
+
+    /** `FlxEase.expoOut`. */
+    private fun expoOut(t: Double): Double =
+        if (t >= 1.0) 1.0 else 1.0 - 2.0.pow(-10.0 * t)
+
+    /**
+     * `BoyfriendCard.onCapsuleSelected`: entering the LE SSERAFIM level turns
+     * every marquee into "SPECIAL" (long rows "SPECIAL SPECIAL"); leaving it
+     * puts BF's freeplay lines back. `prevLevelId` only changes when the level
+     * actually changes, so scrolling between two capsules of one week leaves
+     * the rows alone.
+     */
+    private fun updateCardMarqueesForLevel(entry: FreeplayEntry?) {
+        if (newCharacterCard || boyfriendBands.isEmpty()) return
+        val levelId = entry?.level?.id
+        if (levelId == cardPrevLevelId) return
+        val wasSserafim = cardPrevLevelId == "sserafim"
+        cardPrevLevelId = levelId
+
+        when {
+            levelId == "sserafim" -> setBoyfriendBandTexts(
+                moreWays = "SPECIAL",
+                funnyScroll = "SPECIAL SPECIAL",
+                nuts = "SPECIAL",
+            )
+
+            wasSserafim -> setBoyfriendBandTexts(
+                moreWays = BF_DJ_TEXT_2,
+                funnyScroll = BF_DJ_TEXT_1,
+                nuts = BF_DJ_TEXT_3,
+            )
+        }
+    }
+
+    /** The six `BGScrollingText` rows of `BoyfriendCard`, in creation order. */
+    private fun setBoyfriendBandTexts(moreWays: String, funnyScroll: String, nuts: String) {
+        boyfriendBands.getOrNull(0)?.updateText(moreWays)
+        boyfriendBands.getOrNull(1)?.updateText(funnyScroll)
+        boyfriendBands.getOrNull(2)?.updateText(nuts)
+        boyfriendBands.getOrNull(3)?.updateText(funnyScroll)
+        boyfriendBands.getOrNull(4)?.updateText(moreWays)
+        boyfriendBands.getOrNull(5)?.updateText(funnyScroll)
+    }
+
+    /**
      * `NewCharacterCard` from 0.8.6. Shown only when the save still has an
      * unseen playable character (`KNF_NEWCARD=1` can force it for testing).
      */
@@ -603,6 +790,10 @@ class SongSelectScene : Scene() {
             cardLayer.addChild(it)
         }
         newCardGroup = group
+
+        // `NewCharacterCard.onCreate` adds the confirm glows (with additive
+        // blending) before the dark backdrop and the marquees.
+        buildConfirmGlows(group, BlendMode.ADD)
 
         fun addImage(
             path: String,
@@ -683,42 +874,56 @@ class SongSelectScene : Scene() {
             ?: fiveBySeven?.let { Resourceable.Fixed(it) }
             ?: return
 
-        fun makeCopy(): Container {
-            val copy = Container().also { holder.addChild(it) }
-            copy.text(
-                text,
-                textSize = textSize,
-                color = color,
-                font = font,
-            ).also { it.y = 0.0 }
-            if (bold) {
-                // `FlxText.bold` is a faux second pass; Korge's bitmap-font
-                // renderer ignores `stroke`, so draw the glyphs twice.
+        val placementOffset = 20.0
+
+        // `BGScrollingText.updateText` re-renders its graphic and re-spaces
+        // every copy; KNF rebuilds the row from the same font/colour
+        // arguments (see `BoyfriendCard.onCapsuleSelected`).
+        fun buildCopies(value: String): Pair<List<Container>, Double> {
+            holder.removeChildren()
+
+            fun makeCopy(): Container {
+                val copy = Container().also { holder.addChild(it) }
                 copy.text(
-                    text,
+                    value,
                     textSize = textSize,
                     color = color,
                     font = font,
-                ).also {
-                    it.x = 1.0
-                    it.y = 0.0
+                ).also { it.y = 0.0 }
+                if (bold) {
+                    // `FlxText.bold` is a faux second pass; Korge's bitmap-font
+                    // renderer ignores `stroke`, so draw the glyphs twice.
+                    copy.text(
+                        value,
+                        textSize = textSize,
+                        color = color,
+                        font = font,
+                    ).also {
+                        it.x = 1.0
+                        it.y = 0.0
+                    }
                 }
+                return copy
             }
-            return copy
+
+            val first = makeCopy()
+            first.x = 0.0
+            val firstText = first.getChildAtOrNull(0) as? Text
+            val textWidth = firstText?.width?.takeIf { it > 0.0 }?.toDouble()
+                ?: (textSize * value.length * 0.55)
+            val needed = max(1, ceil(widthLimit / textWidth).toInt() + 1)
+            val copies = ArrayList<Container>(needed)
+            copies += first
+            for (i in 1 until needed) {
+                copies += makeCopy().also { it.x = i * (textWidth + placementOffset) }
+            }
+            return copies to textWidth
         }
 
-        val first = makeCopy()
-        first.x = 0.0
-        val firstText = first.getChildAtOrNull(0) as? Text
-        val textWidth = firstText?.width?.takeIf { it > 0.0 }?.toDouble()
-            ?: (textSize * text.length * 0.55)
-        val needed = max(1, ceil(widthLimit / textWidth).toInt() + 1)
-        val copies = ArrayList<Container>(needed)
-        copies += first
-        for (i in 1 until needed) {
-            copies += makeCopy().also { it.x = i * (textWidth + 20.0) }
+        val (copies, textWidth) = buildCopies(text)
+        out += BackingScrollBand(holder, copies, textWidth, placementOffset, speed, text) {
+            buildCopies(it)
         }
-        out += BackingScrollBand(holder, copies, textWidth, 20.0, speed)
     }
 
     private fun buildDj(parent: Container) {
@@ -1424,6 +1629,9 @@ class SongSelectScene : Scene() {
     // ======================================================================
 
     private fun updateAlbum() {
+        // `changeSelection` dispatches CAPSULE_SELECTED right after the album
+        // roll update; the BF card's marquee text is part of that event.
+        updateCardMarqueesForLevel(selectedEntry())
         val entry = selectedEntry() ?: run {
             resetAlbumRoll()
             return
@@ -1945,6 +2153,8 @@ class SongSelectScene : Scene() {
         val capsule = viewCapsules.getOrNull(selected)
         capsule?.forcePosition()
         capsule?.confirm()
+        // `backingCard.confirm()` runs in the same frame as the capsule's.
+        cardConfirm()
         fadeDots()
         touchControls?.visible = false
         startPhase = StartPhase.DELAY
@@ -2263,6 +2473,8 @@ class SongSelectScene : Scene() {
             knfInput.update()
 
             updateCard(d)
+            updateCardConfirm(d)
+            backingTextYeah?.update(d)
             updateCardDisappear(d)
             updateDj(d)
             // Korge computes Text bounds during the first render, so the
@@ -2739,6 +2951,14 @@ class SongSelectScene : Scene() {
         /** `#FFD863`: the yellow the plate turns into after the intro. */
         val YELLOW_PLATE: RGBA get() = RGBA(0xFF, 0xD8, 0x63)
 
+        /**
+         * `bf.json`'s freeplay DJ lines (`text1`/`text2`/`text3`), the six
+         * `BGScrollingText` rows of `BoyfriendCard`.
+         */
+        const val BF_DJ_TEXT_1 = "BOYFRIEND"
+        const val BF_DJ_TEXT_2 = "HOT BLOODED IN MORE WAYS THAN ONE"
+        const val BF_DJ_TEXT_3 = "PROTECT YO NUTS"
+
         /** `diff.x = 90 + (CUTOUT_WIDTH * DJ_POS_MULTI)` in FNF. */
         val BADGE_HOME_X: Double get() = 90.0 + CUTOUT_WIDTH * DJ_POS_MULTI
 
@@ -2818,12 +3038,32 @@ private class DifficultyBadge(
  */
 private class BackingScrollBand(
     val container: Container,
-    val copies: List<Container>,
-    val textWidth: Double,
+    copies: List<Container>,
+    textWidth: Double,
     val placementOffset: Double,
     var speed: Double,
+    var text: String = "",
+    private val rebuild: ((String) -> Pair<List<Container>, Double>)? = null,
 ) {
-    private val positions = copies.map { it.x }.toMutableList()
+    var copies: List<Container> = copies
+        private set
+    var textWidth: Double = textWidth
+        private set
+    private var positions = copies.map { it.x }.toMutableList()
+
+    /**
+     * `BGScrollingText.updateText`: swap the marquee text and rebuild the row.
+     * Used by `BoyfriendCard.onCapsuleSelected` for the LE SSERAFIM level,
+     * which turns every line into "SPECIAL".
+     */
+    fun updateText(value: String) {
+        if (value == text || rebuild == null) return
+        text = value
+        val (built, width) = rebuild(value)
+        copies = built
+        textWidth = width
+        positions = copies.map { it.x }.toMutableList()
+    }
 
     fun update(dt: Double) {
         if (dt <= 0.0) return
