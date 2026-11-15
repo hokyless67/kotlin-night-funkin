@@ -194,6 +194,13 @@ class ResultAnimateSprite(
 
     var onFinished: (() -> Unit)? = null
 
+    /**
+     * `FlxAnimationController.onFrameChange`: fired with the animation-relative
+     * frame number every time the pose advances (the results scripts vibrate on
+     * specific frames of their animations).
+     */
+    var onFrameChange: ((Int) -> Unit)? = null
+
     init {
         content.scaleX = scale
         content.scaleY = scale
@@ -255,8 +262,12 @@ class ResultAnimateSprite(
                 }
             }
             render()
+            onFrameChange?.invoke(frameIndex)
         }
     }
+
+    /** The atlas pose currently shown at an animation-relative frame. */
+    fun poseIndexAt(frame: Int): Int? = frames.getOrNull(frame)
 
     private fun render() {
         if (frames.isEmpty()) return

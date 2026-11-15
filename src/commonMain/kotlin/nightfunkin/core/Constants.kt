@@ -162,6 +162,12 @@ object Constants {
     const val MUSIC_EASE_RATIO = 42.0
     const val CONDUCTOR_DRIFT_THRESHOLD = 65.0
 
+    /**
+     * `Strumline.vwooshNotes` / `vwooshInNotes` duration: notes fly out (and
+     * back in) over half a second when a song is reset or the countdown starts.
+     */
+    const val RETRY_VWOOSH_SECONDS = 0.5
+
     // ---- song ids --------------------------------------------------------
     val DEFAULT_DIFFICULTY_LIST = listOf("easy", "normal", "hard")
 

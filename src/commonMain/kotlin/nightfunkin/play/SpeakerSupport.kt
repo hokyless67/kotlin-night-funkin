@@ -175,7 +175,7 @@ class SpeakerSupport private constructor(
 
             val pupilDir = KnfFiles.findAnimateDir("shared", "characters/abot/systemEyes")
             if (pupilDir != null) {
-                val pupils = AnimateView(AnimateAtlas(pupilDir))
+                val pupils = AnimateView(AnimateAtlas.cached(pupilDir))
                 pupils.x = 50.0
                 pupils.y = 238.0
                 addChild(pupils)
@@ -191,7 +191,7 @@ class SpeakerSupport private constructor(
                 "characters/abot/abotSystem"
             }
             val abotDir = KnfFiles.findAnimateDir("shared", abotPath)
-            val atlas = abotDir?.let { AnimateAtlas(it) } ?: AnimateAtlas(abotPath)
+            val atlas = abotDir?.let { AnimateAtlas.cached(it) } ?: AnimateAtlas.cached(abotPath)
             abot = AnimateView(atlas)
             addChild(abot)
 

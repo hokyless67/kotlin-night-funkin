@@ -44,6 +44,9 @@ korge {
 
     androidPermission("android.permission.MANAGE_EXTERNAL_STORAGE")
     androidPermission("android.permission.READ_EXTERNAL_STORAGE")
+    // `HapticUtil` (KNF_VIBRATION=1) needs the normal-level vibrate permission,
+    // the same one FNF's Lime haptics extension declares.
+    androidPermission("android.permission.VIBRATE")
     androidCustomApplicationAttribute("android:requestLegacyExternalStorage", "true")
     // Fully decoded FNF stems are heavy; give the JVM heap room on top of the
     // default 256 MB (audio is streamed now, but sprites still allocate big

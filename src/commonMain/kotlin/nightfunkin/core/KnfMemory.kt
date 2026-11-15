@@ -52,20 +52,32 @@ object KnfMemory {
      * atlas cache still references their bitmaps), then the atlas cache, then
      * the uploaded GL textures, then ask for a collection while the main thread
      * is blocked preparing the new scene anyway.
+     *
+     * [keepArt] is the restart path: FNF's `restartPlayState` builds a new
+     * `PlayState` without purging the graphic cache, so the same stage and
+     * character sheets are reused instead of decoded again. KNF mirrors that -
+     * a retry keeps the cached atlases, their decoded bitmaps and their GL
+     * textures, which is what made restarts feel like a full reload.
      */
-    fun beginScene(views: Views, name: String) {
+    fun beginScene(views: Views, name: String, keepArt: Boolean = false) {
         if (!KnfPlatform.isMobile) return
-        for (hook in artCachePurgeHooks) runCatching { hook() }
-        TextureAtlas.clearCache()
-        releaseTextures(views)
+        if (!keepArt) {
+            for (hook in artCachePurgeHooks) runCatching { hook() }
+            TextureAtlas.clearCache()
+            AnimateAtlas.clearCache()
+            KnfFiles.clearDecodedImageCache()
+            releaseTextures(views)
+        }
         // KorGE evicts any texture that has not been drawn for 60 frames.
         // KNF drops textures explicitly on every scene switch (`releaseTextures`
         // above), so that idle eviction only ever costs a *re-upload* mid-song -
         // a note splash that waits 60 frames between hits paid for its sheet
         // again. A window longer than any song keeps the cache stable.
         runCatching { views.renderContext.agBitmapTextureManager.framesBetweenGC = 100_000 }
-        KnfPlatform.requestMemoryReclaim()
-        log(views, "enter $name")
+        // On a retry nothing was released, so a forced collection would only
+        // scan a heap that is still fully live - and it blocks the restart.
+        if (!keepArt) KnfPlatform.requestMemoryReclaim()
+        log(views, "enter $name${if (keepArt) " (art kept)" else ""}")
     }
 
     /** `FunkinMemory.clearStickers`, called when the peel-off finishes. */
@@ -93,17 +105,22 @@ object KnfMemory {
      * scene *after* the incoming `sceneInit`, so its art is still reachable
      * during the first call and only the `sceneAfterInit` one can reclaim it.
      */
-    fun endScene(views: Views, name: String) {
+    fun endScene(views: Views, name: String, collect: Boolean = true) {
         if (!KnfPlatform.isMobile) return
         // ART answers an explicit GC request with a collection that can still
         // be sweeping when it returns, and a single pass has measured 4 MB
         // reclaimed out of ~176 MB that was already garbage. Asking twice is
         // what actually brings the heap back before the countdown ends.
-        KnfPlatform.requestMemoryReclaim()
-        KnfPlatform.requestMemoryReclaim()
+        // A retry keeps everything live and skips it: the collection would
+        // find no garbage and only delay the restart.
+        if (collect) {
+            KnfPlatform.requestMemoryReclaim()
+            KnfPlatform.requestMemoryReclaim()
+        }
         log(views, "ready $name")
         if (!debug) return
         println("KNF_MEM [atlases] ${TextureAtlas.cacheStats()}")
+        println("KNF_MEM [animate] ${AnimateAtlas.cacheStats()}")
         println("KNF_MEM [scene probe] leavingSceneAlive=$leavingSceneAlive")
         reportHolders(views)
     }

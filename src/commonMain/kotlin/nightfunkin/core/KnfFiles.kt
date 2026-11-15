@@ -250,6 +250,21 @@ object KnfFiles {
         bytesOrNull(path)?.let { runCatching { decodeImage(it, limit).bitmap }.getOrNull() }
 
     /**
+     * Decoded image cache, FNF's `FlxG.bitmap` equivalent.
+     *
+     * A stage's static scenery and an Animate sheet are decoded once and then
+     * reused: a retry rebuilds the stage and the characters from the same files,
+     * and re-decoding every background PNG was a big part of why a restart felt
+     * like a full reload. Kept in sync with the scene art purges through
+     * [clearDecodedImageCache] (see `KnfMemory.beginScene`).
+     */
+    private val decodedImageCache = HashMap<String, KnfDecodedImage>()
+
+    internal fun clearDecodedImageCache() {
+        decodedImageCache.clear()
+    }
+
+    /**
      * Like [bitmapOrNull], but keeps the factor the source was shrunk by.
      *
      * Atlases store frame rectangles in *source* pixels, so they need the
@@ -258,11 +273,22 @@ object KnfFiles {
     internal fun decodedImageOrNull(
         path: String,
         limit: Int = maxTextureDimension,
-    ): KnfDecodedImage? =
-        bytesOrNull(path)?.let { runCatching { decodeImage(it, limit) }.getOrNull() }
+    ): KnfDecodedImage? {
+        val key = "$path|$limit"
+        decodedImageCache[key]?.let { return it }
+        val image = bytesOrNull(path)?.let { runCatching { decodeImage(it, limit) }.getOrNull() }
+            ?: return null
+        decodedImageCache[key] = image
+        return image
+    }
 
-    internal fun decodedImage(path: String, limit: Int = maxTextureDimension): KnfDecodedImage =
-        decodeImage(bytes(path), limit)
+    internal fun decodedImage(path: String, limit: Int = maxTextureDimension): KnfDecodedImage {
+        val key = "$path|$limit"
+        decodedImageCache[key]?.let { return it }
+        val image = decodeImage(bytes(path), limit)
+        decodedImageCache[key] = image
+        return image
+    }
 
     /**
      * PNG decoding, with two workarounds.

@@ -12,6 +12,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import nightfunkin.audio.MenuMusic
 import nightfunkin.audio.SfxPlayer
 import nightfunkin.core.Constants
+import nightfunkin.core.HapticUtil
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfInput
 import nightfunkin.core.KnfTouch
@@ -294,6 +295,8 @@ class MainMenuScene : Scene() {
         val down = input.justPressed(1)
         if (up != down) {
             scrollSoundPath?.let { sfx.play(it, 0.4) }
+            // `MenuList`: a light buzz whenever the highlight moves.
+            HapticUtil.vibrate(0.0, 0.01, 0.5)
             selectItem(if (up) selectedIndex - 1 else selectedIndex + 1)
             return
         }
@@ -303,6 +306,8 @@ class MainMenuScene : Scene() {
 
     private fun acceptSelected() {
         val item = items.getOrNull(selectedIndex) ?: return
+        // `MenuList`'s main-menu accept branch: the strong buzz.
+        HapticUtil.vibrate(0.0, 0.05, 1.0)
         interacting = true
         startMagentaFlicker()
 

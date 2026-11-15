@@ -17,6 +17,7 @@ import nightfunkin.audio.SfxPlayer
 import nightfunkin.core.AnimateAtlas
 import nightfunkin.core.Constants
 import nightfunkin.core.FunkinAtlasText
+import nightfunkin.core.HapticUtil
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfInput
 import nightfunkin.core.KnfTouch
@@ -371,6 +372,8 @@ class TitleScene : Scene() {
         flashRect?.alpha = 1.0
 
         confirmSoundPath?.let { sfx.play(it, 0.7) }
+        // `TitleState`: `HapticUtil.vibrate(0.1, 0.5, 0.5)` on the Enter press.
+        HapticUtil.vibrate(0.1, 0.5, 0.5)
         transitioning = true
         transitionElapsed = 0.0
     }
@@ -449,6 +452,8 @@ class TitleScene : Scene() {
 
     private fun addMoreText(value: String) {
         val group = introTextGroup ?: return
+        // `TitleState.addMoreText`: a default buzz per credits line.
+        HapticUtil.vibrate()
         val text = FunkinAtlasText.bold(value.trim()).also { it.bornAt = introElapsed }
         text.x = Constants.GAME_WIDTH / 2.0 - text.contentWidth / 2.0
         text.y = group.children.size * 60.0 + 200.0

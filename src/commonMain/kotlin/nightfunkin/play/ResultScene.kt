@@ -20,6 +20,7 @@ import nightfunkin.audio.MusicPlayer
 import nightfunkin.audio.SfxPlayer
 import nightfunkin.core.AnimateAtlas
 import nightfunkin.core.Constants
+import nightfunkin.core.HapticUtil
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfInput
 import nightfunkin.core.KnfMemory
@@ -587,11 +588,19 @@ class ResultScene : Scene() {
             if (value != lastTicked) {
                 lastTicked = value
                 scrollMenuSound?.let { sfx.play(it) }
+                // `ResultState`: a weak buzz per cleared-percent tick.
+                HapticUtil.vibrate(0.0, 0.01)
             }
             counter.curNumber = value
         }, {
             counter.curNumber = clearPercentTarget
             confirmMenuSound?.let { sfx.play(it) }
+            // Strong buzz when the rank tally lands on its final number.
+            HapticUtil.vibrate(
+                HapticUtil.DEFAULT_VIBRATION_PERIOD,
+                HapticUtil.DEFAULT_VIBRATION_DURATION * 5.0,
+                HapticUtil.MAX_VIBRATION_AMPLITUDE,
+            )
             counter.flash(true)
             after(0.4) { counter.flash(false) }
 
@@ -843,7 +852,61 @@ class ResultScene : Scene() {
         )
         sprite.x = x
         sprite.y = y
+        attachResultsHaptics(sprite, anim.scriptClass, atlas)
         return AnimateCharacter(sprite, anim.delay ?: 0.0, soundPath)
+    }
+
+    /**
+     * The results character scripts' `onFrameChange` / `onFrameLabel` haptics
+     * (`BFBedPerfectResults.hxc`, `BFShitResults.hxc`, `Pico*Results.hxc`).
+     */
+    private fun attachResultsHaptics(
+        sprite: ResultAnimateSprite,
+        scriptClass: String?,
+        atlas: AnimateAtlas,
+    ) {
+        when (scriptClass) {
+            "BFBedPerfectResults" -> sprite.onFrameChange = { frame ->
+                // Feel the bed fun :freaky:
+                if (frame > 87 && frame % 5 == 0) HapticUtil.vibrate(0.0, 0.01, 1.0)
+                // GF slams into the wall.
+                if (frame == 51) HapticUtil.vibrate(0.0, 0.01, 0.8)
+            }
+
+            "BFShitResults" -> sprite.onFrameChange = { frame ->
+                // BF falling, then GF slamming on him.
+                if (frame == 5 || frame == 90) HapticUtil.vibrate(0.2, 0.2, 1.0)
+            }
+
+            "PicoGoodResults" -> {
+                // `animation.onFrameLabel`: buzz when the `flash frame` label
+                // is reached (once per pass over the label).
+                val flashPoses = atlas.labelFrames("flash frame").toSet()
+                if (flashPoses.isNotEmpty()) {
+                    var inFlash = false
+                    sprite.onFrameChange = { frame ->
+                        val pose = sprite.poseIndexAt(frame)
+                        val nowInFlash = pose != null && pose in flashPoses
+                        if (nowInFlash && !inFlash) {
+                            HapticUtil.vibrate(0.0, 0.01, 1.0)
+                        }
+                        inFlash = nowInFlash
+                    }
+                }
+            }
+
+            "PicoGreatResults" -> sprite.onFrameChange = { frame ->
+                // Pico shoots.
+                if (frame == 45) HapticUtil.vibrate(0.0, 0.01, 0.8)
+                // The targets explode.
+                if (frame == 50) HapticUtil.vibrate(0.1, 0.1, 1.0)
+            }
+
+            "PicoPerfectResults" -> sprite.onFrameChange = { frame ->
+                // Pico drop-kicking Nene.
+                if (frame == 52) HapticUtil.vibrate(0.1, 0.5, 1.0)
+            }
+        }
     }
 
     private fun createSparrowCharacter(

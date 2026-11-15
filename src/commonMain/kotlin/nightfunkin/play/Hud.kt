@@ -201,6 +201,30 @@ class Hud(
     // per-frame
     // ======================================================================
 
+    /** `sserafim.hxc`'s `PlayState.instance.remove(comboPopUps)`. */
+    fun hidePopUps() {
+        popUps.visible = false
+    }
+
+    /** `SetHealthIcon` song event: `iconP1`/`iconP2.configure(data)`. */
+    fun replaceHealthIcon(playerId: Int, id: String, flipX: Boolean, isPixel: Boolean = false) {
+        val old = if (playerId == 0) playerIcon else opponentIcon
+        old?.image?.removeFromParent()
+        val icon = HealthIcon(
+            characterId = id,
+            playerId = playerId,
+            isPixel = isPixel,
+            flipX = flipX,
+        )
+        if (playerId == 0) playerIcon = icon else opponentIcon = icon
+        addChild(icon.image)
+        updateIconPositions()
+    }
+
+    fun setOpponentIconVisible(visible: Boolean) {
+        opponentIcon?.image?.visible = visible
+    }
+
     fun update(dt: Double) {
         // FNF: healthLerp = lerp(healthLerp, health, 0.15)
         healthLerp += (health - healthLerp) * Constants.HEALTH_LERP_RATE

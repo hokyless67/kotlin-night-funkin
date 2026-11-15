@@ -36,6 +36,7 @@ import nightfunkin.audio.knfPrewarmMusicOutput
 import nightfunkin.core.AnimateAtlas
 import nightfunkin.core.AnimateSpriteView
 import nightfunkin.core.Constants
+import nightfunkin.core.HapticUtil
 import nightfunkin.core.KnfBootLog
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfFmt
@@ -281,6 +282,15 @@ class SongSelectScene : Scene() {
     private var startPhase = StartPhase.NONE
     private var startElapsed = 0.0
     private var startFadeOverlay: SolidRect? = null
+
+    /**
+     * `capsuleOnConfirmDefault`'s haptics: 0.5 s after the confirm pose the
+     * game buzzes once - or, for Pico songs, keeps a light rumble going for
+     * another 0.5 s while his bullets fire (`allowPicoBulletsVibration`).
+     */
+    private var confirmHapticElapsed = -1.0
+    private var confirmHapticIsPico = false
+    private var picoBulletHapticLeft = 0.0
 
     /** One `FreeplayState.exitMovers` entry: a layer sliding to [targetX]/[targetY]. */
     private class ExitMover(
@@ -1919,6 +1929,9 @@ class SongSelectScene : Scene() {
         updateDifficultyDots()
         rememberSelection()
         scrollSound?.let { sfx.play(it, 0.4) }
+        // `FreeplayState.updateCapsulePositions` / `changeSelection`: a small
+        // buzz on every selection change.
+        HapticUtil.vibrate(0.0, 0.01, 0.5)
         requestPreview()
     }
 
@@ -1953,6 +1966,8 @@ class SongSelectScene : Scene() {
         updateTopUi()
         rememberSelection()
         scrollSound?.let { sfx.play(it, 0.4) }
+        // `changeDiff`: the same small buzz as a song selection change.
+        if (delta != 0) HapticUtil.vibrate(0.0, 0.01, 0.5, 0.1)
         // `playCurSongPreview` runs with `restartTrack: false`: a pure
         // difficulty switch keeps the current preview playing.
         requestPreviewIfTargetChanged(previewBefore)
@@ -2162,9 +2177,17 @@ class SongSelectScene : Scene() {
         startFadeOverlay?.alpha = 0.0
         startFadeOverlay?.visible = false
 
+        // `capsuleOnConfirmDefault`: the buzz starts half a second after the
+        // confirm pose, timed off the same delay that leads into the fade.
+        confirmHapticElapsed = 0.0
+        confirmHapticIsPico = isPicoPlayer(entry.song.metadataFor(variation).playData.characters.player)
+        picoBulletHapticLeft = 0.0
+
         PlayRequest.songId = entry.song.id
         PlayRequest.difficulty = currentDifficulty
         PlayRequest.variation = variation
+        // A fresh pick from the list always reloads the stage/character art.
+        PlayRequest.restarted = false
         // Freeplay normally skips story-mode videos. KNF_STORY=1 keeps the old
         // test hook that lets those sequences run from the normal song list.
         PlayRequest.storyMode = KnfEnv["KNF_STORY"] == "1"
@@ -2430,6 +2453,8 @@ class SongSelectScene : Scene() {
                 if (img.visible && placement.appearAt <= revealElapsed) {
                     img.visible = false
                     if (placement.soundStem.isNotEmpty()) sfx.play(placement.soundStem)
+                    // `degenStickers`: a small buzz as each sticker peels off.
+                    HapticUtil.vibrate(0.0, 0.01, HapticUtil.MIN_VIBRATION_AMPLITUDE * 0.5)
                 }
                 if (img.visible) remaining++
             }
@@ -2554,6 +2579,33 @@ class SongSelectScene : Scene() {
                     SceneWipe.requestSkipNextReveal()
                     launch { sceneContainer.changeTo<MainMenuScene>() }
                     return@addUpdater
+                }
+            }
+
+            // `capsuleOnConfirmDefault`'s delayed vibration (see
+            // [confirmHapticElapsed]); the Pico branch rumbles every frame
+            // while his bullets fly.
+            if (confirmHapticElapsed >= 0.0) {
+                val before = confirmHapticElapsed
+                confirmHapticElapsed += d
+                if (before < 0.5 && confirmHapticElapsed >= 0.5) {
+                    if (confirmHapticIsPico) {
+                        picoBulletHapticLeft = 0.5
+                    } else {
+                        HapticUtil.vibrate(
+                            HapticUtil.DEFAULT_VIBRATION_PERIOD,
+                            HapticUtil.DEFAULT_VIBRATION_DURATION * 5.0,
+                            HapticUtil.MAX_VIBRATION_AMPLITUDE / 3.0 * 2.5,
+                        )
+                    }
+                }
+                if (picoBulletHapticLeft > 0.0) {
+                    picoBulletHapticLeft -= d
+                    HapticUtil.vibrate(
+                        0.0,
+                        0.01,
+                        HapticUtil.MAX_VIBRATION_AMPLITUDE / 3.0 * 2.5,
+                    )
                 }
             }
 
@@ -2889,6 +2941,7 @@ class SongSelectScene : Scene() {
     }
 
     override suspend fun sceneDestroy() {
+        HapticUtil.cancel()
         stopPreview()
         preview.dispose()
         rememberSelection()

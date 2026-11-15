@@ -85,6 +85,15 @@ class MusicPlayer {
     var loadedPath: String? = null
         private set
 
+    /**
+     * Set when the next gameplay scene takes this player over for an in-place
+     * retry instead of decoding the same stems again. The outgoing scene's
+     * `dispose` then only clears the flag, so the PCM it was about to free is
+     * still valid for the new scene (the old scene is destroyed after the new
+     * one initialises).
+     */
+    var handedOff: Boolean = false
+
     /** `FunkinSound.playMusic`'s `loop` flag (menu music metadata is looped). */
     var loop: Boolean = false
 
@@ -393,6 +402,12 @@ class MusicPlayer {
     }
 
     fun dispose() {
+        // A retry handed this player to the incoming scene; it still owns the
+        // decoded PCM, so this scene must not drop it.
+        if (handedOff) {
+            handedOff = false
+            return
+        }
         stop()
         playbackContext.cancel()
         sound = null

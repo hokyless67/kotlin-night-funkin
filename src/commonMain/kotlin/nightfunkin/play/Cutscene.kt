@@ -43,6 +43,14 @@ interface SongCutscene {
     val kind: CutsceneKind get() = CutsceneKind.STARTING
 
     /**
+     * FNF's cutscene scripts can leave the camera wherever they want; KNF's
+     * `beginCountdown` normally snaps back to the stage zoom. Song-stage
+     * sequences that tween the camera into gameplay (SPAGHETTI) set this so
+     * that reset does not undo their final move.
+     */
+    val keepCameraOnFinish: Boolean get() = false
+
+    /**
      * `PauseSubState` mode for this cutscene, or [CutscenePauseMode.NONE] when
      * ESC/P should not open a menu.
      */
@@ -101,6 +109,13 @@ interface CutsceneHost {
      */
     fun addCutsceneView(view: View)
     fun removeCutsceneView(view: View)
+
+    /**
+     * Adds a screen-space view *above the game but below the HUD and the
+     * cutscene overlay*. FNF's `camGame.fade`/`flash` behave this way, so a
+     * stage intro fade must not cover its own "Skip" hint.
+     */
+    fun addGameOverlayView(view: View)
 
     /** FNF's `cameraFollowPoint.setPosition(...)` + `resetCamera()` + direct zoom. */
     fun focusCamera(x: Double, y: Double, zoom: Double)
@@ -162,8 +177,12 @@ interface CutsceneHost {
 
     fun playSound(path: String, volume: Double = 1.0)
 
-    /** Fire-and-forget sound, used by dialogue text blips. */
-    fun playSfx(path: String, volume: Double = 1.0)
+    /**
+     * Fire-and-forget sound, used by dialogue text blips. Returns the channel
+     * so scripted sequences can fade/stop their own sound (`sserafim.hxc`'s
+     * `cutsceneSounds`).
+     */
+    fun playSfx(path: String, volume: Double = 1.0): nightfunkin.audio.SfxChannel?
     fun isSoundPlaying(): Boolean
 }
 
@@ -185,6 +204,7 @@ object SongCutscenes {
         variation: String,
         storyMode: Boolean,
         host: CutsceneHost,
+        sserafim: SserafimStage? = null,
     ): SongCutscene? {
         // Story Mode always plays the default variation. A story-only cutscene
         // therefore makes no sense for an alternate variation: `guns`, `ugh`,
@@ -258,8 +278,10 @@ object SongCutscenes {
         if (stageId == "phillyTrainErect" && variation == "pico") {
             return PhillyTrainErectCutscene(host)
         }
-        // The remaining stage scripts (sserafim) need their custom shader
-        // pipelines and are not ported yet.
+        // `sserafim.hxc` cancels the countdown for its in-game intro.
+        if (stageId == "sserafim" && sserafim != null) {
+            return SserafimCutscene(host, sserafim)
+        }
         return null
     }
 

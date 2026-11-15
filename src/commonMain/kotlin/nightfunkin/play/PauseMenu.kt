@@ -9,6 +9,7 @@ import korlibs.korge.view.solidRect
 import korlibs.korge.view.text
 import nightfunkin.core.Constants
 import nightfunkin.core.FunkinAtlasText
+import nightfunkin.core.HapticUtil
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfInput
 import kotlin.math.min
@@ -77,6 +78,8 @@ class PauseMenu(
     private var selected = 0
     private var time = 0.0
     private var justOpened = true
+    private var openedHapticPlayed = false
+    private var openedFollowUpPlayed = false
 
     init {
         addChild(entriesLayer)
@@ -187,7 +190,11 @@ class PauseMenu(
         if (entries.isEmpty()) return
         val previous = selected
         selected = (selected + change).mod(entries.size)
-        if (selected != previous) onScroll()
+        if (selected != previous) {
+            // `PauseSubState`'s mobile path buzzes on every selection change.
+            HapticUtil.vibrate(0.0, 0.01, 0.5)
+            onScroll()
+        }
 
         for ((index, entry) in entries.withIndex()) {
             entry.startX = entry.view.x
@@ -206,6 +213,16 @@ class PauseMenu(
      */
     fun update(dt: Double, input: KnfInput) {
         time += dt
+        // `PauseSubState.transitionIn` (mobile): a 0.05 s buzz as the menu
+        // opens, then a lighter one 0.2 s later with the metadata fade.
+        if (!openedHapticPlayed) {
+            openedHapticPlayed = true
+            HapticUtil.vibrate(0.0, 0.05, 0.5)
+        }
+        if (!openedFollowUpPlayed && time >= 0.2) {
+            openedFollowUpPlayed = true
+            HapticUtil.vibrate(0.0, 0.01, 0.5)
+        }
         background.alpha = BACKGROUND_ALPHA * quartOut(min(time / BACKGROUND_FADE_SECONDS, 1.0))
 
         for (meta in metadata) {
@@ -236,6 +253,7 @@ class PauseMenu(
         }
 
         if (input.accept) {
+            HapticUtil.vibrate(0.0, 0.05, 1.0)
             entries.getOrNull(selected)?.action?.invoke()
         } else if (input.pause) {
             onResume()

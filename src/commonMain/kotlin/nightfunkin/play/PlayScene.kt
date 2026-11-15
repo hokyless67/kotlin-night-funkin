@@ -27,6 +27,7 @@ import nightfunkin.audio.dtSeconds
 import korlibs.math.geom.degrees
 import nightfunkin.WindowBop
 import nightfunkin.core.Constants
+import nightfunkin.core.HapticUtil
 import nightfunkin.core.KnfFiles
 import nightfunkin.core.KnfFmt
 import nightfunkin.core.KnfInput
@@ -48,6 +49,7 @@ import nightfunkin.ui.SongSelectScene
 import nightfunkin.ui.StickerOverlay
 import nightfunkin.ui.StickerSceneTarget
 import nightfunkin.ui.TouchControls
+import nightfunkin.ui.secondsDouble
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -73,6 +75,15 @@ object PlayRequest {
      * forces Story Mode for normal Freeplay runs too.
      */
     var storyMode: Boolean = false
+
+    /**
+     * Set by `PauseSubState.restartPlayState` (`restartSong`) right before the
+     * scene switch. A retry rebuilds the same song, so the stage/character
+     * sheets are already in the atlas caches and must not be purged - FNF's
+     * `restartPlayState` likewise leaves `FlxG.bitmap` alone. Consumed once by
+     * the incoming `PlayScene`.
+     */
+    var restarted: Boolean = false
 }
 
 /**
@@ -88,18 +99,31 @@ class PlayScene : Scene() {
     private lateinit var chart: SongDifficulty
 
     private val conductor = Conductor()
-    private val music = MusicPlayer()
+    /**
+     * `var` (not `val`): a retry hands the previous scene's players over
+     * instead of decoding the same stems again (see [adoptPreviousStems]).
+     */
+    private var music = MusicPlayer()
 /**
      * FNF's `VoicesGroup`: one mixed vocals track played through two heads so
      * each character has an independent volume, which is how the song decides
      * whose line you hear without duplicating the audio.
      */
-    private val vocals = MusicPlayer()
-    private val opponentVocals = MusicPlayer()
+    private var vocals = MusicPlayer()
+    private var opponentVocals = MusicPlayer()
     private val sfx = SfxPlayer()
 
     /** FNF's `PauseSubState` plays `shared/music/breakfast` under the menu. */
     private val pauseMusic = MusicPlayer()
+
+    /** True while this scene owns stems handed over by the previous retry. */
+    private var stemAudioHandedOff = false
+
+    /** `PlayRequest.restarted` as read by this scene (see `KnfMemory.beginScene`). */
+    private var retryArtKept = false
+
+    /** Seconds into the pre-retry note fly-out; `-1` when inactive. */
+    private var retryFlyOutElapsed = -1.0
 
     private lateinit var gameInput: KnfInput
     private lateinit var noteStyle: NoteStyle
@@ -181,6 +205,12 @@ class PlayScene : Scene() {
     private var gameOverPlayerLayer: CharacterLayer? = null
     private var gameOverMusicGeneration = 0
     private val gameOverMusic = MusicPlayer()
+
+    /**
+     * `GameOverSubState` haptics: the buzz when the death screen opens, plus
+     * the delayed pulses some character scripts (`pico-blazin.hxc`) schedule.
+     */
+    private val gameOverHaptics = ArrayList<Pair<Double, () -> Unit>>()
 
     /**
      * `GameOverSubState.deathQuoteSound` / `hasPlayedDeathQuote`: the
@@ -335,6 +365,12 @@ class PlayScene : Scene() {
     private val characterLayers = ArrayList<CharacterLayer>()
 
     /**
+     * `playerStrumline.noteVibrations`: FNF's `NoteVibrationsHandler`, driven
+     * by the player lane's press/hit/hold states.
+     */
+    private val noteVibrations = NoteVibrations()
+
+    /**
      * FNF's desktop default is upscroll (`Preferences.downscroll == false`),
      * with the receptors one `STRUMLINE_Y_OFFSET` below the top edge.
      *
@@ -347,6 +383,12 @@ class PlayScene : Scene() {
 
     /** Stage-space data for the current stage: props, character slots, zoom. */
     private lateinit var stageFile: StageDataFile
+
+    /** Screen-space layer between the game and the HUD (`camGame` effects). */
+    private lateinit var gameOverlayLayer: Container
+
+    /** SPAGHETTI's stage script, when the current stage has one. */
+    private var sserafim: SserafimStage? = null
 
     /** Where the camera rests, i.e. on the opponent's focus point. */
     private lateinit var defaultCameraFocus: Pair<Double, Double>
@@ -422,8 +464,11 @@ class PlayScene : Scene() {
         // outgoing scene's art and a retried song's decoded stems would still
         // be alive while this scene loads its own. Release both first: the
         // overlap is what used to exhaust the heap on a phone.
-        releasePreviousSongAudio()
-        KnfMemory.beginScene(views, "PlayScene")
+        val retryOfSameSong = PlayRequest.restarted
+        PlayRequest.restarted = false
+        retryArtKept = retryOfSameSong
+        if (!retryOfSameSong) releasePreviousSongAudio()
+        KnfMemory.beginScene(views, "PlayScene", keepArt = retryOfSameSong)
         song = SongRegistry.get(PlayRequest.songId)
             ?: error("KNF: unknown song '${PlayRequest.songId}'")
         chart = song.difficulty(PlayRequest.difficulty, PlayRequest.variation)
@@ -431,7 +476,7 @@ class PlayScene : Scene() {
 
         noteStyle = NoteStyle.get(chart.noteStyle)
         gameInput = KnfInput(keys)
-        totalNotes = chart.notes.count { it.isPlayerNote }
+        totalNotes = chart.notes.count { it.isPlayerNote && it.kind != NON_SCOREABLE_KIND }
 
         // ---- timing ------------------------------------------------------
         conductor.reset()
@@ -454,6 +499,11 @@ class PlayScene : Scene() {
         )
         worldHost.addChild(cameraLayer)
         addChild(worldHost)
+
+        // `camGame`-level fades/flashes live here: above the stage, below the
+        // HUD and the cutscene overlay (which mirrors `camCutscene`).
+        gameOverlayLayer = Container()
+        addChild(gameOverlayLayer)
 
         camera = GameplayCamera(cameraLayer, Constants.GAME_WIDTH.toDouble(), Constants.GAME_HEIGHT.toDouble())
         conductor.update(prePosition, false)
@@ -589,6 +639,24 @@ class PlayScene : Scene() {
         hud.resetHealth()
         hud.setHealthIcons(player, opponent)
 
+        // The LE SSERAFIM stage script adds its own characters, floor, dust
+        // and shader. Built after the HUD exists so it can hide the opponent
+        // receptors/combo popups over the normal objects.
+        if (chart.stage == "sserafim" && stageProps != null) {
+            sserafim = SserafimStage(
+                host = CutsceneHostImpl(),
+                stage = stageProps!!,
+                camera = camera,
+                hud = hud,
+                player = player,
+                opponent = opponent,
+                girlfriend = girlfriend,
+                opponentStrumline = opponentStrumline,
+                resolveSound = { resolveStageSound(it) },
+                onEndSong = { endSong() },
+            )
+        }
+
         // Decode every note-style asset (splash sheets, judgements, hold
         // strips) now instead of lazily mid-song: the first Sick hit used to
         // freeze the GL thread for half a second while the splash sheet
@@ -597,30 +665,39 @@ class PlayScene : Scene() {
 
         // ---- audio -------------------------------------------------------
         val instPath = song.instrumentalPath(PlayRequest.variation)
-        if (instPath == null || !music.load(instPath, streaming = false)) {
-            println("KNF: no instrumental found for '${song.name}'")
-        } else if (KnfFiles.isMp3(instPath)) {
+        val playerVocalsPath = song.vocalsPath(chart.characters.player, PlayRequest.variation)
+        val opponentVocalsPath = song.vocalsPath(chart.characters.opponent, PlayRequest.variation)
+        // A retry can keep the previous scene's fully decoded stems: their
+        // `loadedPath`s still match, and the old scene hands ownership over
+        // instead of disposing them.
+        val adopted = retryOfSameSong &&
+            adoptPreviousStems(instPath, playerVocalsPath, opponentVocalsPath)
+        if (!adopted) {
+            releasePreviousSongAudio()
+            if (instPath == null || !music.load(instPath, streaming = false)) {
+                println("KNF: no instrumental found for '${song.name}'")
+            }
+            // FNF's `VoicesGroup` plays both characters at once, each from its *own*
+            // stem: `Voices-bf.mp3` and `Voices-dad.mp3` are different files rather
+            // than one shared mix, so the opponent head needs its own track or the
+            // opponent stays silent.
+            playerVocalsPath?.let { path ->
+                vocals.load(path, streaming = false)
+                println("KNF: vocals player $path")
+            }
+            opponentVocalsPath?.let { path ->
+                opponentVocals.load(path, streaming = false)
+                println("KNF: vocals opponent $path")
+            }
+        }
+        if (instPath != null && KnfFiles.isMp3(instPath)) {
             // MP3 decoders add ~12 ms of latency; FNF compensates the same way.
             conductor.formatOffset = Constants.MP3_DELAY_MS
         }
-
-        // FNF's `VoicesGroup` plays both characters at once, each from its *own*
-        // stem: `Voices-bf.mp3` and `Voices-dad.mp3` are different files rather
-        // than one shared mix, so the opponent head needs its own track or the
-        // opponent stays silent.
-        chart.characters.let { chars ->
-            song.vocalsPath(chars.player, PlayRequest.variation)?.let { path ->
-                vocals.load(path, streaming = false)
-                println("KNF: vocals player " + path)
-            }
-            song.vocalsPath(chars.opponent, PlayRequest.variation)?.let { path ->
-                opponentVocals.load(path, streaming = false)
-                println("KNF: vocals opponent " + path)
-            }
-        }
         // If this scene is replaced (retry, quit) the next PlayScene runs its
         // `sceneInit` while this one is still alive; it disposes these players
-        // before decoding its own stems so two songs' PCM never coexist.
+        // before decoding its own stems so two songs' PCM never coexist - or,
+        // on a retry, takes them over without decoding anything.
         previousSongPlayers = listOf(music, vocals, opponentVocals)
         KnfMemory.log(views, "stems")
 
@@ -666,7 +743,10 @@ class PlayScene : Scene() {
             if (step % 4 == 0) {
                 onBeat()
                 stageEffects?.onBeat(conductor.currentBeat)
+                sserafim?.onBeat(conductor.currentBeat)
             }
+            // `PlayState.stepHit`: held tails keep a light rumble going.
+            noteVibrations.tryHoldNoteVibration()
         }
 
         nextEventIndex = 0
@@ -743,7 +823,7 @@ class PlayScene : Scene() {
         // arrays) now, while the previous scene is still alive but the heap is
         // at its peak. The previous scene itself only becomes garbage later:
         // `sceneAfterInit` collects that.
-        KnfMemory.endScene(views, "PlayScene")
+        KnfMemory.endScene(views, "PlayScene", collect = !retryArtKept)
     }
 
     /**
@@ -927,7 +1007,7 @@ class PlayScene : Scene() {
      * landing on the first notes.
      */
     override suspend fun sceneAfterInit() {
-        KnfMemory.endScene(views, "PlayScene after transition")
+        KnfMemory.endScene(views, "PlayScene after transition", collect = !retryArtKept)
     }
 
     override suspend fun SContainer.sceneMain() {
@@ -986,6 +1066,7 @@ class PlayScene : Scene() {
 
     override suspend fun sceneDestroy() {
         WindowBop.reset(views)
+        HapticUtil.cancel()
         cutscene?.destroy()
         cutscene = null
         blackScreen?.removeFromParent()
@@ -993,11 +1074,13 @@ class PlayScene : Scene() {
         // `dispose` (not `stop`): a stopped player still holds the fully
         // decoded PCM (~30 MB per stem). The scene switch happens long before
         // this object is collected, so freeing the samples here is what keeps
-        // the next scene from decoding on top of them.
+        // the next scene from decoding on top of them. A retry has already
+        // handed these players to the incoming scene, which makes this a no-op.
+        val stemsHandedOff = music.handedOff || vocals.handedOff || opponentVocals.handedOff
         music.dispose()
         vocals.dispose()
         opponentVocals.dispose()
-        if (previousSongPlayers.contains(music)) previousSongPlayers = emptyList()
+        if (!stemsHandedOff && previousSongPlayers.contains(music)) previousSongPlayers = emptyList()
         gameOverMusic.dispose()
         pauseMusic.dispose()
         sfx.stopAll()
@@ -1152,6 +1235,11 @@ class PlayScene : Scene() {
         music.volume = 1.0
         vocals.volume = 1.0
         opponentVocals.volume = 1.0
+        // A retried song owns the previous scene's stems; make sure the old
+        // channel is not still playing under the countdown.
+        music.stop()
+        vocals.stop()
+        opponentVocals.stop()
         playerStrumline.clean()
         opponentStrumline.clean()
         playerStrumline.setNoteData(chart.notes.filter { it.isPlayerNote })
@@ -1184,6 +1272,7 @@ class PlayScene : Scene() {
             chart.variation,
             PlayRequest.storyMode,
             CutsceneHostImpl(),
+            sserafim,
         ) ?: return
         cutscene = intro
         println("KNF: playing intro cutscene for '${song.id}'")
@@ -1198,8 +1287,8 @@ class PlayScene : Scene() {
      * frame, which silently undoes the cutscene's direct `zoom = 2.5`. KNF
      * applies that reset explicitly here, just before the countdown.
      */
-    private fun beginCountdown() {
-        camera.setZoomImmediate(stageFile.cameraZoom)
+    private fun beginCountdown(keepCamera: Boolean = false) {
+        if (!keepCamera) camera.setZoomImmediate(stageFile.cameraZoom)
         countdownStep = -1
         countdownTimer = 0.0
         // Restart note streaming from the top of the chart. A cutscene must
@@ -1290,6 +1379,10 @@ class PlayScene : Scene() {
             view.removeFromParent()
         }
 
+        override fun addGameOverlayView(view: View) {
+            gameOverlayLayer.addChild(view)
+        }
+
         override fun focusCamera(x: Double, y: Double, zoom: Double) {
             camera.setFocusImmediate(x, y)
             camera.setZoomImmediate(zoom)
@@ -1369,15 +1462,17 @@ class PlayScene : Scene() {
             resolveStageSound(stem)
         }.getOrNull()
 
-        override val advancePressed: Boolean get() = gameInput.accept
+        override val advancePressed: Boolean
+            // FNF's `CUTSCENE_ADVANCE` is ACCEPT plus, on mobile, the pause
+            // button (`sserafim.hxc` checks `isMobilePauseButtonPressed`).
+            get() = gameInput.accept || gameInput.pauseOnly
 
         override fun playSound(path: String, volume: Double) {
             cutsceneSound = sfx.play(path, volume)
         }
 
-        override fun playSfx(path: String, volume: Double) {
+        override fun playSfx(path: String, volume: Double): nightfunkin.audio.SfxChannel? =
             sfx.play(path, volume)
-        }
 
         override fun isSoundPlaying(): Boolean = cutsceneSound?.playing == true
     }
@@ -1439,7 +1534,10 @@ class PlayScene : Scene() {
 
         // `PlayState.pause`: no pausing during the countdown, after the song
         // ended, or while the results transition runs.
-        if (cutscene == null && !startingSong && !songEnded && !ending && gameInput.pause) {
+        if (cutscene == null && !startingSong && !songEnded && !ending && gameInput.pause &&
+            retryFlyOutElapsed < 0.0 &&
+            sserafim?.pauseBlocked != true
+        ) {
             val t = realNowMs()
             openPause()
             phaseMenuMs = realNowMs() - t
@@ -1495,11 +1593,12 @@ class PlayScene : Scene() {
                 if (cutsceneToUpdate.update(dt)) {
                     cutscene = null
                     val kind = cutsceneToUpdate.kind
+                    val keepCamera = cutsceneToUpdate.keepCameraOnFinish
                     cutsceneToUpdate.destroy()
                     when (kind) {
                         CutsceneKind.STARTING -> {
                             println("KNF: intro cutscene finished, starting countdown")
-                            beginCountdown()
+                            beginCountdown(keepCamera)
                         }
                         CutsceneKind.ENDING -> {
                             println("KNF: ending cutscene finished, ending the song")
@@ -1513,6 +1612,9 @@ class PlayScene : Scene() {
                 val tNotes = realNowMs()
                 processSongEvents()
                 processInput()
+                // `PlayState.update`: one haptic check per frame, after the
+                // input and hit handling has updated the lane statuses.
+                noteVibrations.tryNoteVibration()
                 processNotes()
                 checkSongEnd()
                 phaseNotesMs = realNowMs() - tNotes
@@ -1554,6 +1656,7 @@ class PlayScene : Scene() {
 
         val tStage = realNowMs()
         stageProps?.update(dt, camera.scrollX, camera.scrollY)
+        sserafim?.update(dt, conductor.songPosition.toDouble())
         stageEffects?.update(
             dt,
             conductor.songPosition.toDouble(),
@@ -1753,6 +1856,37 @@ class PlayScene : Scene() {
         pauseMusicGeneration++
         pauseMusic.stop()
         if (difficulty != null) PlayRequest.difficulty = difficulty
+        // Retry of the same song: the incoming scene reuses the cached art and
+        // takes the decoded stems over.
+        PlayRequest.restarted = true
+        // `sserafim.hxc`'s `onSongRetry`: the long intro is not replayed; the
+        // stage jumps straight to the "truck has crashed" state.
+        if (chart.stage == "sserafim") SserafimStage.skipIntroOnce = true
+
+        // `PlayState.reset` in FNF: the music stops and the notes already on
+        // screen shoot out for half a second before the chart is rebuilt. A
+        // death retry skips the fly-out (`!fromDeathState`), and the game over
+        // overlay covers the playfield anyway.
+        if (!gameOverActive && retryFlyOutElapsed < 0.0) {
+            music.stop()
+            vocals.stop()
+            opponentVocals.stop()
+            playerStrumline.vwooshNotes()
+            opponentStrumline.vwooshNotes()
+            retryFlyOutElapsed = 0.0
+            sceneRoot.addUpdater { dt ->
+                if (retryFlyOutElapsed < 0.0) return@addUpdater
+                val d = dt.secondsDouble()
+                playerStrumline.updateVwooshOut(d)
+                opponentStrumline.updateVwooshOut(d)
+                retryFlyOutElapsed += d
+                if (retryFlyOutElapsed >= Constants.RETRY_VWOOSH_SECONDS) {
+                    retryFlyOutElapsed = -1.0
+                    launch { sceneContainer.changeTo<PlayScene>() }
+                }
+            }
+            return
+        }
         launch { sceneContainer.changeTo<PlayScene>() }
     }
 
@@ -2017,6 +2151,9 @@ class PlayScene : Scene() {
     }
 
     private fun checkSongEnd() {
+        // `sserafimEnd` owns the last nine seconds: its `SEEYOU` cards run
+        // past the end of the instrumental and call `endSong(true)` themselves.
+        if (sserafim?.suppressSongEnd == true) return
         val length = music.totalMs.takeIf { it > 0.0 } ?: fallbackSongLengthMs()
         // `positionMs` is the *generated* position: it counts the samples
         // handed to the platform output. The audible position lags by
@@ -2212,6 +2349,7 @@ class PlayScene : Scene() {
         //
         // so the arrow sinks the moment you press it, hit or miss.
         playerStrumline.pressKey(lane)
+        noteVibrations.press(lane)
 
         val candidates = playerStrumline.notesMayHit(lane)
         if (candidates.isEmpty()) {
@@ -2222,12 +2360,14 @@ class PlayScene : Scene() {
         }
         val note = candidates.first()
         goodNoteHit(note)
+        noteVibrations.confirm(lane)
         // FNF's `Strumline.hitNote`: the confirm animation and the splash.
         playerStrumline.hitNote(lane)
     }
 
     private fun onRelease(lane: Int) {
         playerStrumline.releaseKey(lane)
+        noteVibrations.release(lane)
     }
 
     // ======================================================================
@@ -2294,6 +2434,10 @@ class PlayScene : Scene() {
 
     private fun goodNoteHit(note: NoteSprite) {
         val hitStart = realNowMs()
+        // `NonScoreableNoteKind.scoreable = false`: the note still confirms and
+        // still plays the character's sing pose, but it never touches the
+        // score, the judgement popups or the combo.
+        val scoreable = note.kind != NON_SCOREABLE_KIND
         stageEffects?.onNoteHit()
         val timingError = conductor.songPosition - note.strumTime
         val absError = abs(timingError)
@@ -2318,39 +2462,55 @@ class PlayScene : Scene() {
             note.hideHead()
         }
 
-        score += Scoring.scoreNote(absError)
-        hits++
-        when (judgement) {
-            Judgement.SICK -> tallies.sick++
-            Judgement.GOOD -> tallies.good++
-            Judgement.BAD -> tallies.bad++
-            Judgement.SHIT -> tallies.shit++
-            Judgement.MISS -> tallies.missed++
-        }
-        tallies.totalNotesHit++
+        if (scoreable) {
+            score += Scoring.scoreNote(absError)
+            hits++
+            when (judgement) {
+                Judgement.SICK -> tallies.sick++
+                Judgement.GOOD -> tallies.good++
+                Judgement.BAD -> tallies.bad++
+                Judgement.SHIT -> tallies.shit++
+                Judgement.MISS -> tallies.missed++
+            }
+            tallies.totalNotesHit++
 
-        // FNF's `applyScore`: BAD and SHIT break the combo, everything else
-        // extends it. The tallies are authoritative; the local `combo` is just
-        // a mirror used by the HUD.
-        if (judgement == Judgement.BAD || judgement == Judgement.SHIT) {
-            if (tallies.combo >= 10) hud.showComboBreak()
-            tallies.combo = 0
-        } else {
-            tallies.combo++
-            if (tallies.combo > tallies.maxCombo) tallies.maxCombo = tallies.combo
+            // FNF's `applyScore`: BAD and SHIT break the combo, everything else
+            // extends it. The tallies are authoritative; the local `combo` is
+            // just a mirror used by the HUD.
+            if (judgement == Judgement.BAD || judgement == Judgement.SHIT) {
+                if (tallies.combo >= 10) hud.showComboBreak()
+                tallies.combo = 0
+            } else {
+                tallies.combo++
+                if (tallies.combo > tallies.maxCombo) tallies.maxCombo = tallies.combo
+            }
+            combo = tallies.combo
         }
-        combo = tallies.combo
 
         val scoreStart = realNowMs()
-        hud.setScore(score)
+        if (scoreable) hud.setScore(score)
         val scoreDone = realNowMs()
-        hud.showJudgement(judgement)
-        hud.showCombo(combo)
-        hud.addHealth(Scoring.healthDelta(judgement))
+        if (scoreable) {
+            hud.showJudgement(judgement)
+            hud.showCombo(combo)
+            hud.addHealth(Scoring.healthDelta(judgement))
+        }
         val hudDone = realNowMs()
 
         // FNF's BF behaviour: strike the matching `singDIR` pose on every hit.
-        if (note.isPlayerNote) player.sing(note.directionIndex, conductor.stepLengthMs.toDouble())
+        if (note.isPlayerNote) {
+            val stage = sserafim
+            if (stage != null) {
+                stage.singPlayerNote(
+                    note.directionIndex,
+                    note.kind,
+                    conductor.stepLengthMs.toDouble(),
+                    miss = false,
+                )
+            } else {
+                player.sing(note.directionIndex, conductor.stepLengthMs.toDouble())
+            }
+        }
         val singDone = realNowMs()
 
         // FNF's `HitNoteScriptEvent.doesNotesplash` defaults to `daRating == 'sick'`,
@@ -2443,7 +2603,8 @@ class PlayScene : Scene() {
                 note.hideHead()
                 opponentStrumline.hitNote(note.directionIndex)
                 // FNF's DAD behaviour: the CPU poses on every note it lands.
-                opponent.sing(note.directionIndex, conductor.stepLengthMs.toDouble())
+                sserafim?.singOpponentNote(note.directionIndex, conductor.stepLengthMs.toDouble())
+                    ?: opponent.sing(note.directionIndex, conductor.stepLengthMs.toDouble())
                 if (note.isHoldNote) {
                     note.startClip()
                     // FNF's opponent branch mirrors the player strumline:
@@ -2458,6 +2619,13 @@ class PlayScene : Scene() {
         for (note in playerStrumline.notes) {
             if (note.hasMissed && !note.handledMiss) {
                 note.handledMiss = true
+                // `NonScoreableNoteKind.onNoteMiss` hides the note and cancels
+                // the event: no health loss, no combo break, no miss sound.
+                if (note.kind == NON_SCOREABLE_KIND) {
+                    note.hideHead()
+                    note.killTrail()
+                    continue
+                }
                 combo = 0
                 misses++
                 tallies.missed++
@@ -2468,7 +2636,17 @@ class PlayScene : Scene() {
                 hud.showJudgement(Judgement.MISS)
                 // `BaseCharacter.onNoteMiss` plays the matching miss pose for
                 // every player note that leaves the window.
-                player.sing(note.directionIndex, conductor.stepLengthMs.toDouble(), miss = true)
+                val stage = sserafim
+                if (stage != null) {
+                    stage.singPlayerNote(
+                        note.directionIndex,
+                        note.kind,
+                        conductor.stepLengthMs.toDouble(),
+                        miss = true,
+                    )
+                } else {
+                    player.sing(note.directionIndex, conductor.stepLengthMs.toDouble(), miss = true)
+                }
                 // FNF hides the tail of a dropped hold note:
                 // `holdNote.missedNote = true; holdNote.visible = false;`
                 note.killTrail()
@@ -2500,19 +2678,27 @@ class PlayScene : Scene() {
                     playerStrumline.playStatic(lane)
                     note.releaseClip(conductor)
                     playerStrumline.endNoteHoldCover(lane)
+                    noteVibrations.idle(lane)
                     continue
                 }
                 // FNF's `Strumline.holdConfirm`: the receptor keeps the confirm
                 // pose for as long as the note is held.
                 playerStrumline.holdConfirm(lane)
+                noteVibrations.hold(lane)
                 val remaining = note.fullSustainLength - (now - note.strumTime)
                 if (remaining <= 0f) {
                     note.releaseClip(conductor)
                     playerStrumline.endNoteHoldCover(lane)
+                    noteVibrations.tryHoldNoteVibration(holdNoteEnded = true)
                     // FNF: a completed hold leaves the receptor pressed while the
                     // key is still down, otherwise it returns to static.
-                    if (playerStrumline.isKeyHeld(lane)) playerStrumline.pressKey(lane)
-                    else playerStrumline.playStatic(lane)
+                    if (playerStrumline.isKeyHeld(lane)) {
+                        playerStrumline.pressKey(lane)
+                        noteVibrations.press(lane)
+                    } else {
+                        playerStrumline.playStatic(lane)
+                        noteVibrations.idle(lane)
+                    }
                     continue
                 }
                 // FNF grants a small health drip while the tail is held.
@@ -2563,6 +2749,19 @@ class PlayScene : Scene() {
         // on game over so the rain does not draw over the death screen.
         stageEffects?.onGameOver()
 
+        // `GameOverSubState.create`: one buzz as the death screen opens.
+        HapticUtil.vibrate(0.0, HapticUtil.DEFAULT_VIBRATION_DURATION)
+
+        // The death scripts (`bf*.hxc`, `pico-*.hxc`) vibrate on specific
+        // animation frames; `pico-blazin.hxc` also schedules two delayed
+        // pulses from its `firstDeath` branch.
+        gameOverHaptics.clear()
+        player.onAnimationFrame = ::deathAnimationHaptic
+        if (player.id == "pico-blazin") {
+            gameOverHaptics += 0.5 to { HapticUtil.vibrate(0.0, 0.1, 0.1, 1.0) }
+            gameOverHaptics += 1.1 to { HapticUtil.vibrate(0.0, 0.1, 0.1, 1.0) }
+        }
+
         val overlay = sceneRoot.solidRect(
             Constants.GAME_WIDTH * 2.0,
             Constants.GAME_HEIGHT * 2.0,
@@ -2608,8 +2807,56 @@ class PlayScene : Scene() {
         camera.targetZoom = camera.stageZoom * player.deathCameraZoom
     }
 
+    /**
+     * `onAnimationFrame` of the shipped character scripts.
+     *
+     *  - `bf.hxc` (and every BF variant that copies it): the microphone hits
+     *    the floor on `firstDeath` frame 27, and the `deathLoop` pulsates on
+     *    frames 0 and 18.
+     *  - `pico-pixel.hxc` / `pico-playable.hxc`: Pico lands on his back on
+     *    `firstDeath` frame 20, then the blood firework pops on every even
+     *    `deathLoop` frame with a random duration and amplitude.
+     */
+    private fun deathAnimationHaptic(name: String, frame: Int) {
+        if (name.startsWith("fakeoutDeath")) return
+        if (player.id.startsWith("bf")) {
+            if (name == "firstDeath" && frame == 27) {
+                HapticUtil.vibrate(0.0, 0.1, 0.1, 1.0)
+            }
+            if (name == "deathLoop" && (frame == 0 || frame == 18)) {
+                HapticUtil.vibrate(0.0, 0.1, 0.1, 1.0)
+            }
+            return
+        }
+        if (!player.id.startsWith("pico")) return
+        if (name == "firstDeath" && frame == 20) {
+            HapticUtil.vibrate(0.0, 0.1, 0.1, 1.0)
+        }
+        if (name == "deathLoop" && frame % 2 == 0) {
+            val amplitude = 0.1 + Random.nextDouble() * 0.4
+            val duration = 0.1 + Random.nextDouble() * 0.2
+            HapticUtil.vibrate(0.0, duration, amplitude)
+        }
+    }
+
     /** `GameOverSubState.update`: the dying pose, the music hand-off, inputs. */
     private fun updateGameOver(dt: Double, input: KnfInput) {
+        // `pico-blazin.hxc`'s delayed death pulses (0.5 s / 1.1 s after
+        // `firstDeath` starts).
+        if (gameOverHaptics.isNotEmpty()) {
+            val due = ArrayList<Pair<Double, () -> Unit>>()
+            for (index in gameOverHaptics.indices.reversed()) {
+                val (remaining, action) = gameOverHaptics[index]
+                val next = remaining - dt
+                if (next <= 0.0) {
+                    due += 0.0 to action
+                    gameOverHaptics.removeAt(index)
+                } else {
+                    gameOverHaptics[index] = next to action
+                }
+            }
+            for ((_, action) in due) action()
+        }
         // First frame: the dying pose and the "blue ball" SFX. `bf.hxc` rolls
         // the 1/4096 `fakeoutDeath` easter egg instead, which restarts
         // `firstDeath` (and plays the loss SFX) once it finishes.
@@ -2998,14 +3245,24 @@ class PlayScene : Scene() {
                 camera.setBop(intensity.toDouble(), rate, offset)
             }
 
-            "SetTargetBopSpeed", "SetCharacter", "SetStage", "PlayAnimation", "SetHealthIcon" -> {
+            "SetHealthIcon" -> {
+                val playerId = ev.getInt("char") ?: 0
+                val id = ev.getString("id") ?: "bf"
+                val flipX = ev.getBool("flipX") ?: false
+                val isPixel = ev.getBool("isPixel") ?: false
+                hud.replaceHealthIcon(playerId, id, flipX, isPixel)
+            }
+
+            "SetTargetBopSpeed", "SetCharacter", "SetStage", "PlayAnimation" -> {
                 // Needs character sprites; handled in a later milestone.
             }
 
             // `tankmanBattlefieldErect.hxc`: turns on tankman-bloody's mask.
             "EnableMask" -> tankmanRimFilter?.useAltMask = true
 
-            else -> println("KNF: unhandled song event '${ev.kind}'")
+            else -> if (sserafim?.onSongEvent(ev) != true) {
+                println("KNF: unhandled song event '${ev.kind}'")
+            }
         }
     }
 
@@ -3016,16 +3273,22 @@ class PlayScene : Scene() {
      * stage's per-character camera offsets), all in stage space.
      */
     private fun focusCamera(char: Int, x: Float, y: Float, durationBeats: Float) {
+        // `char == -1` focuses a raw stage position: `FocusCameraSongEvent`
+        // starts from (x, y) and only ADDS a character's focus point for
+        // `char >= 0`. Treating the pair as an offset from the default focus
+        // put SPAGHETTI's static camera moves hundreds of pixels off target.
+        if (char < 0) {
+            camera.setFocus(x.toDouble(), y.toDouble())
+            return
+        }
         val target: Pair<Double, Double> = when (char) {
             0 -> player.cameraFocusPoint(stageFile.characterFor("bf")?.cameraOffsets.orEmpty())
             1 -> opponent.cameraFocusPoint(stageFile.characterFor("dad")?.cameraOffsets.orEmpty())
             2 -> girlfriend?.cameraFocusPoint(stageFile.characterFor("gf")?.cameraOffsets.orEmpty())
                 ?: return // FNF: "No GF to focus on."
-            else -> defaultCameraFocus
+            else -> return
         }
-        val dx = if (char < 0) x.toDouble() else 0.0
-        val dy = if (char < 0) y.toDouble() else 0.0
-        camera.setFocus(target.first + dx, target.second + dy)
+        camera.setFocus(target.first + x.toDouble(), target.second + y.toDouble())
     }
 
     /**
@@ -3103,12 +3366,44 @@ class PlayScene : Scene() {
         previousSongPlayers = emptyList()
     }
 
+    /**
+     * Takes the previous scene's decoded stems over on a retry.
+     *
+     * FNF's `restartPlayState` keeps `FlxG.sound.music` and rebuilds only the
+     * vocals; KNF decodes gameplay stems fully, so re-decoding them was the
+     * largest remaining hitch on a retry. The players are keyed by the exact
+     * paths this scene would load; anything else is disposed and reloaded.
+     */
+    private fun adoptPreviousStems(
+        instPath: String?,
+        playerVocalsPath: String?,
+        opponentVocalsPath: String?,
+    ): Boolean {
+        val previous = previousSongPlayers
+        if (previous.size != 3 || instPath == null) return false
+        if (previous[0].loadedPath != instPath) return false
+        if (previous[1].loadedPath != playerVocalsPath) return false
+        if (previous[2].loadedPath != opponentVocalsPath) return false
+
+        music = previous[0]
+        vocals = previous[1]
+        opponentVocals = previous[2]
+        for (player in previous) player.handedOff = true
+        stemAudioHandedOff = true
+        previousSongPlayers = emptyList()
+        println("KNF: retry reused the decoded stems ($instPath)")
+        return true
+    }
+
     private companion object {
         /** Players registered by the previous gameplay scene, see [releasePreviousSongAudio]. */
         var previousSongPlayers: List<MusicPlayer> = emptyList()
 
         /** `schoolErect.hxc`: `rim.color = 0xFF52351D`, the warm brown key light. */
         val SCHOOL_ERECT_LIGHT = RGBA(0x52, 0x35, 0x1D)
+
+        /** `NonScoreableNoteKind`'s id: notes that never count towards results. */
+        const val NON_SCOREABLE_KIND = "non_scoreable"
 
         /**
          * How long after `go` a stem may take to queue its first block before

@@ -395,7 +395,23 @@ data class PosePart(
     val matrix: Mat,
 )
 
-class Pose(val parts: List<PosePart>)
+/**
+ * A symbol instance whose name matched the mouth keyword. FNF's SPAGHETTI
+ * lip-sync (`SserafimLipSyncSprite`) is attached as an extra element to every
+ * *frame* of such a symbol, so it is drawn immediately after that symbol's own
+ * content - [insertIndex] is where it belongs in this pose's part list.
+ */
+data class MouthMarker(
+    val symbol: String,
+    val matrix: Mat,
+    val insertIndex: Int,
+)
+
+class Pose(
+    val parts: List<PosePart>,
+    /** `MouthMarker`s found while flattening this pose (empty for props). */
+    val mouths: List<MouthMarker> = emptyList(),
+)
 
 class Bounds {
     var minX = Double.MAX_VALUE
@@ -651,8 +667,9 @@ class AnimateAtlas(
         val out = ArrayList<Pose>(total)
         for (index in 0 until total) {
             val parts = ArrayList<PosePart>()
-            collect(timeline, index, Mat(), parts, 0)
-            out += Pose(parts)
+            val mouths = ArrayList<MouthMarker>()
+            collect(timeline, index, Mat(), parts, 0, mouths)
+            out += Pose(parts, mouths)
         }
         return out
     }
@@ -663,6 +680,7 @@ class AnimateAtlas(
         parent: Mat,
         out: MutableList<PosePart>,
         depth: Int,
+        mouths: MutableList<MouthMarker>? = null,
     ) {
         if (depth > MAX_SYMBOL_DEPTH) return
         // Flixel skips a timeline entirely once its frame counter runs past the end.
@@ -684,7 +702,14 @@ class AnimateAtlas(
                 val si = event.instance ?: continue
                 val child = symbolByName[si.symbolName] ?: continue
                 val childFrame = resolveSymbolFrame(si, frameIndex, keyframe.start, child)
-                collect(child, childFrame, matOf(si.matrix, si.matrix3D).under(parent), out, depth + 1)
+                val childMatrix = matOf(si.matrix, si.matrix3D).under(parent)
+                collect(child, childFrame, childMatrix, out, depth + 1, mouths)
+                // `SserafimLipSyncSprite` is added to the frames of a "mouth"
+                // symbol, so it is drawn after that symbol's own content and
+                // before whatever follows it in the parent frame.
+                if (mouths != null && si.symbolName.contains("mouth", ignoreCase = true)) {
+                    mouths += MouthMarker(si.symbolName, childMatrix, out.size)
+                }
             }
         }
     }
@@ -737,6 +762,38 @@ class AnimateAtlas(
     companion object {
         /** Guards against a malformed file with a cyclic symbol reference. */
         const val MAX_SYMBOL_DEPTH = 24
+
+        /**
+         * Parsed atlases, the equivalent of FNF's animate library cache.
+         *
+         * Rebuilding an `AnimateAtlas` re-reads and re-parses `Animation.json`
+         * and, without this cache, re-decodes `spritemap1.png` - a character
+         * sheet is tens of megabytes. Restarting a song builds new `Character`
+         * instances for the same sheet, so FNF's in-memory graphics stay put
+         * across a retry while KNF used to pay the full load again (the
+         * "restart reloads everything" hitch). Cleared with the other scene art
+         * in `KnfMemory.beginScene`.
+         */
+        private val cache = HashMap<String, AnimateAtlas>()
+
+        fun cached(dir: String, limit: Int = KnfFiles.maxTextureDimension): AnimateAtlas =
+            cache.getOrPut("$dir|$limit") { AnimateAtlas(dir, limit) }
+
+        /** Drops cached atlases, optionally only matching keys. */
+        fun clearCache(match: (String) -> Boolean = { true }) {
+            if (match("")) cache.clear() else cache.keys.removeAll(match)
+        }
+
+        /** One line for `KNF_MEM`, mirroring `TextureAtlas.cacheStats`. */
+        fun cacheStats(): String {
+            var sprites = 0
+            var poses = 0
+            for (atlas in cache.values) {
+                sprites += atlas.sprites.size
+                poses += atlas.poses.size
+            }
+            return "animate=${cache.size} animateSprites=$sprites animatePoses=$poses"
+        }
 
         /** Unit corners of a sprite's logical rectangle, for bounding boxes. */
         val CORNERS = arrayOf(

@@ -100,6 +100,17 @@ class Strumline(
     private val vwooshDuration = 0.5
     private val vwooshDistance = 200.0
 
+    /** One note (or tail) flying off-screen during a reset. */
+    private class FleeingNote(val view: Container, val startY: Double, val targetY: Double)
+
+    /**
+     * `Strumline.vwooshNotes`: notes already on screen at a reset shoot out in
+     * the chart's scroll direction (down on upscroll, up on downscroll) with
+     * `expoIn`, so they leave "against" the way their arrows point.
+     */
+    private val fleeingNotes = ArrayList<FleeingNote>()
+    private var fleeElapsed = -1.0
+
     /**
      * Lane-local y of the receptor line. Notes are children of the same
      * container, so this stays local — adding the lane's screen y on top of it
@@ -297,6 +308,7 @@ class Strumline(
     fun update(conductor: Conductor, songStart: Float = 0f, dt: Double = 1.0 / 60.0) {
         spawnIncoming(conductor, songStart)
         updateVwoosh(dt)
+        updateFleeingNotes(dt)
         updateNotes(conductor)
         if (ghostTapTimer > 0.0) {
             ghostTapTimer -= dt * 1000.0
@@ -347,6 +359,54 @@ class Strumline(
         if (t >= 1.0) {
             vwooshElapsed = -1.0
             for (note in notes) note.vwooshOffsetY = 0.0
+        }
+    }
+
+    /**
+     * `Strumline.vwooshNotes`: starts the fly-out for every live note and tail,
+     * then drops them from the update list so the incoming reset can rebuild
+     * the chart immediately.
+     */
+    fun vwooshNotes() {
+        if (notes.isEmpty()) return
+        fleeElapsed = 0.0
+        for (note in notes.toList()) {
+            addFleeing(note)
+            note.holdTrail?.let { addFleeing(it) }
+        }
+        notes.clear()
+    }
+
+    private fun addFleeing(view: Container) {
+        val start = view.y
+        // FNF: `targetY = FlxG.height + note.y`, or `note.y - FlxG.height`
+        // on downscroll.
+        val target = if (downscroll) start - Constants.GAME_HEIGHT else Constants.GAME_HEIGHT + start
+        fleeingNotes += FleeingNote(view, start, target)
+    }
+
+    /**
+     * Advances [fleeingNotes] with `FlxEase.expoIn` over [vwooshDuration].
+     *
+     * Public because a retry pauses the gameplay update loop: the scene keeps
+     * calling this from its own updater while the screen is frozen.
+     */
+    fun updateVwooshOut(dt: Double) {
+        updateFleeingNotes(dt)
+    }
+
+    private fun updateFleeingNotes(dt: Double) {
+        if (fleeElapsed < 0.0) return
+        fleeElapsed += dt
+        val t = (fleeElapsed / vwooshDuration).coerceIn(0.0, 1.0)
+        val ease = if (t <= 0.0) 0.0 else 2.0.pow(10.0 * (t - 1.0))
+        for (fleeing in fleeingNotes) {
+            fleeing.view.y = fleeing.startY + (fleeing.targetY - fleeing.startY) * ease
+        }
+        if (t >= 1.0) {
+            for (fleeing in fleeingNotes) fleeing.view.removeFromParent()
+            fleeingNotes.clear()
+            fleeElapsed = -1.0
         }
     }
 
@@ -504,6 +564,14 @@ class Strumline(
 
     /** FNF's `Strumline.isKeyHeld`, including notes struck by the bot. */
     fun isKeyHeld(direction: Int): Boolean = heldKeys[direction]
+
+    /**
+     * `sserafim.hxc`'s `hideOpponentStrumline`: hides the receptor arrows only.
+     * Notes keep scrolling, exactly like the original loop over `members`.
+     */
+    fun hideReceptors() {
+        for (receptor in receptors) receptor?.container?.visible = false
+    }
 
     /**
      * FNF's `Strumline.hitNote`: the confirm animation. Note splashes are

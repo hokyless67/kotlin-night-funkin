@@ -12,6 +12,7 @@ import nightfunkin.core.AnimateAtlas
 import nightfunkin.core.AtlasSlice
 import nightfunkin.core.Bounds
 import nightfunkin.core.Mat
+import nightfunkin.core.MouthMarker
 import nightfunkin.core.Pose
 import nightfunkin.core.PosePart
 import nightfunkin.core.SpriteDef
@@ -166,7 +167,7 @@ class Character(val id: String) : Container() {
     }
 
     /** The Animate atlas, for `renderType: animateatlas` / `multianimateatlas`. */
-    private val animateAtlas: AnimateAtlas? = animateDir?.let { AnimateAtlas(it) }
+    private val animateAtlas: AnimateAtlas? = animateDir?.let { AnimateAtlas.cached(it) }
 
     /**
      * `multianimateatlas` (`MultiAnimateAtlasCharacter.loadAtlases`): every
@@ -195,7 +196,7 @@ class Character(val id: String) : Container() {
                 val candidate = "$root/$subPath".removePrefix("/")
                 if (KnfFiles.exists("$candidate/spritemap1.json")) candidate else null
             } ?: continue
-            val atlas = runCatching { AnimateAtlas(dir) }
+            val atlas = runCatching { AnimateAtlas.cached(dir) }
                 .onFailure { println("KNF: sub atlas '$assetPath' failed: ${it.message}") }
                 .getOrNull() ?: continue
             out += SubAtlas(assetPath, "$subPath/", atlas, offset)
@@ -277,7 +278,10 @@ class Character(val id: String) : Container() {
         out.addAll(main.poses)
         for (sub in subAtlases) {
             for (pose in sub.atlas.poses) {
-                out += Pose(pose.parts.map { PosePart(sub.prefix + it.sprite, it.matrix) })
+                out += Pose(
+                    pose.parts.map { PosePart(sub.prefix + it.sprite, it.matrix) },
+                    pose.mouths,
+                )
             }
         }
         return out
@@ -320,6 +324,63 @@ class Character(val id: String) : Container() {
             def.name to (offsets[0] to offsets[1])
         }
         .toMap()
+
+    // ---------------------------------------------------------------------
+    // SPAGHETTI lip sync
+    // ---------------------------------------------------------------------
+
+    /**
+     * `assets/preload/scripts/stages/props/SserafimLipSyncSprite.hxc` plus the
+     * `LIP_SYNC_OFFSETS` table of the character's own script.
+     *
+     * The mouth is a 24 fps mouth-shape animation (`sserafim-lipsync`,
+     * yunjin has her own sheet) that FNF mounts as a `FlxSpriteElement` inside
+     * every frame of a symbol whose name matches [keyword]. Its frame is driven
+     * by the song position, not by the character animation.
+     */
+    private data class LipSyncSpec(
+        val atlas: String,
+        val keyword: String,
+        val flipX: Boolean,
+        val alpha: Double,
+        val offsets: Map<String, Pair<Double, Double>>,
+        val angles: Map<String, Double>,
+    )
+
+    private val lipSyncSpec: LipSyncSpec? = lipSyncSpecFor(id)
+
+    /**
+     * Shared: sakura, chaewon, eunchae and kazuha all mount the same sheet, and
+     * all five are loaded for the same song.
+     */
+    private val lipSyncAtlas: AnimateAtlas? = lipSyncSpec?.let { spec ->
+        lipSyncAtlases.getOrPut(spec.atlas) {
+            KnfFiles.findAnimateDir("sserafim", spec.atlas)?.let { AnimateAtlas.cached(it) }
+        }
+    }
+
+    /** `Conductor.songPosition` in ms; the stage owning this character feeds it. */
+    var lipSyncTimeMs: Double = 0.0
+
+    /** `characterType == CharacterType.BF`: only the girl currently singing. */
+    var lipSyncShouldSing: Boolean = false
+
+    /** Mouth frame last applied, so a 24 fps mouth does not re-render the pose. */
+    private var lipSyncFrame = -1
+    private var lipSyncOffsetX = 0.0
+    private var lipSyncOffsetY = 0.0
+    private var lipSyncAngle = 0.0
+
+    /** Mouth symbol instance of the pose being drawn (null when it has none). */
+    private var lipSyncMouth: MouthMarker? = null
+    private var lipSyncImage: Image? = null
+
+    /**
+     * Frame-space shift for the mouth: the same `- origin` and animation-offset
+     * terms [drawPart] applies, so the mouth moves with the character's pose.
+     */
+    private var lipSyncShiftX = 0.0
+    private var lipSyncShiftY = 0.0
 
     /**
      * Legacy sheets have no timeline, so the bounds come from a single frame
@@ -372,6 +433,12 @@ class Character(val id: String) : Container() {
      * `2hot` ending uses this for BF and Dad while their special animations run.
      */
     var dancesOnBeat: Boolean = true
+
+    /**
+     * `sserafim-gf.hxc`'s `isBeautiful`: every `playAnimation(name)` call is
+     * redirected to `name + suffix` while the flag is set.
+     */
+    var animationSuffix: String = ""
 
     /**
      * Which face to put on the health bar.
@@ -784,8 +851,11 @@ class Character(val id: String) : Container() {
     /**
      * Holds a sing pose for FNF's `singTime`, which is counted in 16th-note
      * steps rather than seconds (8 steps = two beats at any tempo).
+     *
+     * [suffix] is the note-kind variant (`sakura-joint`, `sakura-bf1`, ...):
+     * FNF's `playSingAnimation(dir, miss, suffix)` appends `-<suffix>`.
      */
-    fun sing(direction: Int, stepLengthMs: Double, miss: Boolean = false) {
+    fun sing(direction: Int, stepLengthMs: Double, miss: Boolean = false, suffix: String? = null) {
         val dir = when (direction) {
             0 -> "LEFT"
             1 -> "DOWN"
@@ -793,8 +863,14 @@ class Character(val id: String) : Container() {
             3 -> "RIGHT"
             else -> return
         }
-        // FNF's `playSingAnimation`: 'sing${dir}${miss ? "miss" : ""}'.
-        val anim = "sing$dir" + if (miss) "miss" else ""
+        // FNF's `playSingAnimation`: 'sing${dir}${miss ? "miss" : ""}'
+        val base = "sing$dir" + if (miss) "miss" else ""
+        val variant = if (suffix != null) "$base-$suffix" else base
+        val anim = if (animationSuffix.isNotEmpty() && anims.containsKey(variant + animationSuffix)) {
+            variant + animationSuffix
+        } else {
+            variant
+        }
         if (!anims.containsKey(anim)) return
         dancing = false
         play(anim, forceRestart = true)
@@ -825,17 +901,47 @@ class Character(val id: String) : Container() {
         // A non-looped animation that already reached its last frame therefore
         // restarts on the next `dance()` call, which is how BF's 30-frame idle
         // keeps bobbing even though `idle` is declared `looped: false`.
-        if (anim == currentAnim && !forceRestart && !animFinished) return
-        if (!anims.containsKey(anim)) return
-        if (KnfEnv["KNF_DEBUG_CHAR"] == "1") {
-            val fr = anims[anim]?.frames?.firstOrNull()
-            println("KNF: char $id -> $anim  poseParts=" + (fr?.let { poses.getOrNull(it)?.parts?.size }))
+        val resolved = if (animationSuffix.isNotEmpty() && anims.containsKey(anim + animationSuffix)) {
+            anim + animationSuffix
+        } else {
+            anim
         }
-        currentAnim = anim
+        if (resolved == currentAnim && !forceRestart && !animFinished) return
+        if (!anims.containsKey(resolved)) return
+        if (KnfEnv["KNF_DEBUG_CHAR"] == "1") {
+            val fr = anims[resolved]?.frames?.firstOrNull()
+            println("KNF: char $id -> $resolved  poseParts=" + (fr?.let { poses.getOrNull(it)?.parts?.size }))
+        }
+        // `sserafim-*.hxc` overrides `playAnimation` and re-aims the mouth for
+        // the animations listed in `LIP_SYNC_OFFSETS`; the rest keep the last
+        // values, exactly like the script leaves them alone.
+        lipSyncSpec?.let { spec ->
+            val off = spec.offsets[resolved]
+            if (off != null) {
+                lipSyncOffsetX = off.first
+                lipSyncOffsetY = off.second
+                lipSyncAngle = spec.angles[resolved] ?: lipSyncAngle
+            }
+        }
+        currentAnim = resolved
         frameTime = 0.0
         frameIndex = 0
         animFinished = false
         renderPose()
+        dispatchAnimationFrame()
+    }
+
+    /**
+     * `BaseCharacter.onAnimationFrame`: the character scripts' hook into the
+     * pose timeline (`bf.hxc`, `pico-*.hxc` and the results scripts vibrate on
+     * specific frames of a death animation). Called with the animation name
+     * and its frame index whenever the pose advances.
+     */
+    var onAnimationFrame: ((String, Int) -> Unit)? = null
+
+    private fun dispatchAnimationFrame() {
+        val name = currentAnim ?: return
+        onAnimationFrame?.invoke(name, frameIndex)
     }
 
     fun update(dt: Double) {
@@ -857,12 +963,14 @@ class Character(val id: String) : Container() {
             if (anim.looped) {
                 frameIndex = (frameIndex + 1) % anim.frames.size
                 renderPose()
+                dispatchAnimationFrame()
                 continue
             }
 
             if (frameIndex < anim.frames.lastIndex) {
                 frameIndex++
                 renderPose()
+                dispatchAnimationFrame()
                 continue
             }
 
@@ -900,61 +1008,172 @@ class Character(val id: String) : Container() {
         // local X shift, so flip its sign here to keep the screen-space result.
         val localOffsetX = if (flip) animOffsetX else -animOffsetX
 
-        while (images.size < pose.parts.size) {
+        // FNF's lip-sync element sits between the mouth symbol's own art and
+        // whatever the parent frame draws after it, so the mouth takes a slot in
+        // the same draw order as the limbs.
+        val mouth = lipSyncSpec?.let { spec ->
+            if (lipSyncAtlas == null) null
+            else pose.mouths.firstOrNull { it.symbol.contains(spec.keyword) }
+        }
+        lipSyncMouth = mouth
+        // Parts are drawn at `authoring - timeline bounds`; the mouth lives in
+        // the same authoring space, so it needs that origin shift too (and the
+        // animation offsets, which are a screen-space nudge like on every limb).
+        lipSyncShiftX = -(playback.originX ?: originX) + localOffsetX
+        lipSyncShiftY = -(playback.originY ?: originY) - animOffsetY
+        val slots = pose.parts.size + if (mouth != null) 1 else 0
+        while (images.size < slots) {
             val img = Image(EMPTY_BITMAP, Anchor2D.CENTER)
             images += img
             addChild(img)
         }
-        for (i in images.indices) {
-            val img = images[i]
-            val part = pose.parts.getOrNull(i)
-            val def = part?.let { sprites[it.sprite] }
-            if (part == null || def == null) {
-                img.visible = false
-                continue
-            }
-            img.visible = true
-            img.bitmap = def.slice
-            img.setPixelArt(isPixel)
-
-            // Anchor at the sprite's centre so scale and rotation compose the
-            // same way the Animate matrix does.
-            //
-            // The bounds offset is what FNF's `drawAnimate` applies with
-            // `matrix.translate(-bounds.x, -bounds.y)`: it moves the authoring
-            // origin to the sprite's own top-left. Without it every character is
-            // drawn shifted by its bounding-box corner.
-            val (cx, cy) = part.matrix.xform(def.width / 2.0, def.height / 2.0)
-            // The origin is the authoring bounds of the atlas the pose comes
-            // from: FNF's `drawAnimate` subtracts `timeline._bounds`, which
-            // switches to the sub-atlas when a death animation plays.
-            img.x = cx - (playback.originX ?: originX) + localOffsetX
-            img.y = cy - (playback.originY ?: originY) - animOffsetY
-
-            // KGE builds `translation * rotation * scale`, i.e. `R * S`, whose
-            // first column is `sx * (cos, sin)` and second is
-            // `sy * (-sin, cos)`. Both `hypot` lengths are positive by
-            // construction, which throws away the *sign* of the determinant -
-            // and Animate mirrors plenty of symbols. A mirrored limb then gets
-            // drawn rotated by 180 degrees instead of flipped.
-            //
-            // Tankman's sing poses are the clearest case: `Tankman DOWN note`
-            // places its legs with `MX = [-1, 0, 0, 1]`, which decomposes to
-            // `scale 1, rotation 180` and puts his shorts at his ankles.
-            //
-            // Negating one axis restores the determinant's sign: `R * S(sx, -sy)`
-            // has second column `sy * (sin, -cos)`, which is exactly what a
-            // negatively-oriented matrix carries.
-            val m = part.matrix
-            img.scaleX = hypot(m.a, m.b) * def.textureScaleX
-            img.scaleY = hypot(m.c, m.d) * def.textureScaleY
-            if (m.a * m.d - m.c * m.b < 0.0) img.scaleY = -img.scaleY
-
-            val degrees = (if (def.turned) -90.0 else 0.0) +
-                KnfMath.toDegrees(atan2(m.b, m.a))
-            img.rotation = degrees.degrees
+        val insert = mouth?.insertIndex?.coerceIn(0, pose.parts.size) ?: -1
+        var slot = 0
+        for (i in pose.parts.indices) {
+            if (i == insert) drawLipSync(images[slot++])
+            drawPart(images[slot++], pose.parts[i], playback, localOffsetX, animOffsetY)
         }
+        if (insert == pose.parts.size) drawLipSync(images[slot++])
+        for (i in slot until images.size) images[i].visible = false
         updateRimMask(pose)
+    }
+
+    private fun drawPart(
+        img: Image,
+        part: PosePart,
+        playback: Playback,
+        localOffsetX: Double,
+        animOffsetY: Double,
+    ) {
+        val def = sprites[part.sprite]
+        if (def == null) {
+            img.visible = false
+            return
+        }
+        img.visible = true
+        img.alpha = 1.0
+        img.bitmap = def.slice
+        img.setPixelArt(isPixel)
+
+        // Anchor at the sprite's centre so scale and rotation compose the
+        // same way the Animate matrix does.
+        //
+        // The bounds offset is what FNF's `drawAnimate` applies with
+        // `matrix.translate(-bounds.x, -bounds.y)`: it moves the authoring
+        // origin to the sprite's own top-left. Without it every character is
+        // drawn shifted by its bounding-box corner.
+        val (cx, cy) = part.matrix.xform(def.width / 2.0, def.height / 2.0)
+        // The origin is the authoring bounds of the atlas the pose comes
+        // from: FNF's `drawAnimate` subtracts `timeline._bounds`, which
+        // switches to the sub-atlas when a death animation plays.
+        img.x = cx - (playback.originX ?: originX) + localOffsetX
+        img.y = cy - (playback.originY ?: originY) - animOffsetY
+
+        // KGE builds `translation * rotation * scale`, i.e. `R * S`, whose
+        // first column is `sx * (cos, sin)` and second is
+        // `sy * (-sin, cos)`. Both `hypot` lengths are positive by
+        // construction, which throws away the *sign* of the determinant -
+        // and Animate mirrors plenty of symbols. A mirrored limb then gets
+        // drawn rotated by 180 degrees instead of flipped.
+        //
+        // Tankman's sing poses are the clearest case: `Tankman DOWN note`
+        // places its legs with `MX = [-1, 0, 0, 1]`, which decomposes to
+        // `scale 1, rotation 180` and puts his shorts at his ankles.
+        //
+        // Negating one axis restores the determinant's sign: `R * S(sx, -sy)`
+        // has second column `sy * (sin, -cos)`, which is exactly what a
+        // negatively-oriented matrix carries.
+        val m = part.matrix
+        img.scaleX = hypot(m.a, m.b) * def.textureScaleX
+        img.scaleY = hypot(m.c, m.d) * def.textureScaleY
+        if (m.a * m.d - m.c * m.b < 0.0) img.scaleY = -img.scaleY
+
+        val degrees = (if (def.turned) -90.0 else 0.0) +
+            KnfMath.toDegrees(atan2(m.b, m.a))
+        img.rotation = degrees.degrees
+    }
+
+    /**
+     * Draws `SserafimLipSyncSprite` for the current pose.
+     *
+     * The sprite is a plain `FlxAnimate` at `(0, 0)` whose figure lives at its
+     * own authoring origin, mounted "inside" the mouth symbol. Its transform is
+     * therefore `mouthSymbolMatrix * spriteMatrix * lipsyncPartMatrix`, where the
+     * sprite matrix is `translate(origin) * rotate(angle) * translate(-origin)`
+     * with `origin = frameSize / 2` and the script's `offset` shifting the draw.
+     */
+    private fun drawLipSync(img: Image) {
+        val spec = lipSyncSpec
+        val marker = lipSyncMouth
+        if (spec == null || marker == null) {
+            img.visible = false
+            return
+        }
+        lipSyncImage = img
+        img.alpha = spec.alpha
+        img.setPixelArt(false)
+        paintLipSyncFrame(img, marker, spec, force = true)
+    }
+
+    private fun paintLipSyncFrame(img: Image, marker: MouthMarker, spec: LipSyncSpec, force: Boolean) {
+        val atlas = lipSyncAtlas ?: return
+        val frame = if (lipSyncShouldSing) {
+            // `animation.curAnim.curFrame = floor((songPosition / 1000) * 24) - 1`
+            // and FlxAnimation clamps out-of-range frames.
+            ((lipSyncTimeMs / 1000.0) * 24.0).toInt() - 1
+        } else {
+            // `shouldSing = false` rewinds the mouth to its closed frame.
+            0
+        }
+        val index = frame.coerceIn(0, (atlas.poses.size - 1).coerceAtLeast(0))
+        if (!force && index == lipSyncFrame) return
+        val part = atlas.poses.getOrNull(index)?.parts?.firstOrNull()
+        val def = part?.let { atlas.sprites[it.sprite] }
+        if (part == null || def == null) {
+            img.visible = false
+            return
+        }
+        lipSyncFrame = index
+
+        val bounds = atlas.bounds
+        val originX = bounds.width / 2.0
+        val originY = bounds.height / 2.0
+        // `drawAnimate`: `translate(-bounds)` then the flip, then
+        // `prepareDrawMatrix`'s `translate(-origin) * rotate * translate(origin - offset)`.
+        var t = Mat(1.0, 0.0, 0.0, 1.0, -bounds.minX, -bounds.minY)
+        if (spec.flipX) t = t.under(Mat(-1.0, 0.0, 0.0, 1.0, bounds.width, 0.0))
+        t = t.under(Mat(1.0, 0.0, 0.0, 1.0, -originX, -originY))
+        val radians = lipSyncAngle * kotlin.math.PI / 180.0
+        val cos = kotlin.math.cos(radians)
+        val sin = kotlin.math.sin(radians)
+        t = t.under(Mat(cos, sin, -sin, cos, 0.0, 0.0))
+        t = t.under(Mat(1.0, 0.0, 0.0, 1.0, originX - lipSyncOffsetX, originY - lipSyncOffsetY))
+        val full = part.matrix.under(t).under(marker.matrix)
+
+        img.visible = true
+        img.bitmap = def.slice
+        val (cx, cy) = full.xform(def.width / 2.0, def.height / 2.0)
+        img.x = cx + lipSyncShiftX
+        img.y = cy + lipSyncShiftY
+        img.scaleX = hypot(full.a, full.b) * def.textureScaleX
+        img.scaleY = hypot(full.c, full.d) * def.textureScaleY
+        if (full.a * full.d - full.c * full.b < 0.0) img.scaleY = -img.scaleY
+        img.rotation = ((if (def.turned) -90.0 else 0.0) +
+            KnfMath.toDegrees(atan2(full.b, full.a))).degrees
+    }
+
+    /**
+     * `SserafimLipSyncSprite.update`: advance the mouth to the song time.
+     *
+     * Only the mouth bitmap changes between poses, so this does not re-render
+     * the character; it does re-aim the mouth when the pose swapped it out.
+     */
+    fun updateLipSync(songMs: Double) {
+        if (lipSyncSpec == null) return
+        lipSyncTimeMs = songMs
+        val img = lipSyncImage ?: return
+        if (!img.visible) return
+        paintLipSyncFrame(img, lipSyncMouth ?: return, lipSyncSpec, force = false)
     }
 
     /**
@@ -1019,29 +1238,35 @@ class Character(val id: String) : Container() {
      * other words [data.offsets] is added once unscaled when `setScale`
      * repositions the character and once scaled while drawing.
      *
-     * [applyOffsets] is false for the one scripted exception: GF's `onAdd`
-     * repositions herself at the stage's `gf` point when she is the opponent,
-     * and does so from `stagePos - characterOrigin` without adding her data
-     * offsets (see `assets/preload/scripts/characters/gf.hxc`). The scaled
-     * `getScreenPosition` term still applies to her.
+     * [applyOffsets] is false for the scripted characters that position
+     * themselves: GF's `onAdd` when she is the opponent
+     * (`assets/preload/scripts/characters/gf.hxc`), and SPAGHETTI's five girls,
+     * whose stage script calls `setPosition(x - characterOrigin.x, ...)`
+     * directly. Those bypass `BaseCharacter.setScale`, so the data offsets are
+     * only added by the scaled `getScreenPosition` term - the girls' `[0, 260]`
+     * style offsets are exactly what puts their feet on the diner floor.
      */
     fun placeFeet(feetX: Double, feetY: Double, scale: Double, applyOffsets: Boolean = true) {
         val s = scale
         this.scaleX = s
         this.scaleY = s
-        val globalX = if (applyOffsets) data.offsets.getOrElse(0) { 0.0 } else 0.0
-        val globalY = if (applyOffsets) data.offsets.getOrElse(1) { 0.0 } else 0.0
+        // `BaseCharacter.setScale` adds the offsets to the sprite position;
+        // `Bopper.getScreenPosition` always adds them again, scaled, on draw.
+        val positionX = if (applyOffsets) data.offsets.getOrElse(0) { 0.0 } else 0.0
+        val positionY = if (applyOffsets) data.offsets.getOrElse(1) { 0.0 } else 0.0
+        val drawX = data.offsets.getOrElse(0) { 0.0 }
+        val drawY = data.offsets.getOrElse(1) { 0.0 }
         val baseX = feetX - localWidth * s / 2.0
         val baseY = feetY - localHeight * s
 
         // FNF's `BaseCharacter.setScale` stores this in `originalPosition`.
-        originalX = baseX + globalX
-        originalY = baseY + globalY
+        originalX = baseX + positionX
+        originalY = baseY + positionY
 
-        // Draw at `originalPosition + globalOffsets * scale` because
-        // `Bopper.getScreenPosition` adds the scaled term on top.
-        val visualX = originalX + globalX * s
-        val visualY = originalY + globalY * s
+        // `Bopper.getScreenPosition` subtracts `(animOffsets - globalOffsets)`
+        // scaled, i.e. adds the global offsets on top of the sprite position.
+        val visualX = originalX + drawX * s
+        val visualY = originalY + drawY * s
 
         // A mirrored sheet is drawn around its own right edge, so the origin
         // moves to `visualX + width` and `scaleX` goes negative - same shape as
@@ -1157,6 +1382,134 @@ class Character(val id: String) : Container() {
          * assets dropped straight into the asset root.
          */
         private val ASSET_ROOTS = listOf("shared/images", "preload/images", "")
+
+        /** One shared mouth atlas per path - the five girls reference two. */
+        private val lipSyncAtlases = HashMap<String, AnimateAtlas?>()
+
+        /**
+         * `SserafimLipSyncSprite` mounts, straight from the character scripts.
+         *
+         * `sserafim-yunjin.hxc`, `-chaewon.hxc`, `-eunchae.hxc`, `-kazuha.hxc`
+         * and `-sakura.hxc` all build the same sprite and add it to the frames of
+         * a symbol: `mouth yunjin`, `mouth default` or `mouth edit`. The offsets
+         * and angles are their `LIP_SYNC_OFFSETS` tables verbatim.
+         */
+        private fun lipSyncSpecFor(id: String): LipSyncSpec? = when (id) {
+            "sserafim-yunjin" -> LipSyncSpec(
+                atlas = "sserafim-lipsync-yunjin",
+                keyword = "mouth yunjin",
+                flipX = false,
+                alpha = 1.0,
+                offsets = mapOf(
+                    "idle" to (8.0 to 6.0),
+                    "singUP" to (6.0 to 8.0),
+                    "singRIGHT" to (6.0 to 8.0),
+                    "singDOWN" to (8.0 to 6.0),
+                    "singLEFT" to (6.0 to 8.0),
+                ),
+                angles = mapOf(
+                    "idle" to 23.0,
+                    "singUP" to 22.0,
+                    "singRIGHT" to 23.0,
+                    "singDOWN" to 23.0,
+                    "singLEFT" to 23.0,
+                ),
+            )
+
+            "sserafim-chaewon" -> LipSyncSpec(
+                atlas = "sserafim-lipsync",
+                keyword = "mouth default",
+                flipX = false,
+                alpha = 0.5,
+                offsets = mapOf(
+                    "idle" to (41.0 to 3.0),
+                    "singUP" to (38.0 to 0.0),
+                    "singRIGHT" to (39.0 to 1.0),
+                    "singDOWN" to (41.0 to 3.0),
+                    "singLEFT" to (40.0 to 2.0),
+                ),
+                angles = mapOf(
+                    "idle" to -166.0,
+                    "singUP" to -168.0,
+                    "singRIGHT" to -165.0,
+                    "singDOWN" to -167.0,
+                    "singLEFT" to -165.0,
+                ),
+            )
+
+            "sserafim-eunchae" -> LipSyncSpec(
+                atlas = "sserafim-lipsync",
+                keyword = "mouth default",
+                flipX = false,
+                alpha = 1.0,
+                offsets = mapOf(
+                    "idle" to (43.0 to 6.0),
+                    "singUP" to (45.0 to 10.0),
+                    "singRIGHT" to (42.0 to 5.0),
+                    "singDOWN" to (41.0 to 3.0),
+                    "singLEFT" to (43.0 to 6.0),
+                ),
+                angles = mapOf(
+                    "idle" to -168.0,
+                    "singUP" to -166.0,
+                    "singRIGHT" to -166.0,
+                    "singDOWN" to -168.0,
+                    "singLEFT" to -169.0,
+                ),
+            )
+
+            "sserafim-kazuha" -> LipSyncSpec(
+                atlas = "sserafim-lipsync",
+                keyword = "mouth default",
+                flipX = true,
+                alpha = 1.0,
+                offsets = mapOf(
+                    "idle" to (5.0 to 4.0),
+                    "singUP" to (7.0 to 2.0),
+                    "singRIGHT" to (7.0 to 2.0),
+                    "singDOWN" to (4.0 to 6.0),
+                    "singLEFT" to (5.0 to 4.0),
+                ),
+                angles = mapOf(
+                    "idle" to -13.0,
+                    "singUP" to -14.0,
+                    "singRIGHT" to -13.0,
+                    "singDOWN" to -12.0,
+                    "singLEFT" to -14.0,
+                ),
+            )
+
+            "sserafim-sakura" -> LipSyncSpec(
+                atlas = "sserafim-lipsync",
+                keyword = "mouth edit",
+                flipX = true,
+                alpha = 1.0,
+                offsets = mapOf(
+                    "idle" to (7.0 to 2.0),
+                    "singUP" to (8.0 to 1.0),
+                    "singRIGHT" to (7.0 to 2.0),
+                    "singDOWN" to (6.0 to 3.0),
+                    "singLEFT" to (7.0 to 2.0),
+                    "singUP-joint" to (10.0 to -1.0),
+                    "singRIGHT-joint" to (6.0 to 3.0),
+                    "singDOWN-joint" to (5.0 to 5.0),
+                    "singLEFT-joint" to (7.0 to 2.0),
+                ),
+                angles = mapOf(
+                    "idle" to -14.0,
+                    "singUP" to -15.0,
+                    "singRIGHT" to -15.0,
+                    "singDOWN" to -15.0,
+                    "singLEFT" to -14.0,
+                    "singUP-joint" to -14.0,
+                    "singRIGHT-joint" to -15.0,
+                    "singDOWN-joint" to -15.0,
+                    "singLEFT-joint" to -16.0,
+                ),
+            )
+
+            else -> null
+        }
 
         private val knfJson = Json {
             ignoreUnknownKeys = true

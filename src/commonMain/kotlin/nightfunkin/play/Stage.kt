@@ -415,7 +415,7 @@ class Stage(id: String) : Container() {
             println("KNF: stage prop asset missing: ${prop.assetPath} (${prop.animType})")
             return null
         }
-        val atlas = AnimateAtlas(dir, KnfFiles.backdropTextureDimension)
+        val atlas = AnimateAtlas.cached(dir, KnfFiles.backdropTextureDimension)
         if (atlas.sprites.isEmpty()) {
             println("KNF: stage prop '${file.id}' has no sprites in $dir")
             return null

@@ -21,6 +21,12 @@ import korlibs.korge.view.filter.ShaderFilter.Companion.tex
 import korlibs.math.geom.Vector4F
 import nightfunkin.core.Constants
 import nightfunkin.core.KnfFiles
+import nightfunkin.core.KnfMath
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.floor
+import kotlin.math.pow
+import kotlin.math.sin
 
 /**
  * `funkin.graphics.shaders.WiggleEffectRuntime` (`assets/preload/shaders/wiggle.frag`).
@@ -429,5 +435,239 @@ class OverlayBlendFilter(
             }
         }
         setTex(ctx, u_Overlay, tex)
+    }
+}
+
+/**
+ * `funkin.graphics.shaders.SserafimShader` (the inline GLSL in
+ * `SserafimShader.hx`), used by the LE SSERAFIM collab stage.
+ *
+ * The original folds Rozebud's HSBC "Adjust Color" pass and a light-driven
+ * multiply into one fragment shader. Here the HSBC part is pre-composed on the
+ * CPU into a 3x4 matrix (`u_Row0..2`, exactly like [AdjustColorFilter]), and
+ * the light multiply is a per-frame uniform (`u_Mul`): the values are uniforms
+ * in the original too, so this is the same picture without re-deriving the
+ * hue matrix per pixel.
+ *
+ * `darkFactor` scales differently for the characters (`isChar`), which is why
+ * the stage and the characters each own an instance of this filter.
+ */
+class SserafimFilter(
+    /** `SserafimShader(true)` for the characters, `false` for the stage. */
+    val isCharacter: Boolean = false,
+) : ShaderFilter() {
+
+    companion object {
+        object UB : UniformBlock(fixedLocation = 11) {
+            /** Contrast + hue pass, `w` carrying the additive term. */
+            val u_Row0 by vec4()
+            val u_Row1 by vec4()
+            val u_Row2 by vec4()
+            /** `grayscaleValues` from the shader. */
+            val u_Gray by vec4()
+            /** `1 + saturation/100` (the source triples positive values). */
+            val u_Sat by float()
+            /** Final per-channel multiply (`multiplyColor`). */
+            val u_Mul by vec4()
+        }
+
+        private val GRAY = doubleArrayOf(
+            0.3098039215686275, 0.607843137254902, 0.0823529411764706,
+        )
+        private const val E = 2.718281828459045
+
+        private val PROGRAM_PROVIDER = object : BaseProgramProvider() {
+            override val fragment: FragmentShader = FragmentShader {
+                val c4 = tex(fragmentCoords)
+                val alpha = c4["a"]
+                val base = TERNARY(alpha gt 0f.lit, c4["rgb"] / alpha, c4["rgb"])
+
+                // brightness -> hue -> contrast (the original clamps here)
+                val hsbc = clamp(
+                    vec3(
+                        dot(base, UB.u_Row0["xyz"]) + UB.u_Row0["w"],
+                        dot(base, UB.u_Row1["xyz"]) + UB.u_Row1["w"],
+                        dot(base, UB.u_Row2["xyz"]) + UB.u_Row2["w"],
+                    ),
+                    0f.lit,
+                    1f.lit,
+                )
+                // saturation: clamp(mix(vec3(dot(c, grayscale)), c, value))
+                val gray = vec3(dot(hsbc, UB.u_Gray["xyz"]))
+                val saturated = clamp(mix(gray, hsbc, UB.u_Sat), 0f.lit, 1f.lit)
+                val outColor = saturated * UB.u_Mul["xyz"]
+                SET(out, vec4(outColor * alpha, alpha))
+            }
+        }
+
+        /** `applyHueRotate`'s matrix, row-major after the column-major literals. */
+        private fun hueRows(degrees: Double): Array<DoubleArray> {
+            val angle = KnfMath.toRadians(degrees)
+            val c = cos(angle)
+            val s = sin(angle)
+            // GLSL `mat3(...)` is column-major; the literals below are already
+            // written in row form (`row = (m00, m01, m02)`).
+            // `m = m1 + cos(angle)*m2 + sin(angle)*m3`.
+            val m1 = arrayOf(
+                doubleArrayOf(0.213, 0.715, 0.072),
+                doubleArrayOf(0.213, 0.715, 0.072),
+                doubleArrayOf(0.213, 0.715, 0.072),
+            )
+            val m2 = arrayOf(
+                doubleArrayOf(0.787, -0.715, -0.072),
+                doubleArrayOf(-0.213, 0.285, -0.072),
+                doubleArrayOf(-0.213, -0.715, 0.928),
+            )
+            val m3 = arrayOf(
+                doubleArrayOf(-0.213, -0.715, 0.928),
+                doubleArrayOf(0.143, 0.140, -0.283),
+                doubleArrayOf(-0.787, 0.715, 0.072),
+            )
+            return Array(3) { r -> DoubleArray(3) { col -> m1[r][col] + c * m2[r][col] + s * m3[r][col] } }
+        }
+
+        /** `hue2rgb` from the shader. */
+        private fun hue2rgb(hue: Double): DoubleArray {
+            var h = hue - floor(hue)
+            fun clamp01(v: Double) = v.coerceIn(0.0, 1.0)
+            return doubleArrayOf(
+                clamp01(abs(h * 6.0 - 3.0) - 1.0),
+                clamp01(2.0 - abs(h * 6.0 - 2.0)),
+                clamp01(2.0 - abs(h * 6.0 - 4.0)),
+            )
+        }
+
+        /** `rgb2hsl` from the shader. */
+        private fun rgb2hsl(c: DoubleArray): DoubleArray {
+            val cMin = minOf(c[0], c[1], c[2])
+            val cMax = maxOf(c[0], c[1], c[2])
+            val delta = cMax - cMin
+            val l = (cMax + cMin) / 2.0
+            var h = 0.0
+            var s = 0.0
+            if (delta != 0.0) {
+                s = if (l < 0.5) delta / (cMax + cMin) else delta / (2.0 - cMax - cMin)
+                val dR = (((cMax - c[0]) / 6.0) + delta / 2.0) / delta
+                val dG = (((cMax - c[1]) / 6.0) + delta / 2.0) / delta
+                val dB = (((cMax - c[2]) / 6.0) + delta / 2.0) / delta
+                h = when {
+                    c[0] == cMax -> dB - dG
+                    c[1] == cMax -> 1.0 / 3.0 + dR - dB
+                    else -> 2.0 / 3.0 + dG - dR
+                }
+                h -= floor(h)
+            }
+            return doubleArrayOf(h, s, l)
+        }
+
+        /** `hsl2rgb` from the shader. */
+        private fun hsl2rgb(hsl: DoubleArray): DoubleArray {
+            if (hsl[1] == 0.0) return doubleArrayOf(hsl[2], hsl[2], hsl[2])
+            val b = if (hsl[2] < 0.5) hsl[2] * (1.0 + hsl[1]) else hsl[2] + hsl[1] - hsl[1] * hsl[2]
+            val a = 2.0 * hsl[2] - b
+            val rgb = hue2rgb(hsl[0])
+            return doubleArrayOf(
+                a + rgb[0] * (b - a),
+                a + rgb[1] * (b - a),
+                a + rgb[2] * (b - a),
+            )
+        }
+    }
+
+    // ---- HSBC inputs -----------------------------------------------------
+    private var brightness = 0.0
+    private var hue = 0.0
+    private var contrast = 0.0
+    private var saturation = 0.0
+
+    private var row0 = Vector4F(1f, 0f, 0f, 0f)
+    private var row1 = Vector4F(0f, 1f, 0f, 0f)
+    private var row2 = Vector4F(0f, 0f, 1f, 0f)
+    private var sat = 1.0
+
+    // ---- light multiply --------------------------------------------------
+    var darkenAmount: Double = 0.0
+    var pulseLightColor: RGBA = Colors.WHITE
+    var pulseLightStrength: Double = 0.0
+    var truckLightStrength: Double = 0.0
+
+    init {
+        rebuildHsbc()
+    }
+
+    /** `SserafimShader.setAdjustColor(brightness, hue, contrast, saturation)`. */
+    fun setAdjustColor(
+        brightness: Double = this.brightness,
+        hue: Double = this.hue,
+        contrast: Double = this.contrast,
+        saturation: Double = this.saturation,
+    ) {
+        this.brightness = brightness
+        this.hue = hue
+        this.contrast = contrast
+        this.saturation = saturation
+        rebuildHsbc()
+    }
+
+    private fun rebuildHsbc() {
+        // hue rotation
+        val h = hueRows(hue)
+        // contrast
+        var cv = 1.0 + contrast / 100.0
+        if (cv > 1.0) {
+            cv = (((0.00852259 * E.pow(4.76454 * (cv - 1.0))) * 1.01) - 0.0086078159) * 10.0 + 1.0
+        }
+        // brightness is a `b/255` offset applied before the hue rotation
+        val b = brightness / 255.0
+        val k = 0.25 - 0.25 * cv
+        val rows = Array(3) { r -> DoubleArray(3) { c -> cv * h[r][c] } }
+        val offsets = DoubleArray(3) { r ->
+            var sum = 0.0
+            for (c in 0..2) sum += h[r][c]
+            cv * b * sum + k
+        }
+        row0 = Vector4F(rows[0][0].toFloat(), rows[0][1].toFloat(), rows[0][2].toFloat(), offsets[0].toFloat())
+        row1 = Vector4F(rows[1][0].toFloat(), rows[1][1].toFloat(), rows[1][2].toFloat(), offsets[1].toFloat())
+        row2 = Vector4F(rows[2][0].toFloat(), rows[2][1].toFloat(), rows[2][2].toFloat(), offsets[2].toFloat())
+
+        // saturation, including the source's "positives are tripled" quirk
+        val sv = if (saturation > 0.0) saturation * 3.0 else saturation
+        sat = 1.0 + sv / 100.0
+    }
+
+    /** The `multiplyColor` term, `mix(mix(white, black, d), bruhColor, d/n)`. */
+    private fun multiplyColor(): DoubleArray {
+        val combined = truckLightStrength + pulseLightStrength
+        var darkFactor = combined * 0.07 + darkenAmount
+        if (darkenAmount > 0.65) darkFactor = combined * -0.07 + darkenAmount
+
+        val bruh = hsl2rgb(
+            rgb2hsl(doubleArrayOf(
+                pulseLightColor.r / 255.0,
+                pulseLightColor.g / 255.0,
+                pulseLightColor.b / 255.0,
+            )).also { it[2] *= pulseLightStrength },
+        )
+
+        val divisor = if (isCharacter) 5.0 else 1.0
+        val strengthDivisor = if (isCharacter) 3.0 else 2.0
+        return DoubleArray(3) {
+            val dark = 1.0 + (0.0 - 1.0) * (darkFactor / divisor)
+            dark + (bruh[it] - dark) * (darkFactor / strengthDivisor)
+        }
+    }
+
+    override val programProvider: ProgramProvider = PROGRAM_PROVIDER
+
+    override fun updateUniforms(ctx: RenderContext, filterScale: Double) {
+        val mul = multiplyColor()
+        ctx[UB].push {
+            it[u_Row0] = row0
+            it[u_Row1] = row1
+            it[u_Row2] = row2
+            it[u_Gray] = Vector4F(GRAY[0].toFloat(), GRAY[1].toFloat(), GRAY[2].toFloat(), 0f)
+            it[u_Sat] = sat.toFloat()
+            it[u_Mul] = Vector4F(mul[0].toFloat(), mul[1].toFloat(), mul[2].toFloat(), 1f)
+        }
     }
 }

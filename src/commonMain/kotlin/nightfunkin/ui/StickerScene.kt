@@ -10,6 +10,7 @@ import korlibs.math.geom.Anchor2D
 import korlibs.math.geom.degrees
 import nightfunkin.audio.SfxPlayer
 import nightfunkin.core.Constants
+import nightfunkin.core.HapticUtil
 import nightfunkin.core.KnfBootLog
 import nightfunkin.core.KnfFiles
 import nightfunkin.play.ResultPlayerRegistry
@@ -163,6 +164,8 @@ class StickerOverlay(
                 if (!img.visible && elapsed >= placement.appearAt) {
                     img.visible = true
                     if (placement.soundStem.isNotEmpty()) sfx.play(placement.soundStem)
+                    // `regenStickers`: a small buzz as each sticker lands.
+                    HapticUtil.vibrate(0.0, 0.01, HapticUtil.MIN_VIBRATION_AMPLITUDE * 0.5)
                 }
                 // The small scale pop plays `frameDelay` sprite frames after
                 // the sticker appears (the last one always pops hard).
