@@ -244,38 +244,55 @@ class RainFilter(
                 ) * 43758.5453f.lit,
             )
 
-        /** `rain.frag`'s `rainDist`. */
-        private fun Program.ExpressionBuilder.rainDist(
+        /**
+         * `rain.frag`'s `rainDist`, written with `TEMP`s.
+         *
+         * KorGE's shader DSL inlines an operand at every use site: the chained
+         * `p = ...` assignments of the original made the generated GLSL grow
+         * exponentially (each step re-expands the previous one, ~6x per rain
+         * layer), which produced a gigantic program and made the driver hang
+         * while compiling it. Storing every step in a temp keeps the source
+         * the size of the hand-written GLSL.
+         */
+        private fun Program.Builder.rainDist(
             p0: Operand,
             scale: Float,
             intensity: Operand,
         ): Operand {
             val s = scale.lit
             // p *= 0.1
-            var p = p0 * 0.1f.lit
+            val p = TEMP(p0 * 0.1f.lit)
             // p.x += p.y * 0.1
-            p = vec2(p["x"] + p["y"] * 0.1f.lit, p["y"])
+            SET(p["x"], p["x"] + p["y"] * 0.1f.lit)
             // p.y -= uTime * 500 / scale
-            p = vec2(p["x"], p["y"] - UB.u_Time * (500f.lit / s))
+            SET(p["y"], p["y"] - UB.u_Time * (500f.lit / s))
             // p.y *= 0.03
-            p = vec2(p["x"], p["y"] * 0.03f.lit)
-            val ix = floor(p["x"])
+            SET(p["y"], p["y"] * 0.03f.lit)
+            // float ix = floor(p.x)
+            val ix = TEMP(floor(p["x"]))
             // p.y += mod(ix, 2.0) * 0.5 + (rand(vec2(ix)) - 0.5) * 0.3
-            p = vec2(
-                p["x"],
+            SET(
+                p["y"],
                 p["y"] + mod(ix, 2f.lit) * 0.5f.lit +
                     (rainRand(vec2(ix, ix)) - 0.5f.lit) * 0.3f.lit,
             )
-            val iy = floor(p["y"])
-            val index = vec2(ix, iy)
+            // float iy = floor(p.y)
+            val iy = TEMP(floor(p["y"]))
+            val index = TEMP(vec2(ix, iy))
             // p -= index
-            p = p - index
+            SET(p, p - index)
             // p.x += (rand(index.yx) * 2.0 - 1.0) * 0.35
-            p = vec2(p["x"] + (rainRand(vec2(iy, ix)) * 2f.lit - 1f.lit) * 0.35f.lit, p["y"])
-            val a = abs(p - 0.5f.lit)
-            val res = max(a["x"] * 0.8f.lit, a["y"] * 0.5f.lit) - 0.1f.lit
-            val empty = rainRand(index) lt mix(1f.lit, 0.1f.lit, intensity)
-            return TERNARY(empty, 1f.lit, res)
+            SET(p["x"], p["x"] + (rainRand(vec2(iy, ix)) * 2f.lit - 1f.lit) * 0.35f.lit)
+            // vec2 a = abs(p - 0.5)
+            val a = TEMP(abs(p - 0.5f.lit))
+            // float res = max(a.x * 0.8, a.y * 0.5) - 0.1
+            val res = TEMP(max(a["x"] * 0.8f.lit, a["y"] * 0.5f.lit) - 0.1f.lit)
+            // return (rand(index) < mix(1.0, 0.1, intensity)) ? 1.0 : res
+            return TERNARY(
+                rainRand(index) lt mix(1f.lit, 0.1f.lit, intensity),
+                1f.lit,
+                res,
+            )
         }
 
         private val PROGRAM_PROVIDER = object : BaseProgramProvider() {
@@ -283,34 +300,30 @@ class RainFilter(
                 val uv = fragmentCoords01
                 val viewLeft = UB.u_View["x"]
                 val viewTop = UB.u_View["y"]
-                val viewSize = vec2(UB.u_View["z"], UB.u_View["w"])
+                val viewSize = TEMP(vec2(UB.u_View["z"], UB.u_View["w"]))
 
-                val origin = vec2(viewLeft, viewTop) + uv * viewSize
-                var wpos = origin
-                var add = vec3(0f.lit, 0f.lit, 0f.lit)
-                var rainSum: Operand = 0f.lit
+                // `vec2 wpos = screenToWorld(screenCoord)`.
+                val origin = TEMP(vec2(viewLeft, viewTop) + uv * viewSize)
+                val wpos = TEMP(origin)
+                val add = TEMP(vec3(0f, 0f, 0f))
+                val rainSum = TEMP(0f.lit)
 
                 for (i in SCALES.indices) {
                     val scale = SCALES[i]
                     val p = wpos * (scale.lit / UB.u_Scale) + (500f * i).lit
-                    val r = rainDist(p, scale, UB.u_Intensity)
-                    val hit = r lt 0f.lit
-                    val v = TERNARY(
-                        hit,
-                        (1f.lit - exp(r * 5f.lit)) / scale.lit * 2f.lit,
-                        0f.lit,
-                    )
-                    wpos = wpos + vec2(
-                        v * 10f.lit * UB.u_Scale,
-                        -(v * 2f.lit * UB.u_Scale),
-                    )
-                    add += vec3(0.1f, 0.15f, 0.2f) * v
-                    rainSum += TERNARY(hit, (1f.lit - rainSum) * 0.75f.lit, 0f.lit)
+                    val r = TEMP(rainDist(p, scale, UB.u_Intensity))
+                    IF(r lt 0f.lit) {
+                        val v = TEMP((1f.lit - exp(r * 5f.lit)) / scale.lit * 2f.lit)
+                        SET(wpos["x"], wpos["x"] + v * 10f.lit * UB.u_Scale)
+                        SET(wpos["y"], wpos["y"] - v * 2f.lit * UB.u_Scale)
+                        SET(add, add + vec3(0.1f, 0.15f, 0.2f) * v)
+                        SET(rainSum, rainSum + (1f.lit - rainSum) * 0.75f.lit)
+                    }
                 }
 
                 val screenUv = uv + (wpos - origin) / viewSize
-                val c4 = texture2D(DefaultShaders.u_Tex, screenUv)
-                val alpha = c4["a"]
+                val c4 = TEMP(texture2D(DefaultShaders.u_Tex, screenUv))
+                val alpha = TEMP(c4["a"])
                 val base = TERNARY(alpha gt 0f.lit, c4["rgb"] / alpha, c4["rgb"])
                 val rainColor = vec3(UB.u_RainColor["x"], UB.u_RainColor["y"], UB.u_RainColor["z"])
                 val rgb = mix(base + add, rainColor, 0.1f.lit * rainSum)
@@ -366,24 +379,30 @@ class OverlayBlendFilter(
 ) : ShaderFilter() {
 
     companion object {
-        val u_Overlay by Sampler(ShaderIndices.SAMPLER_INDEX1, SamplerVarType.Sampler2D)
+        /**
+         * `ShaderIndices.SAMPLER_INDEX0` is the unit KorGE reserves for user
+         * samplers. `SAMPLER_INDEX1` is `u_Tex` - the filter's own input - so
+         * binding the overlay there overwrote the render target: both samplers
+         * ended up reading the overlay image, and the sunset collapsed into a
+         * stretched copy of it.
+         */
+        val u_Overlay by Sampler(ShaderIndices.SAMPLER_INDEX0, SamplerVarType.Sampler2D)
 
         private val PROGRAM_PROVIDER = object : BaseProgramProvider() {
             override val fragment: FragmentShader = FragmentShader {
                 val c4 = tex(fragmentCoords)
                 val uv = fragmentCoords01
-                val alpha = c4["a"]
-                val base = TERNARY(alpha gt 0f.lit, c4["rgb"] / alpha, c4["rgb"])
 
+                // `blendOverlay` works on the full vec4, including alpha:
+                //   mix(1 - 2*(1-base)*(1-blend), 2*base*blend, step(base, 0.5))
                 val gf4 = texture2D(u_Overlay, uv + vec2(0.1f.lit, 0.2f.lit))
-                val gfAlpha = gf4["a"]
-                val blend = TERNARY(gfAlpha gt 0f.lit, gf4["rgb"] / gfAlpha, gf4["rgb"])
+                val one = vec4(1f.lit, 1f.lit, 1f.lit, 1f.lit)
+                val half = vec4(0.5f.lit, 0.5f.lit, 0.5f.lit, 0.5f.lit)
 
-                // mix(1 - 2*(1-base)*(1-blend), 2*base*blend, step(base, 0.5))
-                val dark = 1f.lit - 2f.lit * (1f.lit - base) * (1f.lit - blend)
-                val light = 2f.lit * base * blend
-                val mixed = mix(dark, light, step(base, vec4(0.5f.lit)))
-                SET(out, vec4(mixed["rgb"] * alpha, alpha))
+                val dark = one - 2f.lit * (one - c4) * (one - gf4)
+                val light = 2f.lit * c4 * gf4
+                val mixed = mix(dark, light, step(c4, half))
+                SET(out, mixed)
             }
         }
 
